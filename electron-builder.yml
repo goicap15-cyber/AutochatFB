@@ -1,0 +1,66 @@
+appId: com.adsup.autochatbot
+productName: FB Messenger CRM
+copyright: Copyright © 2024 Adsup
+
+# ─── Directories ───────────────────────────────────────────────────────
+directories:
+  buildResources: build
+  output: release
+
+# ─── Files to bundle ───────────────────────────────────────────────────
+files:
+  - dist/server/**/*
+  - dist/client/**/*
+  - dist/extension/**/*
+  - src/electron.js
+  - data/.gitkeep
+  - node_modules/**/*
+  - package.json
+  - "!node_modules/.cache"
+  - "!**/*.map"
+  - "!**/*.md"
+  - "!scripts/**/*"
+  - "!*.log"
+
+# ─── Extra Resources (Chrome Portable + Extension) ─────────────────────
+extraResources:
+  - from: bin/chrome-win
+    to: bin/chrome-win
+    filter: "**/*"
+  - from: dist/extension
+    to: extension
+
+# ─── Windows NSIS Installer ─────────────────────────────────────────────
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: build/icon.ico
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: FB Messenger CRM
+  include: build/installer.nsh   # optional custom NSIS script
+
+# ─── Linux AppImage (dev testing) ──────────────────────────────────────
+linux:
+  target: AppImage
+  icon: build/icon.png
+  category: Office
+
+# ─── Mac DMG (optional) ────────────────────────────────────────────────
+mac:
+  target: dmg
+  icon: build/icon.icns
+  darkModeSupport: true
+
+# ─── App metadata ──────────────────────────────────────────────────────
+compression: maximum
+removePackageScripts: true
+nodeGypRebuild: false
