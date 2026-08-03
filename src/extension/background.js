@@ -319,15 +319,20 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           box.focus();
           document.execCommand('insertText', false, msgTxt);
           box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: msgTxt }));
+          // Messenger exposes a stable semantic button for the composer.
+          // Click DOM element, never screen coordinates.
+          const sendButton = document.querySelector(
+            'button[aria-label="Nhấn Enter để gửi"], [role="button"][aria-label="Nhấn Enter để gửi"], ' +
+            'button[aria-label*="Gửi"], button[aria-label*="Send"]'
+          ) || box.parentElement?.querySelector('button[type="submit"]');
+          if (sendButton) {
+            sendButton.click();
+            return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label') };
+          }
           const form = box.closest('form');
           if (form?.requestSubmit) {
             form.requestSubmit();
             return { success: true, method: 'composer-submit' };
-          }
-          const sendButton = box.parentElement?.querySelector('button[type="submit"], [aria-label*="Gửi"], [aria-label*="Send"]');
-          if (sendButton) {
-            sendButton.click();
-            return { success: true, method: 'composer-click' };
           }
           return { success: false, error: 'Đã nhập nội dung nhưng không tìm thấy nút gửi Messenger', error_code: 'COMPOSER_SEND_CONTROL_NOT_FOUND' };
         },
