@@ -1,10 +1,25 @@
 // AutoChatbot FB Engine - Service Worker Background Script
 let ws = null;
 let fb_dtsg = null;
+const TRUSTED_SEND_ADAPTER_VERSION = "trusted-send-v1";
 let user_id = null;
 let pending_key = null;
 let reconnectTimer = null;
 let reconnectDelay = 3000;
+
+async function dispatchTrustedEnter(tabId) {
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, '1.3');
+    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message, error_code: 'CDP_ENTER_FAILED' };
+  } finally {
+    try { await chrome.debugger.detach(target); } catch (error) {}
+  }
+}
 
 const WS_URLS = ['ws://127.0.0.1:5050/extension', 'ws://localhost:5050/extension'];
 let currentWsIndex = 0;
@@ -328,10 +343,15 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: msgTxt }));
           // Messenger exposes a stable semantic button for the composer.
           // Click DOM element, never screen coordinates.
-          const sendButton = document.querySelector(
+          const findSendButton = () => document.querySelector(
             'button[aria-label="Nhấn Enter để gửi"], [role="button"][aria-label="Nhấn Enter để gửi"], ' +
             'button[aria-label*="Gửi"], button[aria-label*="Send"]'
           ) || box.parentElement?.querySelector('button[type="submit"]');
+          let sendButton = findSendButton();
+          for (let i = 0; !sendButton && i < 30; i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            sendButton = findSendButton();
+          }
           if (sendButton) {
             sendButton.click();
             await new Promise((resolve) => setTimeout(resolve, 1200));
@@ -364,10 +384,21 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
       });
       const composer = composerResult?.[0]?.result;
       trace('COMPOSER_RESULT', { success: !!composer?.success, method: composer?.method || null, error_code: composer?.error_code || null, composer_cleared: composer?.composer_cleared ?? null });
+      if (!composer?.success && ['ENTER_SUBMIT_FAILED', 'COMPOSER_SEND_CONTROL_NOT_FOUND'].includes(composer?.error_code)) {
+        trace('CDP_ENTER_ATTEMPT', { adapter_version: TRUSTED_SEND_ADAPTER_VERSION, tab_id: tab.id });
+        const cdpResult = await dispatchTrustedEnter(tab.id);
+        trace('CDP_ENTER_RESULT', { adapter_version: TRUSTED_SEND_ADAPTER_VERSION, success: !!cdpResult.success, error_code: cdpResult.error_code || null });
+        if (cdpResult.success) {
+          sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, stage: 'CDP_ENTER', error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION', error_code: 'COMPOSER_DISPATCHED' });
+          return;
+        }
+        composer.error = cdpResult.error || composer.error;
+        composer.error_code = cdpResult.error_code || composer.error_code;
+      }
       if (composer?.success) {
         console.log('[SEND_MESSAGE] ✅ Đã gửi qua Messenger composer fallback');
         // Chờ DOM/network observer xác nhận message thật; không tự gán message_id giả.
-        sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION', error_code: 'COMPOSER_DISPATCHED' });
+        sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION', stage: composer?.method === 'composer-dom-click' ? 'DOM_CLICK' : 'POLL_COMPOSER', error_code: 'COMPOSER_DISPATCHED' });
       } else {
         const errMsg = composer?.error || tabRes?.error || lastSendError || 'Gửi tin nhắn qua Facebook thất bại';
         console.error('[SEND_MESSAGE] ❌ Gửi tin nhắn thất bại:', errMsg);

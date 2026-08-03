@@ -14,7 +14,8 @@
     "declarativeNetRequest",
     "tabs",
     "storage",
-    "scripting"
+    "scripting",
+    "debugger"
   ],
   "host_permissions": [
     "https://*.facebook.com/*",
@@ -45,5 +46,6 @@
       "js": ["textFilter.js", "content.js"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "x_crm_adapter_version": "trusted-send-v1"
 }

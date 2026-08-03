@@ -8,10 +8,10 @@
 
 ## Phase 2 — Extension browser adapter
 
-- [ ] T004 Add `debugger` permission and explicit adapter version marker in `src/extension/manifest.json`.
-- [ ] T005 Replace one-shot composer query with bounded semantic polling in `src/extension/background.js`.
-- [ ] T006 Implement one DOM click and confirmation probe in `src/extension/background.js`.
-- [ ] T007 Implement CDP `Input.dispatchKeyEvent` Enter fallback with attach/detach cleanup in `src/extension/background.js`.
+- [X] T004 Add `debugger` permission and explicit adapter version marker in `src/extension/manifest.json`.
+- [X] T005 Replace one-shot composer query with bounded semantic polling in `src/extension/background.js`.
+- [X] T006 Implement one DOM click and confirmation probe in `src/extension/background.js`.
+- [X] T007 Implement CDP `Input.dispatchKeyEvent` Enter fallback with attach/detach cleanup in `src/extension/background.js`.
 - [ ] T008 Remove synthetic-key success assumptions and return stage-specific diagnostics in `src/extension/background.js`.
 
 ## Phase 3 — Backend and UI
