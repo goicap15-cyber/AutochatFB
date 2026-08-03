@@ -337,24 +337,28 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
             await new Promise((resolve) => setTimeout(resolve, 1200));
             const remaining = (box.innerText || box.textContent || '').trim();
             if (!remaining || !remaining.includes(msgTxt)) {
-            return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label'), composer_after_click: remaining };
+              return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label'), composer_after_click: remaining };
             }
-            // Click did not clear the composer: try one Enter/form-submit fallback.
-            box.focus();
-            box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-            box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-            const fallbackForm = box.closest('form');
-            if (fallbackForm?.requestSubmit) fallbackForm.requestSubmit();
-            await new Promise((resolve) => setTimeout(resolve, 800));
-            const afterEnter = (box.innerText || box.textContent || '').trim();
-            return { success: true, method: 'composer-enter-fallback', click_label: sendButton.getAttribute('aria-label'), composer_cleared: !afterEnter || !afterEnter.includes(msgTxt), composer_after_enter: afterEnter };
           }
-          const form = box.closest('form');
-          if (form?.requestSubmit) {
-            form.requestSubmit();
-            return { success: true, method: 'composer-submit' };
-          }
-          return { success: false, error: 'Đã nhập nội dung nhưng không tìm thấy nút gửi Messenger', error_code: 'COMPOSER_SEND_CONTROL_NOT_FOUND' };
+          // Click không tìm thấy hoặc không clear composer: luôn chạy fallback
+          // Enter/form-submit đúng một lần, không phụ thuộc sendButton.
+          box.focus();
+          box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+          box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+          const fallbackForm = box.closest('form');
+          if (fallbackForm?.requestSubmit) fallbackForm.requestSubmit();
+          await new Promise((resolve) => setTimeout(resolve, 800));
+          const afterEnter = (box.innerText || box.textContent || '').trim();
+          const cleared = !afterEnter || !afterEnter.includes(msgTxt);
+          return {
+            success: cleared,
+            method: 'composer-enter-fallback',
+            click_found: !!sendButton,
+            click_label: sendButton?.getAttribute('aria-label') || null,
+            composer_cleared: cleared,
+            error: cleared ? null : 'Enter/form-submit không làm composer clear',
+            error_code: cleared ? null : 'ENTER_SUBMIT_FAILED'
+          };
         },
         args: [messageText]
       });
@@ -365,7 +369,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
         // Chờ DOM/network observer xác nhận message thật; không tự gán message_id giả.
         sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION', error_code: 'COMPOSER_DISPATCHED' });
       } else {
-        const errMsg = tabRes?.error || composer?.error || lastSendError || 'Gửi tin nhắn qua Facebook thất bại';
+        const errMsg = composer?.error || tabRes?.error || lastSendError || 'Gửi tin nhắn qua Facebook thất bại';
         console.error('[SEND_MESSAGE] ❌ Gửi tin nhắn thất bại:', errMsg);
         sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: errMsg, error_code: composer?.error_code || 'FACEBOOK_SEND_REJECTED' });
       }
