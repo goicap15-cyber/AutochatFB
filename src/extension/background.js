@@ -178,6 +178,7 @@ async function getFacebookTab(accountId) {
 // ── Gửi tin nhắn qua Facebook GraphQL API ──────────────────────────────────
 async function handleSendMessage({ thread_id, content, text, client_message_id }) {
   const messageText = content ?? text;
+  let lastSendError = null;
   if (!messageText || !messageText.trim()) {
     console.warn('[SEND_MESSAGE] Lỗi: Nội dung tin nhắn trống', { thread_id, client_message_id });
     sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Nội dung tin nhắn trống' });
@@ -213,7 +214,15 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
       });
 
       if (response.ok) {
-        const resJson = await response.json();
+        const rawBody = await response.text();
+        let resJson = null;
+        try { resJson = rawBody.trim() ? JSON.parse(rawBody) : null; } catch (parseError) {
+          lastSendError = `Facebook response không phải JSON (HTTP ${response.status})`;
+          console.warn('[SEND_MESSAGE] Facebook response parse thất bại:', { status: response.status, contentType: response.headers.get('content-type'), bodyLength: rawBody.length });
+        }
+        if (!resJson) {
+          lastSendError = lastSendError || `Facebook trả response rỗng (HTTP ${response.status})`;
+        } else {
         const hasError = resJson?.errors?.length || resJson?.o0?.errors?.length;
         const messageId = resJson?.o0?.data?.message?.message_id || resJson?.data?.message?.message_id || resJson?.o0?.data?.message_id || resJson?.data?.message_id || resJson?.o0?.data?.send_message?.message?.message_id;
 
@@ -222,9 +231,14 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: true, message_id: messageId, result: resJson });
           return;
         }
+        lastSendError = resJson?.errors?.[0]?.message || resJson?.o0?.errors?.[0]?.message || (hasError ? 'Facebook GraphQL trả về lỗi' : 'Facebook không trả message_id');
+        }
+      } else {
+        lastSendError = `Facebook HTTP ${response.status}`;
       }
     } catch (e) {
       console.warn('[SEND_MESSAGE] ServiceWorker Fetch thất bại, thử lại qua Tab context:', e.message);
+      lastSendError = e.message;
     }
   }
 
@@ -232,7 +246,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
   try {
     const tab = await getFacebookTab(user_id);
     if (!tab) {
-      sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không tìm thấy Tab Facebook hoạt động' });
+      sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không tìm thấy Tab Facebook hoạt động', error_code: 'FACEBOOK_TAB_NOT_FOUND' });
       return;
     }
 
@@ -266,11 +280,16 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
             body: formData.toString()
           });
 
-          const json = await res.json();
+          const rawBody = await res.text();
+          let json = null;
+          try { json = rawBody.trim() ? JSON.parse(rawBody) : null; } catch (parseError) {
+            return { success: false, error: `Facebook response không phải JSON (HTTP ${res.status})`, error_code: 'FACEBOOK_NON_JSON_RESPONSE' };
+          }
+          if (!json) return { success: false, error: `Facebook trả response rỗng (HTTP ${res.status})`, error_code: 'FACEBOOK_EMPTY_RESPONSE' };
           const msgId = json?.o0?.data?.message?.message_id || json?.data?.message?.message_id || json?.o0?.data?.message_id || json?.data?.send_message?.message?.message_id;
           const errMsg = json?.errors?.[0]?.message || json?.o0?.errors?.[0]?.message;
 
-          return { success: !!msgId, message_id: msgId, error: errMsg || (msgId ? null : 'Không nhận được message_id từ Facebook') };
+          return { success: !!msgId && res.ok && !errMsg, message_id: msgId, error: errMsg || (msgId ? null : `Facebook không trả message_id (HTTP ${res.status})`) };
         } catch (err) {
           return { success: false, error: err.message };
         }
@@ -285,11 +304,11 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
     } else {
       const errMsg = tabRes?.error || 'Gửi tin nhắn qua Tab Facebook thất bại';
       console.error('[SEND_MESSAGE] ❌ Gửi tin nhắn thất bại:', errMsg);
-      sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: errMsg });
+      sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: errMsg || lastSendError, error_code: 'FACEBOOK_SEND_REJECTED' });
     }
   } catch (err) {
     console.error('[SEND_MESSAGE] ❌ Lỗi ngoại lệ Tab Context:', err.message);
-    sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: err.message });
+    sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: err.message || lastSendError, error_code: 'FACEBOOK_SEND_EXCEPTION' });
   }
 }
 
@@ -1042,4 +1061,3 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
 
 // Khởi chạy kết nối WS khi service worker load
 connectWebSocket();
-

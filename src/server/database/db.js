@@ -27,7 +27,7 @@ let preMigrationBackupPath = null;
 if (dbExistedBeforeOpen) {
   const migrationTable = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migrations'").get();
   const currentVersion = migrationTable ? (db.prepare('SELECT MAX(version) AS version FROM migrations').get().version || 0) : 0;
-  if (currentVersion < 7) {
+  if (currentVersion < 8) {
     db.pragma('wal_checkpoint(TRUNCATE)');
     preMigrationBackupPath = DB_PATH + '.backup-' + Date.now();
     fs.copyFileSync(DB_PATH, preMigrationBackupPath);
@@ -133,6 +133,15 @@ const migrations = [
         if (/^(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen)\s+\d+\s+(?:giây|phút|giờ|ngày|tuần|tháng|năm)\s+(?:trước|ago)$/i.test(String(row.content || '').trim())) remove.run(row.id);
       }
       console.log('[DB] Removed ' + rows.length + ' delivery-status message rows.');
+    }
+  },
+  {
+    version: 8,
+    name: 'add_outbound_delivery_state',
+    up: (db) => {
+      try { db.exec("ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'sent';"); } catch (e) {}
+      try { db.exec("ALTER TABLE messages ADD COLUMN delivery_error TEXT;"); } catch (e) {}
+      db.exec("UPDATE messages SET delivery_status = CASE WHEN fb_message_id LIKE 'pending_%' THEN 'pending' ELSE 'sent' END WHERE delivery_status IS NULL;");
     }
   }
 ];

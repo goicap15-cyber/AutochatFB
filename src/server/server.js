@@ -78,8 +78,8 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
 
   // Lưu tin nhắn outgoing dạng pending vào CSDL
   const result = db.prepare(`
-    INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, is_outgoing)
-    VALUES (?, ?, ?, 'SYSTEM', ?, 1)
+    INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, is_outgoing, delivery_status)
+    VALUES (?, ?, ?, 'SYSTEM', ?, 1, 'pending')
   `).run(thread_id, pendingFbId, clientMsgId, text);
 
   db.prepare(`
@@ -91,6 +91,7 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
     thread_id,
     content: text,
     is_outgoing: true,
+    status: 'pending',
     created_at: new Date().toISOString(),
     client_message_id: clientMsgId
   });
@@ -165,11 +166,11 @@ wss.on('connection', (ws, req) => {
           if (success && officialFbId) {
             db.prepare(`
               UPDATE messages 
-              SET fb_message_id = ? 
+              SET fb_message_id = ?, delivery_status = 'sent', delivery_error = NULL
               WHERE client_message_id = ? OR fb_message_id = ?
             `).run(officialFbId, client_message_id, `pending_${client_message_id}`);
 
-            io.emit('MESSAGE_SENT', { thread_id, client_message_id, success: true, fb_message_id: officialFbId });
+            io.emit('MESSAGE_SENT', { thread_id, client_message_id, success: true, fb_message_id: officialFbId, status: 'sent' });
           } else {
             console.error('[WS] ❌ SEND_MESSAGE_RESULT failed or missing fb_msg_id:', {
               thread_id,
@@ -179,21 +180,13 @@ wss.on('connection', (ws, req) => {
               fbRes: JSON.stringify(fbRes)?.substring(0, 500)
             });
 
-            // Nếu gửi thất bại hoặc không có message_id chính thức từ Facebook, dọn dẹp bản ghi pending
+            // Giữ lại bản ghi để operator thấy lỗi và retry; tuyệt đối không báo thành công.
             db.prepare(`
-              DELETE FROM messages 
+              UPDATE messages SET delivery_status = 'failed', delivery_error = ?
               WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
-            `).run(client_message_id, `pending_${client_message_id}`);
+            `).run(error || 'Facebook không xác nhận message_id', client_message_id, `pending_${client_message_id}`);
 
-            const lastValid = db.prepare(`
-              SELECT content FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT 1
-            `).get(thread_id);
-
-            db.prepare(`
-              UPDATE threads SET last_message = ? WHERE id = ?
-            `).run(lastValid?.content || 'Chưa có tin nhắn', thread_id);
-
-            io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, error: error || 'Facebook không xác nhận message_id' });
+            io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: error || 'Facebook không xác nhận message_id' });
           }
           break;
         }

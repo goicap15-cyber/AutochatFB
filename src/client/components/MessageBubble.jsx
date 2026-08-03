@@ -22,7 +22,7 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
   const isUnsent = Boolean(msg.is_unsent || msg.unsent);
   const content = msg.content || msg.text || msg.message || '';
   const senderName = msg.sender_name || (isOutgoing ? (msg.is_ai || msg.sender_type === 'ai' ? 'AI' : 'Bạn') : activeThread?.contact_name || 'Khách hàng');
-  const status = msg.status || (msg.is_failed ? 'failed' : msg.is_sending ? 'sending' : 'sent');
+  const status = msg.status || msg.delivery_status || (msg.is_failed ? 'failed' : msg.is_sending ? 'sending' : 'sent');
   const timeLabel = formatTime(msg.timestamp_ms || msg.created_at || msg.time);
   const avatarUrl = msg.sender_avatar || activeThread?.avatar_url;
   const avatarInitial = (senderName || activeThread?.contact_name || 'K').charAt(0).toUpperCase();
@@ -72,7 +72,7 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
         <div className={`flex items-center gap-1 mt-1 text-xs text-[var(--color-text-muted)] ${isOutgoing ? 'justify-end' : 'justify-start'}`}>
           {isOutgoing && <span className="font-medium">{senderName}</span>}
           {timeLabel && <span className="font-mono">{timeLabel}</span>}
-          {isOutgoing && status === 'sending' && (
+          {isOutgoing && (status === 'sending' || status === 'pending') && (
             <span className="inline-flex items-center gap-1">
               <Loader2 size={12} className="animate-spin text-[var(--color-accent)]" />
               Đang gửi
@@ -84,7 +84,7 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
               Thử lại
             </button>
           )}
-          {isOutgoing && status !== 'sending' && status !== 'failed' && (
+          {isOutgoing && status !== 'sending' && status !== 'pending' && status !== 'failed' && (
             status === 'read' || status === 'delivered' ? (
               <CheckCheck size={13} className="text-[var(--color-accent)]" strokeWidth={1.75} />
             ) : (

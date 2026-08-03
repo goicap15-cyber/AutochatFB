@@ -153,12 +153,12 @@ export default function App() {
           const existsIdx = currentMsgs.findIndex(m => m.client_message_id === newMsg.client_message_id);
           if (existsIdx >= 0) {
             updated = [...currentMsgs];
-            updated[existsIdx] = { ...newMsg, status: 'sent' };
+            updated[existsIdx] = { ...currentMsgs[existsIdx], ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' };
           } else {
-            updated = [...currentMsgs, { ...newMsg, status: 'sent' }];
+            updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
           }
         } else {
-          updated = [...currentMsgs, { ...newMsg, status: 'sent' }];
+          updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
         }
         
         updated.sort((a, b) => {
@@ -183,13 +183,13 @@ export default function App() {
       loadThreadsRef.current();
     });
 
-    socket.on('MESSAGE_SENT', ({ thread_id, client_message_id }) => {
+    socket.on('MESSAGE_SENT', ({ thread_id, client_message_id, fb_message_id }) => {
       const tidStr = String(thread_id);
       setMessages(prev => {
         const currentMsgs = prev[tidStr] || [];
         return {
           ...prev,
-          [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'sent' } : m)
+          [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'sent', delivery_status: 'sent', fb_message_id: fb_message_id || m.fb_message_id, error: null } : m)
         };
       });
     });
@@ -200,7 +200,7 @@ export default function App() {
         const currentMsgs = prev[tidStr] || [];
         return {
           ...prev,
-          [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'failed', error } : m)
+          [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'failed', delivery_status: 'failed', error } : m)
         };
       });
     });
@@ -363,7 +363,7 @@ export default function App() {
 
   const handleRetryMessage = (msg) => {
     if (msg?.content) {
-      handleSendMessage(msg.content, msg.client_message_id || `retry_${Date.now()}`);
+      handleSendMessage(msg.content, `retry_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
     }
   };
 
