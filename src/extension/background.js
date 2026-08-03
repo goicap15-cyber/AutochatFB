@@ -319,9 +319,17 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           box.focus();
           document.execCommand('insertText', false, msgTxt);
           box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: msgTxt }));
-          box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-          box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-          return { success: true, method: 'composer' };
+          const form = box.closest('form');
+          if (form?.requestSubmit) {
+            form.requestSubmit();
+            return { success: true, method: 'composer-submit' };
+          }
+          const sendButton = box.parentElement?.querySelector('button[type="submit"], [aria-label*="Gửi"], [aria-label*="Send"]');
+          if (sendButton) {
+            sendButton.click();
+            return { success: true, method: 'composer-click' };
+          }
+          return { success: false, error: 'Đã nhập nội dung nhưng không tìm thấy nút gửi Messenger', error_code: 'COMPOSER_SEND_CONTROL_NOT_FOUND' };
         },
         args: [messageText]
       });
