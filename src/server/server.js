@@ -277,6 +277,15 @@ wss.on('connection', (ws, req) => {
           // Composer fallback không có official GraphQL ID; ghép confirmation DOM
           // vào bản pending gần nhất cùng thread/nội dung thay vì tạo bubble thứ hai.
           if (isOutgoing && m.source === 'dom_observer' && m.content) {
+            // Fix: Tránh crash UNIQUE constraint khi DOM observer gửi lại tin nhắn cũ có trùng content
+            if (m.fb_message_id) {
+               const existingFbId = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(m.fb_message_id);
+               if (existingFbId) {
+                   console.log(`[WS] DOM observer sent an already known fb_message_id (${m.fb_message_id}). Bỏ qua event để tránh ghi đè pending.`);
+                   break;
+               }
+            }
+
             const pending = db.prepare(`
               SELECT id, client_message_id FROM messages
               WHERE thread_id = ? AND content = ? AND is_outgoing = 1 AND delivery_status = 'pending'
@@ -284,6 +293,11 @@ wss.on('connection', (ws, req) => {
             `).get(m.thread_id, m.content);
             if (pending) {
               const confirmedId = m.fb_message_id || `dom_${pending.client_message_id}`;
+              const existingConfirmed = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(confirmedId);
+              if (existingConfirmed) {
+                  console.log(`[WS] Confirmed ID ${confirmedId} đã tồn tại. Bỏ qua pending match.`);
+                  break;
+              }
               db.prepare(`
                 UPDATE messages SET fb_message_id = ?, delivery_status = 'sent', delivery_error = NULL,
                   timestamp_ms = CASE WHEN ? > 0 THEN ? ELSE timestamp_ms END,
