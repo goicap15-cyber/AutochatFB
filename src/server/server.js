@@ -74,8 +74,6 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
   const clientMsgId = client_message_id || `client_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const pendingFbId = `pending_${clientMsgId}`;
 
-  extWs.send(JSON.stringify({ type: 'SEND_MESSAGE', data: { thread_id, content: text, client_message_id: clientMsgId } }));
-
   // Lưu tin nhắn outgoing dạng pending vào CSDL
   const result = db.prepare(`
     INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, is_outgoing, delivery_status)
@@ -85,6 +83,10 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
   db.prepare(`
     UPDATE threads SET last_message = ?, last_activity = CURRENT_TIMESTAMP WHERE id = ?
   `).run(text, thread_id);
+
+  // Persist trước khi dispatch để DOM/network confirmation không chạy vào race
+  // window và luôn tìm thấy bản ghi pending để ghép đúng client_message_id.
+  extWs.send(JSON.stringify({ type: 'SEND_MESSAGE', data: { thread_id, content: text, client_message_id: clientMsgId } }));
 
   io.emit('NEW_MESSAGE', {
     id: result.lastInsertRowid,
