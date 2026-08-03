@@ -73,12 +73,15 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
 
   const clientMsgId = client_message_id || `client_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const pendingFbId = `pending_${clientMsgId}`;
+  const trace = (stage, extra = {}) => console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage, thread_id: String(thread_id), client_message_id: clientMsgId, at: new Date().toISOString(), ...extra }));
+  trace('BACKEND_SEND_REQUEST');
 
   // Lưu tin nhắn outgoing dạng pending vào CSDL
   const result = db.prepare(`
     INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, is_outgoing, delivery_status)
     VALUES (?, ?, ?, 'SYSTEM', ?, 1, 'pending')
   `).run(thread_id, pendingFbId, clientMsgId, text);
+  trace('BACKEND_PENDING_CREATED', { row_id: result.lastInsertRowid });
 
   db.prepare(`
     UPDATE threads SET last_message = ?, last_activity = CURRENT_TIMESTAMP WHERE id = ?
@@ -87,6 +90,7 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
   // Persist trước khi dispatch để DOM/network confirmation không chạy vào race
   // window và luôn tìm thấy bản ghi pending để ghép đúng client_message_id.
   extWs.send(JSON.stringify({ type: 'SEND_MESSAGE', data: { thread_id, content: text, client_message_id: clientMsgId } }));
+  trace('BACKEND_DISPATCHED_EXTENSION');
 
   io.emit('NEW_MESSAGE', {
     id: result.lastInsertRowid,
@@ -164,6 +168,7 @@ wss.on('connection', (ws, req) => {
           const officialFbId = message_id || fbRes?.o0?.data?.message?.message_id || fbRes?.o0?.data?.message_id || fbRes?.data?.message_id;
           
           console.log(`[WS] SEND_MESSAGE_RESULT: thread=${thread_id} client_msg_id=${client_message_id} success=${success} fb_msg_id=${officialFbId}`);
+          console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_RESULT_RECEIVED', thread_id: String(thread_id), client_message_id, success: !!success, official_fb_id: !!officialFbId, error_code: error_code || null, error: error || null, at: new Date().toISOString() }));
           
           if (success && officialFbId) {
             db.prepare(`
@@ -175,7 +180,8 @@ wss.on('connection', (ws, req) => {
             io.emit('MESSAGE_SENT', { thread_id, client_message_id, success: true, fb_message_id: officialFbId, status: 'sent' });
           } else if (error_code === 'COMPOSER_DISPATCHED') {
             console.log(`[WS] Composer đã dispatch tin; giữ pending chờ DOM/network confirmation: ${client_message_id}`);
-            io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error_code });
+              io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error_code });
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_CONFIRMATION_GRACE', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
           } else {
             console.error('[WS] ❌ SEND_MESSAGE_RESULT failed or missing fb_msg_id:', {
               thread_id,
@@ -294,6 +300,7 @@ wss.on('connection', (ws, req) => {
           // Composer fallback không có official GraphQL ID; ghép confirmation DOM
           // vào bản pending gần nhất cùng thread/nội dung thay vì tạo bubble thứ hai.
           if (isOutgoing && m.source === 'dom_observer' && m.content) {
+            console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_OUTGOING_RECEIVED', thread_id: String(threadId), fb_message_id: m.fb_message_id || null, at: new Date().toISOString() }));
             // Fix: Tránh crash UNIQUE constraint khi DOM observer gửi lại tin nhắn cũ có trùng content
             if (m.fb_message_id) {
                const existingFbId = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(m.fb_message_id);
@@ -324,6 +331,7 @@ wss.on('connection', (ws, req) => {
               io.emit('MESSAGE_SENT', { thread_id: m.thread_id, client_message_id: pending.client_message_id, fb_message_id: confirmedId, status: 'sent' });
               io.emit('NEW_MESSAGE', { ...m, client_message_id: pending.client_message_id, fb_message_id: confirmedId, delivery_status: 'sent', status: 'sent', is_outgoing: true, timestamp_ms: tsMs, timestamp_source: tsSource, created_at: createdAt });
               console.log(`[WS] Đã ghép DOM confirmation vào pending outbound ${pending.client_message_id}`);
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_CORRELATED', thread_id: String(m.thread_id), client_message_id: pending.client_message_id, fb_message_id: confirmedId, at: new Date().toISOString() }));
               break;
             }
           }

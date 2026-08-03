@@ -179,16 +179,19 @@ async function getFacebookTab(accountId) {
 async function handleSendMessage({ thread_id, content, text, client_message_id }) {
   const messageText = content ?? text;
   let lastSendError = null;
+  const trace = (stage, extra = {}) => console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage, thread_id: String(thread_id), client_message_id, at: new Date().toISOString(), ...extra }));
   if (!messageText || !messageText.trim()) {
     console.warn('[SEND_MESSAGE] Lỗi: Nội dung tin nhắn trống', { thread_id, client_message_id });
     sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Nội dung tin nhắn trống' });
     return;
   }
+  trace('EXTENSION_SEND_RECEIVED', { text_length: String(messageText).length });
 
   console.log(`[SEND_MESSAGE] 📤 Đang gửi tin nhắn: account=${user_id} thread=${thread_id} client_msg_id=${client_message_id}`);
 
   // Cách 1: Thử gửi trực tiếp qua Service Worker Fetch nếu có token
   if (fb_dtsg) {
+    trace('GRAPHQL_ATTEMPT_START', { token_available: true });
     try {
       const formData = new URLSearchParams();
       formData.append('fb_dtsg', fb_dtsg);
@@ -222,12 +225,14 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
         }
         if (!resJson) {
           lastSendError = lastSendError || `Facebook trả response rỗng (HTTP ${response.status})`;
+          trace('GRAPHQL_RESPONSE_EMPTY', { http_status: response.status });
         } else {
         const hasError = resJson?.errors?.length || resJson?.o0?.errors?.length;
         const messageId = resJson?.o0?.data?.message?.message_id || resJson?.data?.message?.message_id || resJson?.o0?.data?.message_id || resJson?.data?.message_id || resJson?.o0?.data?.send_message?.message?.message_id;
 
         if (!hasError && messageId) {
           console.log('[SEND_MESSAGE] ✅ ServiceWorker Fetch gửi thành công, message_id:', messageId);
+          trace('GRAPHQL_CONFIRMED', { http_status: response.status, message_id: true });
           sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: true, message_id: messageId, result: resJson });
           return;
         }
@@ -235,6 +240,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
         }
       } else {
         lastSendError = `Facebook HTTP ${response.status}`;
+        trace('GRAPHQL_HTTP_ERROR', { http_status: response.status });
       }
     } catch (e) {
       console.warn('[SEND_MESSAGE] ServiceWorker Fetch thất bại, thử lại qua Tab context:', e.message);
@@ -249,6 +255,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
       sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không tìm thấy Tab Facebook hoạt động', error_code: 'FACEBOOK_TAB_NOT_FOUND' });
       return;
     }
+    trace('TAB_CONTEXT_SELECTED', { tab_id: tab.id });
 
     const tabSendResult = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -315,7 +322,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
               return rect.width > 0 && rect.height > 0 && !label.includes('search') && !label.includes('tìm kiếm');
             });
           const box = candidates[candidates.length - 1];
-          if (!box) return { success: false, error: 'Không tìm thấy ô soạn Messenger', error_code: 'COMPOSER_NOT_FOUND' };
+          if (!box) return { success: false, error: 'Không tìm thấy ô soạn Messenger', error_code: 'COMPOSER_NOT_FOUND', candidates: candidates.length };
           box.focus();
           document.execCommand('insertText', false, msgTxt);
           box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: msgTxt }));
@@ -330,7 +337,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
             await new Promise((resolve) => setTimeout(resolve, 1200));
             const remaining = (box.innerText || box.textContent || '').trim();
             if (!remaining || !remaining.includes(msgTxt)) {
-              return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label') };
+            return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label'), composer_after_click: remaining };
             }
             // Click did not clear the composer: try one Enter/form-submit fallback.
             box.focus();
@@ -340,7 +347,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
             if (fallbackForm?.requestSubmit) fallbackForm.requestSubmit();
             await new Promise((resolve) => setTimeout(resolve, 800));
             const afterEnter = (box.innerText || box.textContent || '').trim();
-            return { success: true, method: 'composer-enter-fallback', click_label: sendButton.getAttribute('aria-label'), composer_cleared: !afterEnter || !afterEnter.includes(msgTxt) };
+            return { success: true, method: 'composer-enter-fallback', click_label: sendButton.getAttribute('aria-label'), composer_cleared: !afterEnter || !afterEnter.includes(msgTxt), composer_after_enter: afterEnter };
           }
           const form = box.closest('form');
           if (form?.requestSubmit) {
@@ -352,6 +359,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
         args: [messageText]
       });
       const composer = composerResult?.[0]?.result;
+      trace('COMPOSER_RESULT', { success: !!composer?.success, method: composer?.method || null, error_code: composer?.error_code || null, composer_cleared: composer?.composer_cleared ?? null });
       if (composer?.success) {
         console.log('[SEND_MESSAGE] ✅ Đã gửi qua Messenger composer fallback');
         // Chờ DOM/network observer xác nhận message thật; không tự gán message_id giả.
