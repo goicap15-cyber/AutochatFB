@@ -66,7 +66,12 @@ for (const filename of fs.readdirSync(SRC_DIR)) {
     }
   } else {
     // Các file khác (icons, etc.): copy nguyên
-    fs.copyFileSync(srcPath, outPath);
+    const stat = fs.statSync(srcPath);
+    if (stat.isDirectory()) {
+      fs.cpSync(srcPath, outPath, { recursive: true, force: true });
+    } else {
+      fs.copyFileSync(srcPath, outPath);
+    }
     console.log(`[copy]  ${filename}`);
   }
 }
