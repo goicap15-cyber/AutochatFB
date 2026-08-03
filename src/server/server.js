@@ -185,13 +185,30 @@ wss.on('connection', (ws, req) => {
               fbRes: JSON.stringify(fbRes)?.substring(0, 500)
             });
 
-            // Giữ lại bản ghi để operator thấy lỗi và retry; tuyệt đối không báo thành công.
-            db.prepare(`
-              UPDATE messages SET delivery_status = 'failed', delivery_error = ?
-              WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
-            `).run(error || 'Facebook không xác nhận message_id', client_message_id, `pending_${client_message_id}`);
-
-            io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: error || 'Facebook không xác nhận message_id', error_code });
+            const failureText = error || 'Facebook không xác nhận message_id';
+            const canArriveLateFromComposer = /response rỗng|không nhận message_id|GraphQL/i.test(failureText);
+            if (canArriveLateFromComposer) {
+              // GraphQL có thể lỗi trước khi composer/DOM kịp xác nhận. Giữ pending
+              // một grace window để event đến muộn vẫn ghép được đúng attempt.
+              db.prepare(`
+                UPDATE messages SET delivery_status = 'pending', delivery_error = ?
+                WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
+              `).run(failureText, client_message_id, `pending_${client_message_id}`);
+              io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error: failureText, error_code: 'CONFIRMATION_GRACE' });
+              setTimeout(() => {
+                const stillPending = db.prepare(`SELECT id FROM messages WHERE client_message_id = ? AND delivery_status = 'pending'`).get(client_message_id);
+                if (!stillPending) return;
+                db.prepare(`UPDATE messages SET delivery_status = 'failed', delivery_error = ? WHERE id = ?`).run(failureText, stillPending.id);
+                io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: failureText, error_code: error_code || 'CONFIRMATION_TIMEOUT' });
+              }, 5000);
+            } else {
+              // Lỗi chắc chắn không thể gửi: giữ lịch sử nhưng chuyển failed ngay.
+              db.prepare(`
+                UPDATE messages SET delivery_status = 'failed', delivery_error = ?
+                WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
+              `).run(failureText, client_message_id, `pending_${client_message_id}`);
+              io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: failureText, error_code });
+            }
           }
           break;
         }
