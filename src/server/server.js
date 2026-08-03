@@ -158,7 +158,7 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'SEND_MESSAGE_RESULT': {
-          const { thread_id, client_message_id, success, error, message_id, result: fbRes } = msg.data;
+          const { thread_id, client_message_id, success, error, error_code, message_id, result: fbRes } = msg.data;
           const officialFbId = message_id || fbRes?.o0?.data?.message?.message_id || fbRes?.o0?.data?.message_id || fbRes?.data?.message_id;
           
           console.log(`[WS] SEND_MESSAGE_RESULT: thread=${thread_id} client_msg_id=${client_message_id} success=${success} fb_msg_id=${officialFbId}`);
@@ -171,6 +171,9 @@ wss.on('connection', (ws, req) => {
             `).run(officialFbId, client_message_id, `pending_${client_message_id}`);
 
             io.emit('MESSAGE_SENT', { thread_id, client_message_id, success: true, fb_message_id: officialFbId, status: 'sent' });
+          } else if (error_code === 'COMPOSER_DISPATCHED') {
+            console.log(`[WS] Composer đã dispatch tin; giữ pending chờ DOM/network confirmation: ${client_message_id}`);
+            io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error_code });
           } else {
             console.error('[WS] ❌ SEND_MESSAGE_RESULT failed or missing fb_msg_id:', {
               thread_id,
@@ -186,7 +189,7 @@ wss.on('connection', (ws, req) => {
               WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
             `).run(error || 'Facebook không xác nhận message_id', client_message_id, `pending_${client_message_id}`);
 
-            io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: error || 'Facebook không xác nhận message_id' });
+            io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: error || 'Facebook không xác nhận message_id', error_code });
           }
           break;
         }
@@ -269,6 +272,28 @@ wss.on('connection', (ws, req) => {
           const createdAt = (m.created_at && !isNaN(Date.parse(m.created_at))) ? m.created_at : new Date().toISOString();
 
           const safeSenderId = m.sender_id || (isOutgoing ? String(targetAccountId) : 'CONTACT');
+          // Composer fallback không có official GraphQL ID; ghép confirmation DOM
+          // vào bản pending gần nhất cùng thread/nội dung thay vì tạo bubble thứ hai.
+          if (isOutgoing && m.source === 'dom_observer' && m.content) {
+            const pending = db.prepare(`
+              SELECT id, client_message_id FROM messages
+              WHERE thread_id = ? AND content = ? AND is_outgoing = 1 AND delivery_status = 'pending'
+              ORDER BY id DESC LIMIT 1
+            `).get(m.thread_id, m.content);
+            if (pending) {
+              const confirmedId = m.fb_message_id || `dom_${pending.client_message_id}`;
+              db.prepare(`
+                UPDATE messages SET fb_message_id = ?, delivery_status = 'sent', delivery_error = NULL,
+                  timestamp_ms = CASE WHEN ? > 0 THEN ? ELSE timestamp_ms END,
+                  timestamp_source = CASE WHEN ? <> 'unknown' THEN ? ELSE timestamp_source END
+                WHERE id = ?
+              `).run(confirmedId, tsMs, tsMs, tsSource, tsSource, pending.id);
+              io.emit('MESSAGE_SENT', { thread_id: m.thread_id, client_message_id: pending.client_message_id, fb_message_id: confirmedId, status: 'sent' });
+              io.emit('NEW_MESSAGE', { ...m, client_message_id: pending.client_message_id, fb_message_id: confirmedId, delivery_status: 'sent', status: 'sent', is_outgoing: true, timestamp_ms: tsMs, timestamp_source: tsSource, created_at: createdAt });
+              console.log(`[WS] Đã ghép DOM confirmation vào pending outbound ${pending.client_message_id}`);
+              break;
+            }
+          }
           // Lưu tin nhắn vào bảng messages
           const stableMessageId = m.fb_message_id || m.client_message_id || ConversationRepository.fingerprint(m.thread_id, m);
           const insertMsgResult = db.prepare(`

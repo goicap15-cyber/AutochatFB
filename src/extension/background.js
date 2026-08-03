@@ -302,9 +302,39 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
       console.log('[SEND_MESSAGE] ✅ Tab Context GraphQL gửi thành công, message_id:', tabRes.message_id);
       sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: true, message_id: tabRes.message_id });
     } else {
-      const errMsg = tabRes?.error || 'Gửi tin nhắn qua Tab Facebook thất bại';
-      console.error('[SEND_MESSAGE] ❌ Gửi tin nhắn thất bại:', errMsg);
-      sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: errMsg || lastSendError, error_code: 'FACEBOOK_SEND_REJECTED' });
+      // Facebook đôi khi trả body rỗng cho GraphQL. Fallback qua composer thật
+      // của tab giúp gửi được trong phiên Messenger hiện tại mà không phụ thuộc
+      // response JSON private API.
+      const composerResult = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: (msgTxt) => {
+          const candidates = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
+            .filter((el) => {
+              const rect = el.getBoundingClientRect();
+              const label = (el.getAttribute('aria-label') || '').toLowerCase();
+              return rect.width > 0 && rect.height > 0 && !label.includes('search') && !label.includes('tìm kiếm');
+            });
+          const box = candidates[candidates.length - 1];
+          if (!box) return { success: false, error: 'Không tìm thấy ô soạn Messenger', error_code: 'COMPOSER_NOT_FOUND' };
+          box.focus();
+          document.execCommand('insertText', false, msgTxt);
+          box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: msgTxt }));
+          box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+          box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+          return { success: true, method: 'composer' };
+        },
+        args: [messageText]
+      });
+      const composer = composerResult?.[0]?.result;
+      if (composer?.success) {
+        console.log('[SEND_MESSAGE] ✅ Đã gửi qua Messenger composer fallback');
+        // Chờ DOM/network observer xác nhận message thật; không tự gán message_id giả.
+        sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION', error_code: 'COMPOSER_DISPATCHED' });
+      } else {
+        const errMsg = tabRes?.error || composer?.error || lastSendError || 'Gửi tin nhắn qua Facebook thất bại';
+        console.error('[SEND_MESSAGE] ❌ Gửi tin nhắn thất bại:', errMsg);
+        sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: errMsg, error_code: composer?.error_code || 'FACEBOOK_SEND_REJECTED' });
+      }
     }
   } catch (err) {
     console.error('[SEND_MESSAGE] ❌ Lỗi ngoại lệ Tab Context:', err.message);
