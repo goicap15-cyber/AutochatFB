@@ -307,7 +307,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
       // response JSON private API.
       const composerResult = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: (msgTxt) => {
+        func: async (msgTxt) => {
           const candidates = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
             .filter((el) => {
               const rect = el.getBoundingClientRect();
@@ -327,7 +327,20 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           ) || box.parentElement?.querySelector('button[type="submit"]');
           if (sendButton) {
             sendButton.click();
-            return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label') };
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            const remaining = (box.innerText || box.textContent || '').trim();
+            if (!remaining || !remaining.includes(msgTxt)) {
+              return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label') };
+            }
+            // Click did not clear the composer: try one Enter/form-submit fallback.
+            box.focus();
+            box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+            const fallbackForm = box.closest('form');
+            if (fallbackForm?.requestSubmit) fallbackForm.requestSubmit();
+            await new Promise((resolve) => setTimeout(resolve, 800));
+            const afterEnter = (box.innerText || box.textContent || '').trim();
+            return { success: true, method: 'composer-enter-fallback', click_label: sendButton.getAttribute('aria-label'), composer_cleared: !afterEnter || !afterEnter.includes(msgTxt) };
           }
           const form = box.closest('form');
           if (form?.requestSubmit) {
