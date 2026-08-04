@@ -46,6 +46,5 @@
       "js": ["textFilter.js", "content.js"],
       "run_at": "document_idle"
     }
-  ],
-  "x_crm_adapter_version": "trusted-send-v1"
+  ]
 }

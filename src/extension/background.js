@@ -21,6 +21,20 @@ async function dispatchTrustedEnter(tabId) {
   }
 }
 
+
+async function dispatchTrustedText(tabId, text) {
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, '1.3');
+    await chrome.debugger.sendCommand(target, 'Input.insertText', { text });
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message, error_code: 'CDP_INSERT_TEXT_FAILED' };
+  } finally {
+    try { await chrome.debugger.detach(target); } catch (error) {}
+  }
+}
+
 const WS_URLS = ['ws://127.0.0.1:5050/extension', 'ws://localhost:5050/extension'];
 let currentWsIndex = 0;
 
@@ -327,9 +341,17 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
       // Facebook đôi khi trả body rỗng cho GraphQL. Fallback qua composer thật
       // của tab giúp gửi được trong phiên Messenger hiện tại mà không phụ thuộc
       // response JSON private API.
-      const composerResult = await chrome.scripting.executeScript({
+      const composerPrepResult = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        func: async (msgTxt) => {
+        func: (msgTxt) => {
+          const normalizeComposerText = (text) => {
+            if (!text) return '';
+            let norm = String(text).replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\u00A0/g, ' ');
+            norm = norm.replace(/\s+/g, ' ').trim();
+            const lower = norm.toLowerCase();
+            if (lower === 'aa' || lower === 'tin nhắn' || lower === 'soạn tin nhắn' || lower === 'message') return '';
+            return norm;
+          };
           const candidates = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
             .filter((el) => {
               const rect = el.getBoundingClientRect();
@@ -339,50 +361,97 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           const box = candidates[candidates.length - 1];
           if (!box) return { success: false, error: 'Không tìm thấy ô soạn Messenger', error_code: 'COMPOSER_NOT_FOUND', candidates: candidates.length };
           box.focus();
-          document.execCommand('insertText', false, msgTxt);
-          box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: msgTxt }));
-          // Messenger exposes a stable semantic button for the composer.
-          // Click DOM element, never screen coordinates.
-          const findSendButton = () => document.querySelector(
-            'button[aria-label="Nhấn Enter để gửi"], [role="button"][aria-label="Nhấn Enter để gửi"], ' +
-            'button[aria-label*="Gửi"], button[aria-label*="Send"]'
-          ) || box.parentElement?.querySelector('button[type="submit"]');
-          let sendButton = findSendButton();
-          for (let i = 0; !sendButton && i < 30; i += 1) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            sendButton = findSendButton();
+          const beforeText = normalizeComposerText(box.innerText || box.textContent || '');
+          if (beforeText !== '') {
+            return { success: false, error: 'Composer đang có text lạ', error_code: 'COMPOSER_NOT_EMPTY', composer_content_length: beforeText.length };
           }
-          if (sendButton) {
-            sendButton.click();
-            await new Promise((resolve) => setTimeout(resolve, 1200));
-            const remaining = (box.innerText || box.textContent || '').trim();
-            if (!remaining || !remaining.includes(msgTxt)) {
-              return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label'), composer_after_click: remaining };
-            }
-          }
-          // Click không tìm thấy hoặc không clear composer: luôn chạy fallback
-          // Enter/form-submit đúng một lần, không phụ thuộc sendButton.
-          box.focus();
-          box.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-          box.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
-          const fallbackForm = box.closest('form');
-          if (fallbackForm?.requestSubmit) fallbackForm.requestSubmit();
-          await new Promise((resolve) => setTimeout(resolve, 800));
-          const afterEnter = (box.innerText || box.textContent || '').trim();
-          const cleared = !afterEnter || !afterEnter.includes(msgTxt);
-          return {
-            success: cleared,
-            method: 'composer-enter-fallback',
-            click_found: !!sendButton,
-            click_label: sendButton?.getAttribute('aria-label') || null,
-            composer_cleared: cleared,
-            error: cleared ? null : 'Enter/form-submit không làm composer clear',
-            error_code: cleared ? null : 'ENTER_SUBMIT_FAILED'
-          };
+          return { success: true, method: 'composer-ready' };
         },
         args: [messageText]
       });
-      const composer = composerResult?.[0]?.result;
+      let composer = composerPrepResult?.[0]?.result;
+
+      if (composer?.success) {
+        const insertResult = await dispatchTrustedText(tab.id, messageText);
+        if (!insertResult.success) {
+          composer = { success: false, method: 'cdp-insert-text', error: insertResult.error || 'CDP insert text failed', error_code: insertResult.error_code || 'CDP_INSERT_TEXT_FAILED' };
+        } else {
+          const composerSendResult = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: async (msgTxt) => {
+              const normalizeComposerText = (text) => {
+                if (!text) return '';
+                let norm = String(text).replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\u00A0/g, ' ');
+                norm = norm.replace(/\s+/g, ' ').trim();
+                const lower = norm.toLowerCase();
+                if (lower === 'aa' || lower === 'tin nhắn' || lower === 'soạn tin nhắn' || lower === 'message') return '';
+                return norm;
+              };
+              const cleanupComposer = (box) => {
+                try {
+                  box.focus();
+                  document.execCommand('selectAll', false, null);
+                  document.execCommand('delete', false, null);
+                } catch (_e) { /* best-effort */ }
+              };
+              const candidates = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
+                .filter((el) => {
+                  const rect = el.getBoundingClientRect();
+                  const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                  return rect.width > 0 && rect.height > 0 && !label.includes('search') && !label.includes('tìm kiếm');
+                });
+              const box = candidates[candidates.length - 1];
+              if (!box) return { success: false, error: 'Không tìm thấy ô soạn Messenger sau khi insert', error_code: 'COMPOSER_NOT_FOUND', candidates: candidates.length };
+
+              const normalizedMsgTxt = normalizeComposerText(msgTxt);
+              let afterText = '';
+              for (let i = 0; i < 10; i += 1) {
+                afterText = normalizeComposerText(box.innerText || box.textContent || '');
+                if (afterText) break;
+                await new Promise((resolve) => setTimeout(resolve, 70));
+              }
+
+              if (afterText === normalizedMsgTxt + normalizedMsgTxt) {
+                cleanupComposer(box);
+                return { success: false, error: 'Composer bị chèn lặp nội dung', error_code: 'COMPOSER_CONTENT_MISMATCH', composer_content_length: afterText.length };
+              }
+              if (afterText !== normalizedMsgTxt) {
+                cleanupComposer(box);
+                return { success: false, error: 'Nội dung composer không khớp sau khi insert', error_code: afterText ? 'COMPOSER_CONTENT_MISMATCH' : 'COMPOSER_CONTENT_MISSING', composer_content_length: afterText.length };
+              }
+
+              const findSendButton = () => document.querySelector(
+                'button[aria-label="Nhấn Enter để gửi"], [role="button"][aria-label="Nhấn Enter để gửi"], ' +
+                'button[aria-label*="Gửi"], button[aria-label*="Send"]'
+              ) || box.parentElement?.querySelector('button[type="submit"]');
+              let sendButton = findSendButton();
+              for (let i = 0; !sendButton && i < 30; i += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+                sendButton = findSendButton();
+              }
+              if (sendButton) {
+                sendButton.click();
+                await new Promise((resolve) => setTimeout(resolve, 1200));
+                const remaining = normalizeComposerText(box.innerText || box.textContent || '');
+                if (remaining === '') {
+                  return { success: true, method: 'composer-dom-click', aria_label: sendButton.getAttribute('aria-label'), composer_after_click: remaining };
+                }
+              }
+              return {
+                success: false,
+                method: 'composer-enter-fallback',
+                click_found: !!sendButton,
+                click_label: sendButton?.getAttribute('aria-label') || null,
+                composer_cleared: false,
+                error: 'DOM click không thành công, chuyển sang CDP',
+                error_code: 'ENTER_SUBMIT_FAILED'
+              };
+            },
+            args: [messageText]
+          });
+          composer = composerSendResult?.[0]?.result;
+        }
+      }
       trace('COMPOSER_RESULT', { success: !!composer?.success, method: composer?.method || null, error_code: composer?.error_code || null, composer_cleared: composer?.composer_cleared ?? null });
       if (!composer?.success && ['ENTER_SUBMIT_FAILED', 'COMPOSER_SEND_CONTROL_NOT_FOUND'].includes(composer?.error_code)) {
         trace('CDP_ENTER_ATTEMPT', { adapter_version: TRUSTED_SEND_ADAPTER_VERSION, tab_id: tab.id });

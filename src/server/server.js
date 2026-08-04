@@ -37,6 +37,7 @@ const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: '*' } });
 const wss = new WebSocket.Server({ noServer: true });
 const extensionConnections = new Map();
+const domReplaySuppressUntil = new Map();
 
 // Router HTTP Upgrade: phân định Socket.io vs Chrome Extension WebSocket
 // Extension kết nối tại: ws://127.0.0.1:5050/extension
@@ -118,6 +119,7 @@ wss.on('connection', (ws, req) => {
         case 'REGISTER_ACCOUNT': {
           const { account_id, name, pending_key } = msg.data;
           extensionConnections.set(account_id, ws);
+          domReplaySuppressUntil.set(account_id, Date.now() + 8000);
           ws.accountId = account_id;
 
           let profileDir = `data/profiles/${account_id}`;
@@ -179,9 +181,22 @@ wss.on('connection', (ws, req) => {
 
             io.emit('MESSAGE_SENT', { thread_id, client_message_id, success: true, fb_message_id: officialFbId, status: 'sent' });
           } else if (error_code === 'COMPOSER_DISPATCHED') {
-            console.log(`[WS] Composer đã dispatch tin; giữ pending chờ DOM/network confirmation: ${client_message_id}`);
+            // Check if DOM/network confirmation already arrived before this result
+            const existingRow = db.prepare(`SELECT delivery_status, delivery_error FROM messages WHERE client_message_id = ? OR fb_message_id = ?`).get(client_message_id, `pending_${client_message_id}`);
+            if (existingRow && existingRow.delivery_status === 'sent') {
+              console.log(`[WS] COMPOSER_DISPATCHED arrived but row already sent for ${client_message_id}. No-op.`);
+              io.emit('MESSAGE_SENT', { thread_id, client_message_id, status: 'sent' });
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DISPATCHED_ALREADY_SENT', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
+            } else if (existingRow && existingRow.delivery_status === 'failed') {
+              console.log(`[WS] COMPOSER_DISPATCHED arrived but row already failed for ${client_message_id}. No-op.`);
+              const failError = existingRow.delivery_error || 'Previously failed';
+              io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: failError });
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DISPATCHED_ALREADY_FAILED', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
+            } else {
+              console.log(`[WS] Composer đã dispatch tin; giữ pending chờ DOM/network confirmation: ${client_message_id}`);
               io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error_code });
               console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_CONFIRMATION_GRACE', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
+            }
           } else {
             console.error('[WS] ❌ SEND_MESSAGE_RESULT failed or missing fb_msg_id:', {
               thread_id,
@@ -277,6 +292,21 @@ wss.on('connection', (ws, req) => {
 
           const isOutgoing = finalIsOutgoing;
 
+          if (m.source === 'dom_observer' && isOutgoing) {
+            const hasRecentPending = db.prepare(`
+              SELECT id FROM messages
+              WHERE thread_id = ? AND is_outgoing = 1 AND delivery_status = 'pending'
+                AND datetime(created_at) >= datetime('now', '-10 seconds')
+              LIMIT 1
+            `).get(threadId);
+            const suppressUntil = domReplaySuppressUntil.get(targetAccountId) || 0;
+            if (!hasRecentPending && Date.now() < suppressUntil) {
+              console.log(`[WS] ℹ️ Suppress outgoing DOM replay during startup/sync window: thread=${threadId} content="${(m.content || '').substring(0, 40)}"`);
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_REPLAY_SUPPRESSED', thread_id: String(threadId), at: new Date().toISOString() }));
+              break;
+            }
+          }
+
           // Tải media về local nếu tin mới có đính kèm
           if (m.media_url && m.media_type && m.media_type !== 'text') {
             const localPath = await mediaDownloader.downloadNewMessageMedia(m.thread_id, m.media_url, m.media_type);
@@ -333,6 +363,35 @@ wss.on('connection', (ws, req) => {
               console.log(`[WS] Đã ghép DOM confirmation vào pending outbound ${pending.client_message_id}`);
               console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_CORRELATED', thread_id: String(m.thread_id), client_message_id: pending.client_message_id, fb_message_id: confirmedId, at: new Date().toISOString() }));
               break;
+            }
+
+            // Mismatch guard: exactly 1 pending in same thread within 10s, but content differs
+            const recentPendings = db.prepare(`
+              SELECT id, client_message_id, content FROM messages
+              WHERE thread_id = ? AND is_outgoing = 1 AND delivery_status = 'pending'
+                AND datetime(created_at) >= datetime('now', '-10 seconds')
+              ORDER BY id DESC
+            `).all(m.thread_id);
+            if (recentPendings.length === 1) {
+              const mismatchPending = recentPendings[0];
+              const pendingContent = String(mismatchPending.content || '').trim();
+              const domContent = String(m.content || '').trim();
+              // Only mark mismatch if DOM content looks related to the pending attempt
+              // (e.g. "what" -> "whatwhat", "alo 123" -> "aloalo 123")
+              // Unrelated old messages like "Long ngu" won't accidentally fail a pending "what"
+              const looksLikeSameAttempt = pendingContent && domContent &&
+                (domContent.includes(pendingContent) || pendingContent.includes(domContent));
+              if (looksLikeSameAttempt) {
+                console.warn(`[WS] ⚠️ COMPOSER_CONTENT_MISMATCH: pending content="${pendingContent.substring(0, 40)}" vs DOM content="${domContent.substring(0, 40)}" | thread=${m.thread_id}`);
+                console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_CONTENT_MISMATCH', thread_id: String(m.thread_id), client_message_id: mismatchPending.client_message_id, pending_len: pendingContent.length, dom_len: domContent.length, at: new Date().toISOString() }));
+                db.prepare(`
+                  UPDATE messages SET delivery_status = 'failed', delivery_error = 'COMPOSER_CONTENT_MISMATCH'
+                  WHERE id = ?
+                `).run(mismatchPending.id);
+                io.emit('MESSAGE_SEND_FAILED', { thread_id: m.thread_id, client_message_id: mismatchPending.client_message_id, success: false, status: 'failed', error: 'COMPOSER_CONTENT_MISMATCH', error_code: 'COMPOSER_CONTENT_MISMATCH' });
+                // Discard the mismatched DOM bubble entirely — do not insert it
+                break;
+              }
             }
           }
           // Lưu tin nhắn vào bảng messages
@@ -435,6 +494,7 @@ wss.on('connection', (ws, req) => {
         case 'SYNC_THREADS_RESULT': {
           const { account_id, threads } = msg.data;
           console.log(`[WS] Nhận ${threads?.length || 0} threads từ extension tài khoản: ${account_id}`);
+          domReplaySuppressUntil.set(account_id, Date.now() + 5000);
           if (threads?.length) {
             const txn = db.transaction((account_id, threads) => {
               for (const t of threads) {
@@ -636,6 +696,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (ws.accountId) {
       extensionConnections.delete(ws.accountId);
+      domReplaySuppressUntil.delete(ws.accountId);
       db.prepare("UPDATE accounts SET status='DISCONNECTED' WHERE id=?").run(ws.accountId);
       io.emit('ACCOUNT_STATUS_CHANGED', { account_id: ws.accountId, status: 'DISCONNECTED' });
       io.emit('EXTENSION_CONNECTION_CHANGED', { account_id: ws.accountId, is_connected: false });

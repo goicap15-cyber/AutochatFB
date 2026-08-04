@@ -650,12 +650,31 @@
   // Initialize everything
   patchXHR(); patchFetch(); patchWebSocket();
   extractFbTokensFromDOM(); setInterval(extractFbTokensFromDOM, 3000);
+
+  // Observer starts paused to avoid replaying old history on page load/reload
+  observerPaused = true;
   setTimeout(() => {
     const initialThreadId = extractThreadIdFromUrl();
     if (initialThreadId && /^\d+$/.test(initialThreadId)) {
       currentBaselineThreadId = initialThreadId;
+      // First seed: capture whatever DOM rows exist now
       seedBaseline(initialThreadId);
     }
+    // Start observing, but mutations are ignored while observerPaused === true
     chatObserver.observe(document.body, { childList: true, subtree: true });
-  }, 3000);
+
+    // Second seed after 3s to cover late-rendered history, then unpause
+    setTimeout(() => {
+      const threadIdNow = extractThreadIdFromUrl();
+      if (threadIdNow && /^\d+$/.test(threadIdNow)) {
+        if (threadIdNow !== currentBaselineThreadId) {
+          // Thread changed during startup window; reset baseline for new thread
+          currentBaselineThreadId = threadIdNow;
+          lastObservedMessages.clear();
+        }
+        seedBaseline(threadIdNow);
+      }
+      observerPaused = false;
+    }, 3000);
+  }, 1000);
 })();
