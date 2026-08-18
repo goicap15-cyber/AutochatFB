@@ -48,6 +48,12 @@ function walk(dir) {
           console.error(`[ERROR]  ${rel}: ${err.message}`);
         }
       }
+    } else if (entry.name.endsWith('.sql')) {
+      const rel = path.relative(SRC_DIR, srcPath);
+      const outPath = path.join(OUT_DIR, rel);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.copyFileSync(srcPath, outPath);
+      console.log(`[asset]  ${rel}`);
     }
   }
 }

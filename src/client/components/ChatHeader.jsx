@@ -31,6 +31,7 @@ function HeaderIconButton({ children, onClick, href, title, className = '' }) {
 export default function ChatHeader({
   activeThread,
   accounts = [],
+  inboxSources = [],
   onAssignStaff,
   onCompleteThread,
   onPauseAi,
@@ -44,12 +45,17 @@ export default function ChatHeader({
 
   const isAiPaused = activeThread.ai_paused_until && new Date(activeThread.ai_paused_until) > new Date();
   const account = accounts.find((item) => String(item.id) === String(activeThread.account_id));
+  const source = inboxSources.find((item) => String(item.id) === String(activeThread.source_id));
   const accountName = account ? (account.name || account.id) : (activeThread.account_id || 'Facebook');
-  const isExtConnected = account ? account.is_extension_connected !== false : true;
+  const sourceType = activeThread.source_type || source?.source_type || 'personal_messenger';
+  const sourceName = activeThread.source_name || source?.display_name || accountName;
+  const sourceLabel = sourceType === 'page_messenger' ? `Page · ${sourceName}` : `Messenger · ${sourceName}`;
+  const sourceStatus = activeThread.source_status || source?.status || 'ACTIVE';
+  const isExtConnected = sourceType === 'page_messenger' ? sourceStatus === 'ACTIVE' : (account ? account.is_extension_connected !== false : true);
   const customerName = activeThread.contact_name || activeThread.name || 'Khách hàng';
   const avatarColor = pickAvatarColor(activeThread.id || customerName);
   const showAccountPill = accounts.length > 1;
-  const messengerUrl = activeThread.thread_url || `https://facebook.com/messages/t/${activeThread.id}`;
+  const messengerUrl = sourceType === 'page_messenger' ? null : (activeThread.thread_url || `https://facebook.com/messages/t/${activeThread.external_thread_id || activeThread.id}`);
 
   return (
     <div className="h-[var(--header-height)] border-b border-[var(--color-border)] px-4 flex items-center justify-between bg-[var(--color-bg-panel)] shrink-0 select-none">
@@ -90,15 +96,15 @@ export default function ChatHeader({
         <div className="min-w-0">
           <div className="flex items-center gap-2 min-w-0">
             <h2 className="font-bold text-[var(--color-text-primary)] text-base truncate">{customerName}</h2>
-            {showAccountPill && (
-              <span className="hidden sm:inline-flex text-[11px] px-2 py-0.5 rounded-full bg-[var(--color-accent-subtle)] text-[var(--color-accent)] font-medium truncate max-w-[150px]">
-                {accountName}
+            {(showAccountPill || activeThread.source_id) && (
+              <span className={`hidden sm:inline-flex text-[11px] px-2 py-0.5 rounded-full font-medium truncate max-w-[180px] ${sourceType === 'page_messenger' ? 'bg-violet-500/10 text-violet-500' : 'bg-[var(--color-accent-subtle)] text-[var(--color-accent)]'}`}>
+                {sourceLabel}
               </span>
             )}
           </div>
           <div className="flex items-center gap-1.5 mt-0.5 text-xs text-[var(--color-text-muted)]">
             <span className={`w-2 h-2 rounded-full ${isExtConnected ? 'bg-[var(--color-success)]' : 'bg-[var(--color-danger)]'}`} />
-            <span>{isExtConnected ? 'Đang hoạt động' : 'Không hoạt động'}</span>
+            <span>{sourceType === 'page_messenger' ? (isExtConnected ? 'Page API Active' : 'Page disconnected') : (isExtConnected ? 'Đang hoạt động' : 'Không hoạt động')}</span>
           </div>
         </div>
       </div>
@@ -113,9 +119,11 @@ export default function ChatHeader({
         <HeaderIconButton title="Tìm trong hội thoại" onClick={onOpenSearch} className="text-[var(--color-text-secondary)] hover:text-[var(--color-accent)]">
           <Search size={19} strokeWidth={1.75} />
         </HeaderIconButton>
-        <HeaderIconButton title="Mở Messenger" href={messengerUrl} className="text-[var(--color-text-secondary)] hover:text-[var(--color-accent)]">
-          <ExternalLink size={18} strokeWidth={1.75} />
-        </HeaderIconButton>
+        {messengerUrl && (
+          <HeaderIconButton title="Mở Messenger" href={messengerUrl} className="text-[var(--color-text-secondary)] hover:text-[var(--color-accent)]">
+            <ExternalLink size={18} strokeWidth={1.75} />
+          </HeaderIconButton>
+        )}
         <HeaderIconButton title="Thông tin khách hàng" onClick={() => onShowLeadPanel?.()}>
           <Info size={19} strokeWidth={1.9} />
         </HeaderIconButton>

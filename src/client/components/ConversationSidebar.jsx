@@ -1,19 +1,41 @@
-import React, { useState, useEffect } from 'react';
-import { Search, Edit, Filter, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Search, Edit, Filter, Megaphone, X }  from 'lucide-react';
 import ConversationFilters from './ConversationFilters.jsx';
 import ConversationItem from './ConversationItem.jsx';
+import ConversationFilterPopover from './ConversationFilterPopover.jsx';
 import EmptyState from './EmptyState.jsx';
+import {
+  createDefaultFilters,
+  countActiveFilters,
+  getAvailableTagOptions,
+  matchesConversationFilters,
+  normalizeFilters
+} from '../utils/conversationFilters.js';
+import { sortDueReminders } from '../utils/reminderPresentation.js';
 
 export default function ConversationSidebar({
   threads = [], activeThreadId, onSelectThread,
   activeTab, onTabChange, searchQuery, onSearchChange, isConnected, onOpenSearch,
-  accounts = []
+  accounts = [],
+  inboxSources = [],
+  leadStatuses = [],
+  campaignSelectionMode = false,
+  selectedCampaignThreadIds = [],
+  onToggleCampaignThread,
+  onStartCampaignSelection, onCancelCampaignSelection, onCreateCampaign
 }) {
-  const [selectedAccountId, setSelectedAccountId] = useState('ALL');
-  const shouldShowAccountFilter = accounts.length > 1;
+  const [appliedFilters, setAppliedFilters] = useState(() => normalizeFilters(createDefaultFilters()));
+  const [isFilterPopoverOpen, setIsFilterPopoverOpen] = useState(false);
+  const filterButtonRef = useRef(null);
 
-  const filteredThreads = threads.filter((thread) => {
-    if (selectedAccountId !== 'ALL' && String(thread.account_id) !== String(selectedAccountId)) return false;
+  const activeFilterCount = countActiveFilters(appliedFilters);
+  const hasFilterActive = activeFilterCount > 0;
+  const filterButtonAriaLabel = hasFilterActive
+    ? `Bộ lọc (${activeFilterCount} điều kiện đang bật)`
+    : 'Bộ lọc';
+
+  const visibleThreads = threads.filter((thread) => {
+    if (!matchesConversationFilters(thread, appliedFilters)) return false;
     if (activeTab === 'ASSIGNED' && thread.status !== 'ASSIGNED') return false;
     if (activeTab === 'UNPROCESSED' && thread.status !== 'UNPROCESSED') return false;
     if (activeTab === 'COMPLETED' && thread.status !== 'COMPLETED') return false;
@@ -22,6 +44,9 @@ export default function ConversationSidebar({
     if (!query) return true;
     return `${thread.contact_name || ''} ${thread.last_message || ''}`.toLowerCase().includes(query);
   });
+
+  // Keep view membership intact, then promote due conversations with stable order.
+  const filteredThreads = sortDueReminders(visibleThreads);
 
   useEffect(() => {
     const handleKeyDown = (event) => {
@@ -41,7 +66,7 @@ export default function ConversationSidebar({
   }, [filteredThreads, activeThreadId, onSelectThread]);
 
   return (
-    <aside className="w-[var(--conversation-width)] min-w-[var(--conversation-width)] max-w-[var(--conversation-width)] bg-[var(--color-bg-panel)] border-r border-[var(--color-border)] flex flex-col h-full min-h-0 max-h-full overflow-hidden shrink-0 select-none">
+    <aside className="w-[var(--conversation-width)] min-w-[var(--conversation-width)] max-w-[var(--conversation-width)] bg-[var(--color-bg-panel)] border-r border-[var(--color-border)] flex flex-col h-full min-h-0 max-h-full overflow-visible shrink-0 select-none">
       <div className="px-4 pt-4 pb-3.5 bg-[var(--color-bg-panel)] border-b border-[var(--color-border)] shrink-0 flex flex-col gap-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2 min-w-0">
@@ -57,31 +82,52 @@ export default function ConversationSidebar({
             </div>
           </div>
 
-          <div className="flex gap-1.5 shrink-0">
-            <button onClick={onOpenSearch} className="p-1.5 hover:bg-[var(--color-bg-hover)] rounded-full transition-colors" title="Tìm kiếm nhanh" aria-label="Tìm kiếm nhanh">
+          <div className="flex gap-1.5 shrink-0 items-center">
+            <button onClick={onOpenSearch} className="p-1.5 hover:bg-[var(--color-bg-hover)] rounded-full transition-colors cursor-pointer" title="Tìm kiếm nhanh" aria-label="Tìm kiếm nhanh">
               <Edit size={17} className="text-[var(--color-text-muted)]" strokeWidth={1.75} />
             </button>
-            <button className="p-1.5 hover:bg-[var(--color-bg-hover)] rounded-full transition-colors" title="Bộ lọc" aria-label="Bộ lọc">
-              <Filter size={17} className="text-[var(--color-text-muted)]" strokeWidth={1.75} />
+            <button onClick={onStartCampaignSelection} className={'p-1.5 rounded-full transition-colors cursor-pointer ' + (campaignSelectionMode ? 'bg-[var(--color-accent-subtle)] text-[var(--color-accent)]' : 'hover:bg-[var(--color-bg-hover)] text-[var(--color-text-muted)]')} title="Chọn người nhận campaign" aria-label="Chọn người nhận campaign">
+              <Megaphone size={17} strokeWidth={1.75} />
             </button>
+            <div className="relative">
+              <button
+                ref={filterButtonRef}
+                type="button"
+                onClick={() => setIsFilterPopoverOpen((prev) => !prev)}
+                aria-haspopup="dialog"
+                aria-expanded={isFilterPopoverOpen}
+                aria-label={filterButtonAriaLabel}
+                title={filterButtonAriaLabel}
+                className={`relative p-1.5 rounded-full transition-colors cursor-pointer ${
+                  isFilterPopoverOpen || hasFilterActive
+                    ? 'bg-[var(--color-accent-subtle)] text-[var(--color-accent)] ring-1 ring-[var(--color-accent)]/30'
+                    : 'hover:bg-[var(--color-bg-hover)] text-[var(--color-text-muted)]'
+                }`}
+              >
+                <Filter size={17} strokeWidth={1.75} />
+                {hasFilterActive && (
+                  <span
+                    className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full bg-[var(--color-accent)] text-[var(--color-text-on-accent)] text-[10px] font-bold flex items-center justify-center shadow-xs animate-in zoom-in-75 duration-100"
+                    aria-hidden="true"
+                  >
+                    {activeFilterCount}
+                  </span>
+                )}
+              </button>
+
+              <ConversationFilterPopover
+                isOpen={isFilterPopoverOpen}
+                appliedFilters={appliedFilters}
+                inboxSources={inboxSources}
+                leadStatuses={leadStatuses}
+                tagOptions={getAvailableTagOptions(threads)}
+                onApply={(nextFilters) => setAppliedFilters(nextFilters)}
+                onClose={() => setIsFilterPopoverOpen(false)}
+                openerRef={filterButtonRef}
+              />
+            </div>
           </div>
         </div>
-
-        {shouldShowAccountFilter && (
-          <div className="relative">
-            <select
-              value={selectedAccountId}
-              onChange={(event) => setSelectedAccountId(event.target.value)}
-              className="w-full h-8 bg-[var(--color-bg-surface)] text-[var(--color-text-primary)] text-xs font-medium pl-3 pr-8 rounded-full border border-[var(--color-border)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]/20 appearance-none cursor-pointer transition-all"
-            >
-              <option value="ALL" className="bg-[var(--color-bg-panel)] text-[var(--color-text-primary)]">Tất cả tài khoản Facebook</option>
-              {accounts.map((account) => (
-                <option key={account.id} value={account.id} className="bg-[var(--color-bg-panel)] text-[var(--color-text-primary)]">{account.name || account.id}</option>
-              ))}
-            </select>
-            <ChevronDown size={14} className="absolute right-3 top-2 pointer-events-none text-[var(--color-text-muted)]" strokeWidth={1.75} />
-          </div>
-        )}
 
         <div className="relative">
           <input
@@ -99,19 +145,31 @@ export default function ConversationSidebar({
 
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain touch-pan-y bg-[var(--color-bg-panel)]">
         {filteredThreads.length === 0 ? (
-          <EmptyState title="Không tìm thấy hội thoại" description="Thử đổi bộ lọc, tài khoản Facebook hoặc từ khóa tìm kiếm." />
+          <EmptyState title="Không tìm thấy hội thoại" description="Thử đổi bộ lọc hoặc từ khóa tìm kiếm." />
         ) : (
           filteredThreads.map((thread) => (
             <ConversationItem
-              key={thread.id}
+              key={thread.thread_key || thread.id}
               thread={thread}
               accounts={accounts}
+              inboxSources={inboxSources}
               isSelected={String(thread.id) === String(activeThreadId)}
               onSelect={() => onSelectThread(thread.id)}
+              selectionMode={campaignSelectionMode}
+              isChecked={selectedCampaignThreadIds.some((threadId) => String(threadId) === String(thread.id))}
+              onToggle={() => onToggleCampaignThread(thread.id)}
             />
           ))
         )}
       </div>
+      {campaignSelectionMode && (
+        <div className="flex shrink-0 items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg-elevated)] p-3">
+          <button type="button" onClick={onCancelCampaignSelection} className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-[var(--color-border)] px-3 text-xs font-semibold hover:bg-[var(--color-bg-hover)]"><X size={14} /> Hủy</button>
+          <button type="button" onClick={onCreateCampaign} disabled={selectedCampaignThreadIds.length === 0} className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg bg-[var(--color-accent)] px-3 text-xs font-bold text-[var(--color-text-on-accent)] disabled:cursor-not-allowed disabled:opacity-45">
+            <Megaphone size={14} /> Tạo ({selectedCampaignThreadIds.length})
+          </button>
+        </div>
+      )}
     </aside>
   );
 }

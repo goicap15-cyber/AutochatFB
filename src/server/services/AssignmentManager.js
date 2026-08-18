@@ -1,22 +1,26 @@
 const db = require('../database/db');
 
 class AssignmentManager {
+  constructor(database = db) {
+    this.db = database;
+  }
+
   // Gán nhân viên phụ trách độc quyền cho một hội thoại
   assignThread(threadId, userId) {
-    const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId);
+    const thread = this.db.prepare('SELECT * FROM threads WHERE id = ?').get(threadId);
     if (!thread) {
       return { success: false, error: 'Không tìm thấy hội thoại' };
     }
 
     if (thread.assigned_user_id && thread.assigned_user_id !== userId) {
-      const current = db.prepare('SELECT username FROM users WHERE id = ?').get(thread.assigned_user_id);
+      const current = this.db.prepare('SELECT username FROM users WHERE id = ?').get(thread.assigned_user_id);
       return {
         success: false,
         error: `Hội thoại đã được phân công cho nhân viên: ${current?.username}`
       };
     }
 
-    db.prepare(`
+    this.db.prepare(`
       UPDATE threads
       SET assigned_user_id = ?, status = 'ASSIGNED'
       WHERE id = ?
@@ -27,41 +31,57 @@ class AssignmentManager {
 
   // Nhân viên hoàn thành hội thoại (đánh dấu Đã chốt)
   completeThread(threadId) {
-    db.prepare(`
+    this.db.prepare(`
       UPDATE threads SET status = 'COMPLETED' WHERE id = ?
     `).run(threadId);
     return { success: true, thread_id: threadId, status: 'COMPLETED' };
   }
 
   // Lấy danh sách hội thoại theo tab/filter
-  getThreadsByFilter(userId, role, tab = 'ALL') {
+  getThreadsByFilter(userId, role, tab = 'ALL', sourceFilter = 'all') {
     let query = `
-      SELECT t.*, c.phone, c.email, c.lead_captured, c.avatar_url
+      SELECT t.*, c.phone, c.email, c.address, c.tags, c.lead_captured, c.avatar_url,
+        s.source_type, s.display_name AS source_name, s.status AS source_status, s.external_id AS source_external_id,
+        c.status_id, ls.name AS status_name, ls.color AS status_color, r.due_at AS reminder_due_at, r.note AS reminder_note, r.status AS reminder_status
       FROM threads t
       LEFT JOIN contacts c ON c.thread_id = t.id
+      LEFT JOIN inbox_sources s ON s.id = t.source_id
+      LEFT JOIN lead_statuses ls ON ls.id = c.status_id
+      LEFT JOIN conversation_reminders r ON r.thread_id = t.id AND r.status = 'active'
     `;
     const params = [];
+    const where = [];
 
     if (tab === 'ASSIGNED') {
-      query += ' WHERE t.status = ? AND t.assigned_user_id = ?';
+      where.push('t.status = ? AND t.assigned_user_id = ?');
       params.push('ASSIGNED', userId);
     } else if (tab === 'UNPROCESSED') {
-      query += ' WHERE t.status = ?';
+      where.push('t.status = ?');
       params.push('UNPROCESSED');
     } else if (tab === 'COMPLETED') {
-      query += ' WHERE t.status = ?';
+      where.push('t.status = ?');
       params.push('COMPLETED');
-    } else {
+    } else if (role !== 'ADMIN') {
       // Tab ALL: staff chỉ thấy thread của mình + chưa xử lý; admin thấy tất cả
-      if (role !== 'ADMIN') {
-        query += ' WHERE (t.assigned_user_id = ? OR t.status = ?)';
-        params.push(userId, 'UNPROCESSED');
+      where.push('(t.assigned_user_id = ? OR t.status = ?)');
+      params.push(userId, 'UNPROCESSED');
+    }
+
+    if (sourceFilter && sourceFilter !== 'all' && sourceFilter !== 'ALL') {
+      if (sourceFilter === 'personal_messenger' || sourceFilter === 'page_messenger') {
+        where.push('s.source_type = ?');
+        params.push(sourceFilter);
+      } else {
+        where.push('t.source_id = ?');
+        params.push(sourceFilter);
       }
     }
 
+    if (where.length) query += ' WHERE ' + where.join(' AND ');
     query += ' ORDER BY t.last_activity DESC';
-    return db.prepare(query).all(...params);
+    return this.db.prepare(query).all(...params);
   }
 }
 
 module.exports = new AssignmentManager();
+module.exports.AssignmentManager = AssignmentManager;

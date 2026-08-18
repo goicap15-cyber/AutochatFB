@@ -155,16 +155,18 @@ export default function ChatArea({
             }
 
             const { msg } = item;
-            const isOutgoing = msg.is_outgoing;
+            const isPendingDirection = msg.direction_status === 'pending';
+            const isOutgoing = !isPendingDirection && !!msg.is_outgoing;
+            const alignmentClass = isPendingDirection ? 'items-center' : (isOutgoing ? 'items-end' : 'items-start');
             const isUnsent = msg.is_unsent;
 
             return (
               <div
                 key={msg.id || `${msg.fb_message_id}-${idx}`}
-                className={`flex flex-col gap-1 ${isOutgoing ? 'items-end' : 'items-start'}`}
+                className={`flex flex-col gap-1 ${alignmentClass}`}
               >
                 {/* Sender info */}
-                {!isOutgoing && (msg.sender_name || msg.sender_avatar) && (
+                {!isOutgoing && !isPendingDirection && (msg.sender_name || msg.sender_avatar) && (
                   <div className="flex items-center gap-2 ml-1">
                     {msg.sender_avatar ? (
                       <img src={msg.sender_avatar} alt="" className="w-5 h-5 rounded-full object-cover ring-1 ring-white/[0.05]" />
@@ -177,12 +179,14 @@ export default function ChatArea({
                   </div>
                 )}
 
-                <div className={`flex items-end gap-2 ${isOutgoing ? 'flex-row-reverse' : ''}`}>
+                <div className={`flex items-end gap-2 ${isPendingDirection ? 'justify-center' : (isOutgoing ? 'flex-row-reverse' : '')}`}>
                   {/* Bubble */}
                   <div
                     className={`relative max-w-[75%] px-4 py-2.5 rounded-2xl text-xs leading-relaxed shadow-sm ${
                       isUnsent
                         ? 'bg-red-500/10 border border-red-500/20 text-red-400 rounded-bl-none'
+                        : isPendingDirection
+                        ? 'bg-slate-700/60 border border-dashed border-amber-400/30 text-slate-200'
                         : isOutgoing
                         ? 'bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-bl-none shadow-blue-500/20'
                         : 'bg-gradient-to-br from-slate-800/90 to-slate-900/90 text-[#F2F4F8] border border-white/[0.06] rounded-br-none shadow-black/20'
@@ -199,7 +203,7 @@ export default function ChatArea({
                   </div>
 
                   {/* Status */}
-                  {isOutgoing && !isUnsent && (
+                  {isOutgoing && !isPendingDirection && !isUnsent && (
                     <span className="pb-0.5">
                       <CheckCircle2 size={12} className="text-blue-300/50" strokeWidth={2} />
                     </span>

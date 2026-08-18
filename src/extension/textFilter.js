@@ -32,10 +32,17 @@
     // Accessibility / System standalone
     /^(?:Tin nhắn do|Message sent by) .+?(?:gửi lúc|at) .+?:\s*.*$/i,
     /^Nhấn Enter để gửi$/i,
+    // Meta Business Suite lead-activity UI, not a message from the customer.
+    /^Đã tự động tạo hoạt động về khách hàng tiềm năng cho bạn dựa trên cuộc trò chuyện này[.!…]*$/i,
 
     // Standalone Timestamps (e.g. 09:09, 16:36 T5, 18:00 T5, 12:30 AM, T5, CN)
     /^\d{1,2}:\d{2}(?:\s*(?:T[2-7]|CN|AM|PM))?$/i,
-    /^(?:T[2-7]|CN)$/i
+    /^(?:T[2-7]|CN)$/i,
+
+    // Full date/time separator header Business Suite renders between message
+    // groups (e.g. "13:52 6 Tháng 8, 2026") - mirrors the same addition in
+    // src/server/utils/textFilter.js (keep both copies in sync).
+    /^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i
   ];
 
   function isSystemOrMetadataText(text) {

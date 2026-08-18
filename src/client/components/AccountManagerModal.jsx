@@ -1,14 +1,29 @@
 import React, { useState, useEffect } from 'react';
 import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle } from 'lucide-react';
 
-export default function AccountManagerModal({ onClose }) {
+export default function AccountManagerModal({ onClose, onSourcesChanged }) {
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [startingId, setStartingId] = useState(null);
   const [addingSession, setAddingSession] = useState(false);
   const [pendingKey, setPendingKey] = useState(null);
+  const [inboxSources, setInboxSources] = useState([]);
+  const [pageToken, setPageToken] = useState('');
+  const [pageOwnerAccountId, setPageOwnerAccountId] = useState('');
+  const [pageConnectError, setPageConnectError] = useState('');
+  const [pageConnectLoading, setPageConnectLoading] = useState(false);
 
   const [initialAccountCount, setInitialAccountCount] = useState(null);
+
+  const loadInboxSources = async () => {
+    try {
+      const res = await fetch('/api/inbox-sources');
+      const data = await res.json();
+      setInboxSources(Array.isArray(data) ? data : []);
+    } catch {
+      setInboxSources([]);
+    }
+  };
 
   const loadAccounts = async () => {
     try {
@@ -27,7 +42,8 @@ export default function AccountManagerModal({ onClose }) {
 
   useEffect(() => {
     loadAccounts();
-    const interval = setInterval(loadAccounts, 3000);
+    loadInboxSources();
+    const interval = setInterval(() => { loadAccounts(); loadInboxSources(); }, 3000);
     return () => clearInterval(interval);
   }, []);
 
@@ -67,6 +83,37 @@ export default function AccountManagerModal({ onClose }) {
       console.error(e);
       setAddingSession(false);
     }
+  };
+
+  const handleConnectPage = async () => {
+    setPageConnectError('');
+    if (!pageToken.trim()) {
+      setPageConnectError('Thiếu Page access token');
+      return;
+    }
+    setPageConnectLoading(true);
+    try {
+      const res = await fetch('/api/inbox-sources/page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_access_token: pageToken.trim(), owner_account_id: pageOwnerAccountId || null })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Không kết nối được Page');
+      setPageToken('');
+      await loadInboxSources();
+      onSourcesChanged?.();
+    } catch (err) {
+      setPageConnectError(err.message);
+    } finally {
+      setPageConnectLoading(false);
+    }
+  };
+
+  const handleDisconnectSource = async (sourceId) => {
+    await fetch(`/api/inbox-sources/${sourceId}`, { method: 'DELETE' });
+    await loadInboxSources();
+    onSourcesChanged?.();
   };
 
   return (
@@ -129,6 +176,52 @@ export default function AccountManagerModal({ onClose }) {
             </div>
           )}
 
+
+          <div className="border-t border-slate-800 pt-4 space-y-3">
+            <div>
+              <h4 className="text-xs font-semibold text-slate-100 uppercase tracking-wider">Kết nối Page Messenger</h4>
+              <p className="text-[11px] text-slate-500 mt-1">Dán Link Page, ID Page, hoặc Page Access Token để kết nối. Không cần API token vì Extension sẽ lo việc gửi/nhận.</p>
+            </div>
+            <div className="grid gap-2">
+              <select
+                value={pageOwnerAccountId}
+                onChange={(event) => setPageOwnerAccountId(event.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500/60"
+              >
+                <option value="">Không gắn owner account</option>
+                {accounts.map((acc) => <option key={acc.id} value={acc.id}>{acc.name || acc.id}</option>)}
+              </select>
+              <textarea
+                value={pageToken}
+                onChange={(event) => setPageToken(event.target.value)}
+                rows={2}
+                placeholder="Ví dụ: https://www.facebook.com/profile.php?id=123456789 hoặc 123456789"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500/60 resize-none"
+              />
+              {pageConnectError && <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">{pageConnectError}</div>}
+              <button
+                type="button"
+                onClick={handleConnectPage}
+                disabled={pageConnectLoading}
+                className="px-3 py-2 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-colors"
+              >
+                {pageConnectLoading ? <RefreshCw size={14} className="animate-spin" /> : <PlusCircle size={15} />}
+                <span>Kết nối Page</span>
+              </button>
+            </div>
+            <div className="space-y-2">
+              {inboxSources.filter((source) => source.source_type === 'page_messenger').map((source) => (
+                <div key={source.id} className="p-3 rounded-lg border border-violet-500/20 bg-violet-500/5 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-slate-100 truncate">Page · {source.display_name || source.external_id}</div>
+                    <div className="text-[10px] text-slate-500 font-mono truncate">{source.external_id} · {source.status}</div>
+                  </div>
+                  <button type="button" onClick={() => handleDisconnectSource(source.id)} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-300 border border-slate-700/60">Ngắt</button>
+                </div>
+              ))}
+            </div>
+          </div>
+
           {loading ? (
             <div className="py-8 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
               <RefreshCw size={14} className="animate-spin" /> Đang tải danh sách...
@@ -142,7 +235,38 @@ export default function AccountManagerModal({ onClose }) {
               {accounts.map((acc) => {
                 const isCheckpoint = acc.status === 'CHECKPOINT';
 
-                return (
+                const handleConnectPage = async () => {
+    setPageConnectError('');
+    if (!pageToken.trim()) {
+      setPageConnectError('Thiếu Page access token');
+      return;
+    }
+    setPageConnectLoading(true);
+    try {
+      const res = await fetch('/api/inbox-sources/page', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page_access_token: pageToken.trim(), owner_account_id: pageOwnerAccountId || null })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Không kết nối được Page');
+      setPageToken('');
+      await loadInboxSources();
+      onSourcesChanged?.();
+    } catch (err) {
+      setPageConnectError(err.message);
+    } finally {
+      setPageConnectLoading(false);
+    }
+  };
+
+  const handleDisconnectSource = async (sourceId) => {
+    await fetch(`/api/inbox-sources/${sourceId}`, { method: 'DELETE' });
+    await loadInboxSources();
+    onSourcesChanged?.();
+  };
+
+  return (
                   <div
                     key={acc.id}
                     className={`p-3.5 rounded-lg border flex items-center justify-between gap-3 ${

@@ -1,0 +1,2105 @@
+const path = require('path');
+// Neither the plain `node src/server/index.js` entrypoint nor Electron's
+// require(serverPath) load .env on their own (no dotenv dependency, no
+// --env-file flag) - PAGE_TOKEN_SECRET/WEBHOOK_VERIFY_TOKEN/RICH_MESSAGE_*
+// flags etc. were silently falling back to unset. Node 20.6+'s built-in
+// loadEnvFile covers both launch paths without adding a dependency.
+try {
+  process.loadEnvFile(path.join(__dirname, '../../.env'));
+} catch (_) {
+  // Missing .env is fine (e.g. a fresh checkout) - env vars just stay unset.
+}
+
+const express = require('express');
+const crypto = require('crypto');
+const OutboundAttachmentRepository = require('./repositories/OutboundAttachmentRepository');
+const OutboundAttemptRepository = require('./repositories/OutboundAttemptRepository');
+const OutboundAttachmentService = require('./services/OutboundAttachmentService');
+const RichMessageCapabilityService = require('./services/RichMessageCapabilityService');
+const RichMessageService = require('./services/RichMessageService');
+const OutboundConfirmationService = require('./services/OutboundConfirmationService');
+const PhoneCaptureService = require('./services/PhoneCaptureService');
+const CampaignPhoneCaptureService = require('./services/CampaignPhoneCaptureService');
+const GlobalPhoneAutomationService = require('./services/GlobalPhoneAutomationService');
+const { resolveInternalThreadId } = require('./utils/threadIdResolver');
+const http = require('http');
+const WebSocket = require('ws');
+const { Server: SocketIOServer } = require('socket.io');
+const db = require('./database/db');
+const processManager = require('./services/ProcessManager');
+const mediaDownloader = require('./services/MediaDownloader');
+const assignmentManager = require('./services/AssignmentManager');
+const searchService = require('./services/SearchService');
+const exportService = require('./services/ExportService');
+const autoReplyEngine = require('./services/AutoReplyEngine');
+const broadcastEngine = require('./services/BroadcastEngine');
+const aiMediator = require('./services/AIMediator');
+const { extractLeadInfo } = require('./utils/leadExtractor');
+const { downloadAvatar, saveAvatarFromBase64OrUrl, serveAvatar } = require('./utils/avatarManager');
+const { isSystemOrMetadataText, cleanMessageText } = require('./utils/textFilter');
+const { isKnownPageSystemNotice } = require('./utils/pageSystemNotice');
+const ConversationRepository = require('./repositories/ConversationRepository');
+const MessageQueueRepository = require('./repositories/MessageQueueRepository');
+const queueWorker = require('./services/QueueWorker');
+const CampaignRepository = require('./repositories/CampaignRepository');
+const CampaignService = require('./services/CampaignService');
+const campaignRunner = require('./services/CampaignRunner');
+const CampaignEventService = require('./services/CampaignEventService');
+const CampaignEligibilityService = require('./services/CampaignEligibilityService');
+const CampaignAttachmentService = require('./services/CampaignAttachmentService');
+const CampaignRecoveryService = require('./services/CampaignRecoveryService');
+const LeadStatusService = require('./services/LeadStatusService');
+const ContactService = require('./services/ContactService');
+const FollowupService = require('./services/FollowupService');
+
+const app = express();
+const followupService = new FollowupService(db);
+app.use(express.json());
+
+// Static: React Dashboard UI & Media files
+app.use(express.static(path.join(__dirname, '../../../dist/client'), { 
+  setHeaders: (res, path) => {
+    if (path.endsWith('.jpg') || path.endsWith('.jpeg') || path.endsWith('.png')) {
+      res.set('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+  } 
+}));
+const clientDistPath = path.join(__dirname, '../../dist/client');
+app.use(express.static(clientDistPath));
+app.use('/data/media', express.static(path.join(__dirname, '../../data/media')));
+app.use('/data/exports', express.static(path.join(__dirname, '../../data/exports')));
+
+const server = http.createServer(app);
+const io = new SocketIOServer(server, { cors: { origin: '*' } });
+const wss = new WebSocket.Server({ noServer: true });
+const extensionConnections = new Map();
+const domReplaySuppressUntil = new Map();
+
+const richContentSecret = crypto.randomBytes(32);
+
+function isLoopbackAddress(address) {
+  const normalized = String(address || '').toLowerCase();
+  return normalized === '127.0.0.1' ||
+    normalized === '::1' ||
+    normalized === '::ffff:127.0.0.1';
+}
+
+function requireLocalCrmRequest(req, res, next) {
+  if (isLoopbackAddress(req.socket?.remoteAddress) === false) {
+    return res.status(403).json({
+      code: 'LOCAL_CRM_REQUIRED',
+      error: 'Rich-message chỉ được phép từ CRM chạy trên máy này.'
+    });
+  }
+  next();
+}
+
+function getLocalOperatorId() {
+  return db.prepare(
+    "SELECT id FROM users WHERE role = 'ADMIN' ORDER BY id ASC LIMIT 1"
+  ).get()?.id || null;
+}
+
+function getRichMessageCapabilityOptions() {
+  return {
+    database: db,
+    getConnection: (accountId) => extensionConnections.get(accountId)
+  };
+}
+
+function createAttachmentContentToken(attachmentId, lifetimeMs = 60 * 60 * 1000) {
+  const expires = Date.now() + lifetimeMs;
+  const payload = String(attachmentId) + ':' + expires;
+  const token = crypto.createHmac('sha256', richContentSecret).update(payload).digest('hex');
+  return { expires, token };
+}
+
+function verifyAttachmentContentToken(attachmentId, expiresValue, tokenValue) {
+  const expires = Number(expiresValue);
+  const token = String(tokenValue || '');
+  if (Number.isSafeInteger(expires) === false || expires < Date.now() || /^[a-f0-9]{64}$/.test(token) === false) {
+    return false;
+  }
+  const expected = crypto.createHmac('sha256', richContentSecret)
+    .update(String(attachmentId) + ':' + expires)
+    .digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+}
+
+// Rich-message attachments require a signed URL per FR-023's "authenticated
+// content access" - a stored, unsigned media_url would 403 (token missing)
+// and a stored absolute filesystem path would 404 via the SPA catch-all
+// (neither is web-servable as-is). Sign fresh on every read instead of at
+// insert time, since createAttachmentContentToken()'s token has a lifetime.
+function withAttachmentAccessUrl(message) {
+  if (!message || !message.attachment_id) return message;
+  const { expires, token } = createAttachmentContentToken(message.attachment_id);
+  return {
+    ...message,
+    media_url: '/api/outbound-attachments/' + message.attachment_id + '/content' +
+      '?expires=' + expires + '&token=' + token,
+    local_media_path: null
+  };
+}
+
+function sendRichMessageError(res, error) {
+  const status = Number(error?.httpStatus) || 400;
+  res.status(status).json({
+    error: error?.message || 'Không thể xử lý rich-message.',
+    code: error?.code || 'RICH_MESSAGE_ERROR',
+    details: error?.details || null
+  });
+}
+
+// Router HTTP Upgrade: phân định Socket.io vs Chrome Extension WebSocket
+// Extension kết nối tại: ws://127.0.0.1:5050/extension
+// Socket.IO kết nối tại: ws://localhost:5050/socket.io/...
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+
+  if (pathname.startsWith('/socket.io')) {
+    // Socket.io tự xử lý upgrade của mình
+    return;
+  }
+
+  // Chấp nhận /extension (Chrome Extension) hoặc / (legacy)
+  if (pathname === '/extension' || pathname === '/') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    // Từ chối các path không xác định
+    socket.destroy();
+  }
+});
+
+// ── Helper: gửi tin nhắn qua Extension WebSocket ──────────────────────────
+async function sendViaExtension(thread_id, text, client_message_id = null) {
+  // Tìm account_id của thread
+  const thread = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(thread_id);
+  if (!thread) throw new Error(`Thread ${thread_id} không tồn tại`);
+
+  const extWs = extensionConnections.get(thread.account_id);
+  if (!extWs || extWs.readyState !== WebSocket.OPEN) {
+    throw new Error(`Extension cho tài khoản ${thread.account_id} không kết nối`);
+  }
+
+  // Route Page threads through the already-built queue pipeline (feature 009:
+  // message_queue -> QueueWorker -> SEND_QUEUED_MESSAGE -> handleSendPageMessage,
+  // CDP into Business Suite) instead of the generic personal-messenger dispatch
+  // below. Personal threads (or any thread with no resolvable page source) keep
+  // the exact existing behavior (feature 015).
+  const { sourceType } = ConversationRepository.getThreadSource(thread_id);
+  const isPageThread = sourceType === 'page_messenger';
+
+  let clientMsgId;
+  let queueId = null;
+  if (isPageThread) {
+    // client_message_id MUST match what handleSendQueuedMessage independently
+    // derives ('queue_' + queue_id) so the existing SEND_MESSAGE_RESULT
+    // correlation below finds this pending row - never the caller-supplied id.
+    queueId = MessageQueueRepository.insert({ thread_id, account_id: thread.account_id, content: text });
+    clientMsgId = `queue_${queueId}`;
+  } else {
+    clientMsgId = client_message_id || `client_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  }
+  const pendingFbId = `pending_${clientMsgId}`;
+  const trace = (stage, extra = {}) => console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage, thread_id: String(thread_id), client_message_id: clientMsgId, route: isPageThread ? 'page_queue' : 'direct_extension', at: new Date().toISOString(), ...extra }));
+  trace('BACKEND_SEND_REQUEST', queueId ? { queue_id: queueId } : {});
+
+  // Lưu tin nhắn outgoing dạng pending vào CSDL
+  const result = db.prepare(`
+    INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, is_outgoing, delivery_status)
+    VALUES (?, ?, ?, 'SYSTEM', ?, 1, 'pending')
+  `).run(thread_id, pendingFbId, clientMsgId, text);
+  trace('BACKEND_PENDING_CREATED', { row_id: result.lastInsertRowid });
+
+  db.prepare(`
+    UPDATE threads SET last_message = ?, last_activity = CURRENT_TIMESTAMP WHERE id = ?
+  `).run(text, thread_id);
+
+  if (isPageThread) {
+    // QueueWorker (already running) picks this up and dispatches SEND_QUEUED_MESSAGE.
+    trace('BACKEND_QUEUED_FOR_PAGE_SEND');
+  } else {
+    // Persist trước khi dispatch để DOM/network confirmation không chạy vào race
+    // window và luôn tìm thấy bản ghi pending để ghép đúng client_message_id.
+    extWs.send(JSON.stringify({ type: 'SEND_MESSAGE', data: { thread_id, content: text, client_message_id: clientMsgId } }));
+    trace('BACKEND_DISPATCHED_EXTENSION');
+  }
+
+  io.emit('NEW_MESSAGE', {
+    id: result.lastInsertRowid,
+    thread_id,
+    content: text,
+    is_outgoing: true,
+    status: 'pending',
+    created_at: new Date().toISOString(),
+    client_message_id: clientMsgId,
+    // Feature 021: for Page threads, clientMsgId above is 'queue_' + queueId,
+    // NOT the id the CRM's own optimistic local bubble was created with
+    // (background.js/handleSendQueuedMessage independently re-derives that
+    // same 'queue_' id later, so it can't be changed - see this feature's
+    // spec). Carrying the original id lets the frontend reconcile its local
+    // bubble to the server's id instead of rendering a second, orphaned one.
+    original_client_message_id: client_message_id || clientMsgId
+  });
+}
+
+
+function enqueueCampaignMessage({ campaign, recipient, attempt, content, attachment = null }) {
+  const route = CampaignEligibilityService.revalidateSnapshotRecipient(recipient, db, {
+    getConnection: (accId) => accountsWs[accId],
+    hasAttachment: Boolean(attachment)
+  });
+  const effectiveSourceType = route.source_type;
+  const effectiveSourceId = route.source_id;
+  const pageId = effectiveSourceType === "page_messenger" ? route.source_external_id : null;
+
+  const config = CampaignService.getConfig();
+  if (config.testMode && effectiveSourceId && !config.testSourceIds.includes(String(effectiveSourceId))) {
+    const error = new Error('Source không nằm trong CAMPAIGN_TEST_SOURCE_IDS');
+    error.code = 'SOURCE_UNAVAILABLE';
+    throw error;
+  }
+  if (CampaignRepository.countAccountSentToday(recipient.account_id) >= config.accountDailyCap) {
+    const error = new Error("Tài khoản đã đạt giới hạn gửi trong ngày");
+    error.code = "SEND_LIMIT_REACHED";
+    throw error;
+  }
+
+  const { queueId, clientMessageId, messageId } = MessageQueueRepository.insertCampaignDispatch({
+    thread_id: recipient.thread_id,
+    account_id: recipient.account_id,
+    source_id: effectiveSourceId,
+    source_type: effectiveSourceType,
+    page_id: pageId,
+    content,
+    attachment_id: attachment?.id || null,
+    attachment_path: attachment?.storage_path || null,
+    attachment_mime_type: attachment?.mime_type || null,
+    attachment_name: attachment?.original_name || null,
+    campaign_id: campaign.id,
+    campaign_recipient_id: recipient.id,
+    campaign_attempt_id: attempt.id,
+    idempotency_key: attempt.idempotency_key
+  }, db);
+  io.emit("NEW_MESSAGE", {
+    id: messageId,
+    thread_id: recipient.thread_id,
+    content,
+    is_outgoing: true,
+    status: "pending",
+    created_at: new Date().toISOString(),
+    client_message_id: clientMessageId,
+    original_client_message_id: clientMessageId,
+    campaign_id: campaign.id,
+    campaign_recipient_id: recipient.id
+  });
+  return { queueId, clientMessageId };
+}
+
+function updateQueueStatusFromClientMessage(clientMessageId, status, errorReason = null) {
+  if (typeof clientMessageId !== 'string' || !clientMessageId.startsWith('queue_')) return false;
+  const queueId = clientMessageId.slice('queue_'.length);
+  if (!queueId) return false;
+  return MessageQueueRepository.updateStatus(queueId, status, errorReason);
+}
+
+// ────────────────────────────────────────────────
+// Extension WebSocket Handler
+// ────────────────────────────────────────────────
+wss.on('connection', (ws, req) => {
+  console.log('[WS] Extension connected from:', req.socket.remoteAddress);
+
+  ws.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      console.log('[WS] 📨 Nhận message:', msg.type, '| WS ID:', req.socket.remoteAddress);
+
+      switch (msg.type) {
+        case 'REGISTER_ACCOUNT': {
+          const { account_id, name, pending_key } = msg.data;
+          extensionConnections.set(account_id, ws);
+          domReplaySuppressUntil.set(account_id, Date.now() + 8000);
+          ws.accountId = account_id;
+
+          let profileDir = `data/profiles/${account_id}`;
+          if (pending_key) {
+            profileDir = `data/profiles/${pending_key}`;
+            if (processManager.processes.has(pending_key)) {
+              const procData = processManager.processes.get(pending_key);
+              processManager.processes.set(account_id, procData);
+            }
+          }
+
+          const accName = name || `FB Account (${account_id})`;
+
+          db.prepare(`
+            INSERT INTO accounts (id, name, profile_dir, status)
+            VALUES (?, ?, ?, 'ACTIVE')
+            ON CONFLICT(id) DO UPDATE SET
+              name = COALESCE(excluded.name, accounts.name),
+              profile_dir = COALESCE(excluded.profile_dir, accounts.profile_dir),
+              status = 'ACTIVE',
+              last_broadcast_date = DATE('now')
+          `).run(account_id, accName, profileDir);
+
+          console.log(`[WS] REGISTER_ACCOUNT thành công: account_id=${account_id}, profile_dir=${profileDir}`);
+          io.emit('ACCOUNT_STATUS_CHANGED', { account_id, status: 'ACTIVE' });
+          io.emit('EXTENSION_CONNECTION_CHANGED', { account_id, is_connected: true });
+
+          // Gửi ACK về Extension xác nhận đăng ký thành công
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'REGISTER_ACCOUNT_ACK',
+              data: { account_id, status: 'SUCCESS', pending_key }
+            }));
+          }
+
+          // Trigger đồng bộ threads ngay sau khi extension đăng ký
+          setTimeout(() => {
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'SYNC_THREADS', data: { account_id } }));
+              console.log(`[WS] Gửi SYNC_THREADS đến extension tài khoản: ${account_id}`);
+            }
+          }, 1500);
+          break;
+        }
+
+        case 'SEND_MESSAGE_RESULT': {
+          const { thread_id, client_message_id, success, error, error_code, message_id, result: fbRes } = msg.data;
+          const officialFbId = message_id || fbRes?.o0?.data?.message?.message_id || fbRes?.o0?.data?.message_id || fbRes?.data?.message_id;
+          const resultQueueId = typeof client_message_id === 'string' && client_message_id.startsWith('queue_')
+            ? client_message_id.slice('queue_'.length)
+            : null;
+          const richQueueResult = resultQueueId
+            ? db.prepare('SELECT outbound_attempt_id FROM message_queue WHERE id = ?').get(resultQueueId)
+            : null;
+          if (richQueueResult?.outbound_attempt_id) {
+            // Rich-message delivery is driven by QUEUED_MESSAGE_RESULT plus
+            // bounded Facebook observation, never by this legacy result path.
+            break;
+          }
+          
+          console.log(`[WS] SEND_MESSAGE_RESULT: thread=${thread_id} client_msg_id=${client_message_id} success=${success} fb_msg_id=${officialFbId}`);
+          console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_RESULT_RECEIVED', thread_id: String(thread_id), client_message_id, success: !!success, official_fb_id: !!officialFbId, error_code: error_code || null, error: error || null, at: new Date().toISOString() }));
+          
+          if (success && officialFbId) {
+            db.prepare(`
+              UPDATE messages 
+              SET fb_message_id = ?, delivery_status = 'sent', delivery_error = NULL
+              WHERE client_message_id = ? OR fb_message_id = ?
+            `).run(officialFbId, client_message_id, `pending_${client_message_id}`);
+            updateQueueStatusFromClientMessage(client_message_id, 'sent');
+
+            io.emit('MESSAGE_SENT', { thread_id, client_message_id, success: true, fb_message_id: officialFbId, status: 'sent' });
+          } else if (error_code === 'COMPOSER_DISPATCHED') {
+            // Check if DOM/network confirmation already arrived before this result
+            const existingRow = db.prepare(`SELECT delivery_status, delivery_error FROM messages WHERE client_message_id = ? OR fb_message_id = ?`).get(client_message_id, `pending_${client_message_id}`);
+            if (existingRow && existingRow.delivery_status === 'sent') {
+              console.log(`[WS] COMPOSER_DISPATCHED arrived but row already sent for ${client_message_id}. No-op.`);
+              updateQueueStatusFromClientMessage(client_message_id, 'sent');
+              io.emit('MESSAGE_SENT', { thread_id, client_message_id, status: 'sent' });
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DISPATCHED_ALREADY_SENT', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
+            } else if (existingRow && existingRow.delivery_status === 'failed') {
+              console.log(`[WS] COMPOSER_DISPATCHED arrived but row already failed for ${client_message_id}. No-op.`);
+              const failError = existingRow.delivery_error || 'Previously failed';
+              io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: failError });
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DISPATCHED_ALREADY_FAILED', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
+            } else {
+              console.log(`[WS] Composer đã dispatch tin; giữ pending chờ DOM/network confirmation: ${client_message_id}`);
+              io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error_code });
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_CONFIRMATION_GRACE', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
+            }
+          } else {
+            console.error('[WS] ❌ SEND_MESSAGE_RESULT failed or missing fb_msg_id:', {
+              thread_id,
+              client_message_id,
+              success,
+              error,
+              fbRes: JSON.stringify(fbRes)?.substring(0, 500)
+            });
+
+            const failureText = error || 'Facebook không xác nhận message_id';
+            const canArriveLateFromComposer = /response rỗng|không nhận message_id|GraphQL/i.test(failureText);
+            if (canArriveLateFromComposer) {
+              // GraphQL có thể lỗi trước khi composer/DOM kịp xác nhận. Giữ pending
+              // một grace window để event đến muộn vẫn ghép được đúng attempt.
+              db.prepare(`
+                UPDATE messages SET delivery_status = 'pending', delivery_error = ?
+                WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
+              `).run(failureText, client_message_id, `pending_${client_message_id}`);
+              io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error: failureText, error_code: 'CONFIRMATION_GRACE' });
+              setTimeout(() => {
+                const stillPending = db.prepare(`SELECT id FROM messages WHERE client_message_id = ? AND delivery_status = 'pending'`).get(client_message_id);
+                if (!stillPending) return;
+                db.prepare(`UPDATE messages SET delivery_status = 'failed', delivery_error = ? WHERE id = ?`).run(failureText, stillPending.id);
+                io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: failureText, error_code: error_code || 'CONFIRMATION_TIMEOUT' });
+              }, 5000);
+            } else {
+              // Lỗi chắc chắn không thể gửi: giữ lịch sử nhưng chuyển failed ngay.
+              db.prepare(`
+                UPDATE messages SET delivery_status = 'failed', delivery_error = ?
+                WHERE (client_message_id = ? OR fb_message_id = ?) AND is_outgoing = 1
+              `).run(failureText, client_message_id, `pending_${client_message_id}`);
+              io.emit('MESSAGE_SEND_FAILED', { thread_id, client_message_id, success: false, status: 'failed', error: failureText, error_code });
+            }
+          }
+          break;
+        }
+
+        case 'CHECKPOINT_DETECTED': {
+          const { account_id } = msg.data;
+          db.prepare("UPDATE accounts SET status='CHECKPOINT' WHERE id=?").run(account_id);
+          processManager.unhideWindow(account_id);
+          io.emit('ACCOUNT_STATUS_CHANGED', { account_id, status: 'CHECKPOINT' });
+          break;
+        }
+
+        case 'NEW_MESSAGE_RECEIVED': {
+          const m = msg.data;
+          const threadId = String(m.thread_id || '');
+          console.log(`[WS] 📩 Nhận NEW_MESSAGE_RECEIVED | Source: ${m.source || 'unknown'} | Thread: ${threadId} | FB Message ID: ${m.fb_message_id} | Content: "${(m.content || '').substring(0, 80)}"`);
+          if (!threadId || threadId === 'unknown_dom' || !/^\d+$/.test(threadId)) {
+            console.warn(`[WS] ⚠️ Bỏ qua tin nhắn từ Thread ID không hợp lệ: "${threadId}"`);
+            break;
+          }
+
+          // Lọc tin nhắn hệ thống, accessibility text & timestamps bằng textFilter.
+          // Một tin nhắn media (ảnh/sticker) hợp lệ có thể không có caption nào cả -
+          // content rỗng không có nghĩa là rác nếu đã có media_url HOẶC media_type
+          // khác 'text' kèm theo (media_url có thể là null khi DOM chỉ thấy được
+          // data: URI cục bộ, không có CDN URL thật - nhưng media_type vẫn đủ để
+          // biết đây là ảnh thật, không phải rác).
+          const cleanedContent = cleanMessageText(m.content);
+          const hasMediaPayload = !!(m.media_url || (m.media_type && m.media_type !== 'text'));
+          // Meta Page can inject this lead-activity notice repeatedly while a
+          // thread reloads. It is never customer content, even when it arrives
+          // without an FB message id, so reject it before persistence/capture.
+          if (!hasMediaPayload && isKnownPageSystemNotice(cleanedContent)) {
+            console.log(`[WS] ℹ️ Backend Guard: Bỏ qua thông báo hệ thống Meta lặp lại từ thread ${threadId}`);
+            break;
+          }
+          if (!hasMediaPayload && (!cleanedContent || isSystemOrMetadataText(cleanedContent))) {
+            console.log(`[WS] ℹ️ Backend Guard: Bỏ qua tin nhắn rác/hệ thống: "${(m.content || '').substring(0, 40)}" từ thread ${threadId}`);
+            break;
+          }
+
+          // Nếu raw content chứa chuỗi quá lớn (scrap rộng), reject ở backend
+          if ((m.content || '').split('\n').length > 8 && isSystemOrMetadataText(m.content)) {
+            console.log(`[WS] ℹ️ Backend Guard: Bỏ qua cụm text scrap rộng từ thread ${threadId}`);
+            break;
+          }
+
+          m.content = cleanedContent;
+
+          // 3. Fix backend fallback is_outgoing
+          let finalIsOutgoing = 0;
+          const targetAccountId = m.account_id || ws.accountId || null;
+          let threadAccountId = targetAccountId;
+
+          // Lấy account_id của thread nếu có
+          const existingThreadForAcct = db.prepare('SELECT account_id FROM threads WHERE id=?').get(threadId);
+          if (existingThreadForAcct && existingThreadForAcct.account_id) {
+            threadAccountId = existingThreadForAcct.account_id;
+          }
+
+          if (m.is_outgoing === true || m.is_outgoing === 1) {
+            finalIsOutgoing = 1;
+          } else if (m.sender_name === 'Bạn') {
+            finalIsOutgoing = 1;
+          } else if (m.sender_id && targetAccountId && String(m.sender_id) === String(targetAccountId)) {
+            finalIsOutgoing = 1;
+          } else if (m.sender_id && threadAccountId && String(m.sender_id) === String(threadAccountId)) {
+            finalIsOutgoing = 1;
+          }
+
+          // 2. Bổ sung log backend
+          console.log(`[WS] 🔍 Debug Outgoing | Thread: ${threadId} | Source: ${m.source} | account_id: ${targetAccountId} | thread_account_id: ${threadAccountId} | sender_id: ${m.sender_id} | sender_name: ${m.sender_name} | raw is_outgoing: ${m.is_outgoing} | final is_outgoing: ${finalIsOutgoing}`);
+
+          const isPageDomObservation = m.source === 'page_dom_observer';
+          const hasBooleanDirection = m.is_outgoing === true || m.is_outgoing === false
+            || m.is_outgoing === 1 || m.is_outgoing === 0;
+          // New Page events must carry an explicit high-confidence direction.
+          // Older payloads and unknown geometry remain pending for safety.
+          const directionStatus = isPageDomObservation
+            && !(m.direction_status === 'confirmed' && m.direction_confidence === 'high' && hasBooleanDirection)
+            ? 'pending'
+            : 'confirmed';
+          if (directionStatus === 'pending') finalIsOutgoing = 0;
+          const isOutgoing = finalIsOutgoing;
+          const isConfirmedIncoming = directionStatus === 'confirmed' && !isOutgoing;
+
+          // Startup/sync replay suppression only applies to the personal-messenger
+          // dom_observer, which replays confirmations of messages the CRM itself
+          // just sent. page_dom_observer passively scrapes Business Suite's
+          // existing history and never has a corresponding pending row to match
+          // against, so this gate would (and did) drop every real outgoing Page
+          // message discovered during the ~8s window right after any reconnect.
+          if (m.source === 'dom_observer' && isOutgoing) {
+            const hasRecentPending = db.prepare(`
+              SELECT id FROM messages
+              WHERE thread_id = ? AND is_outgoing = 1 AND delivery_status = 'pending'
+                AND datetime(created_at) >= datetime('now', '-10 seconds')
+              LIMIT 1
+            `).get(threadId);
+            const suppressUntil = domReplaySuppressUntil.get(targetAccountId) || 0;
+            if (!hasRecentPending && Date.now() < suppressUntil) {
+              console.log(`[WS] ℹ️ Suppress outgoing DOM replay during startup/sync window: thread=${threadId} content="${(m.content || '').substring(0, 40)}"`);
+              console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_REPLAY_SUPPRESSED', thread_id: String(threadId), at: new Date().toISOString() }));
+              break;
+            }
+          }
+
+          // Tải media về local nếu tin mới có đính kèm
+          if (m.media_url && m.media_type && m.media_type !== 'text') {
+            const localPath = await mediaDownloader.downloadNewMessageMedia(m.thread_id, m.media_url, m.media_type);
+            if (localPath) m.local_media_path = localPath;
+          }
+
+          // FIX FOREIGN KEY: Đảm bảo thread tồn tại/được upsert TRƯỚC KHI insert message
+          ConversationRepository.upsertThread({
+            id: m.thread_id,
+            account_id: targetAccountId,
+            contact_name: m.contact_name || 'Khách hàng',
+            last_message: m.content,
+            is_unread: true
+          });
+
+          const tsMs = m.timestamp_ms || 0;
+          const tsSource = m.timestamp_source || 'unknown';
+          const createdAt = (m.created_at && !isNaN(Date.parse(m.created_at))) ? m.created_at : new Date().toISOString();
+
+          const safeSenderId = m.sender_id || (isOutgoing ? String(targetAccountId) : 'CONTACT');
+          // Composer fallback không có official GraphQL ID; ghép confirmation DOM
+          // vào bản pending gần nhất cùng thread/nội dung thay vì tạo bubble thứ hai.
+          if (isOutgoing && (m.source === 'dom_observer' || m.source === 'page_dom_observer') && (m.content || m.media_url || (m.media_type && m.media_type !== 'text'))) {
+            console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_OUTGOING_RECEIVED', thread_id: String(threadId), fb_message_id: m.fb_message_id || null, at: new Date().toISOString() }));
+            let skipPendingCorrelation = false;
+            // Fix: Tránh crash UNIQUE constraint khi DOM observer gửi lại tin nhắn cũ có trùng content
+            if (m.fb_message_id) {
+               const existingFbId = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(m.fb_message_id);
+               if (existingFbId) {
+                   console.log(`[WS] DOM observer sent an already known fb_message_id (${m.fb_message_id}). Bỏ qua event để tránh ghi đè pending.`);
+                   skipPendingCorrelation = true;
+               }
+            }
+
+            if (!skipPendingCorrelation) {
+              // Rich-message sends (image/file, tracked via outbound_attempts)
+              // are invisible to the legacy pending lookup below - it only
+              // knows the messages table. Try the dedicated confirmation
+              // service first; it's a safe no-op (NO_CANDIDATE) for every
+              // plain-text send, since those never create an outbound_attempts
+              // row, so this can never double-fire against the legacy path.
+              const internalThreadId = resolveInternalThreadId(db, targetAccountId, m.thread_id);
+              const richConfirmation = OutboundConfirmationService.confirmObservation({
+                threadId: internalThreadId,
+                fbMessageId: m.fb_message_id,
+                isOutgoing: true,
+                mediaType: m.media_type || 'text',
+                content: m.content,
+                observedAt: Date.now(),
+                confirmationSource: m.source === 'page_dom_observer' ? 'page_dom' : 'personal_dom'
+              }, { database: db });
+
+              if (richConfirmation.matched) {
+                const updatedMessage = db.prepare('SELECT * FROM messages WHERE id = ?').get(richConfirmation.message_id);
+                io.emit('MESSAGE_SENT', { thread_id: internalThreadId, client_message_id: richConfirmation.client_message_id, fb_message_id: richConfirmation.fb_message_id, status: 'sent' });
+                io.emit('NEW_MESSAGE', withAttachmentAccessUrl({ ...updatedMessage, client_message_id: richConfirmation.client_message_id, status: 'sent' }));
+                console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_RICH_CONFIRMED', thread_id: String(internalThreadId), client_message_id: richConfirmation.client_message_id, fb_message_id: richConfirmation.fb_message_id, at: new Date().toISOString() }));
+                break;
+              }
+
+              const isMediaConfirmation = !m.content && (m.media_url || (m.media_type && m.media_type !== 'text'));
+              const pending = isMediaConfirmation
+                ? db.prepare(`
+                    SELECT outbound.id, outbound.client_message_id
+                    FROM messages outbound
+                    JOIN message_queue queued ON outbound.client_message_id = 'queue_' || queued.id
+                    WHERE outbound.thread_id = ? AND outbound.is_outgoing = 1
+                      AND outbound.delivery_status = 'pending' AND queued.attachment_id IS NOT NULL
+                    ORDER BY outbound.id DESC LIMIT 1
+                  `).get(m.thread_id)
+                : db.prepare(`
+                    SELECT id, client_message_id FROM messages
+                    WHERE thread_id = ? AND content = ? AND is_outgoing = 1 AND delivery_status = 'pending'
+                    ORDER BY id DESC LIMIT 1
+                  `).get(m.thread_id, m.content);
+              if (pending) {
+                const confirmedId = m.fb_message_id || `dom_${pending.client_message_id}`;
+                const existingConfirmed = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(confirmedId);
+                if (existingConfirmed) {
+                    console.log(`[WS] Confirmed ID ${confirmedId} đã tồn tại. Bỏ qua pending match.`);
+                } else {
+                  db.prepare(`
+                    UPDATE messages SET fb_message_id = ?, delivery_status = 'sent', delivery_error = NULL,
+                      timestamp_ms = CASE WHEN ? > 0 THEN ? ELSE timestamp_ms END,
+                      timestamp_source = CASE WHEN ? <> 'unknown' THEN ? ELSE timestamp_source END
+                    WHERE id = ?
+                  `).run(confirmedId, tsMs, tsMs, tsSource, tsSource, pending.id);
+                  updateQueueStatusFromClientMessage(pending.client_message_id, 'sent');
+                  io.emit('MESSAGE_SENT', { thread_id: m.thread_id, client_message_id: pending.client_message_id, fb_message_id: confirmedId, status: 'sent' });
+                  io.emit('NEW_MESSAGE', { ...m, client_message_id: pending.client_message_id, fb_message_id: confirmedId, delivery_status: 'sent', status: 'sent', is_outgoing: true, timestamp_ms: tsMs, timestamp_source: tsSource, created_at: createdAt });
+                  console.log(`[WS] Đã ghép DOM confirmation vào pending outbound ${pending.client_message_id}`);
+                  console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_CORRELATED', thread_id: String(m.thread_id), client_message_id: pending.client_message_id, fb_message_id: confirmedId, at: new Date().toISOString() }));
+                  break;
+                }
+              }
+
+              // Feature 020: Facebook sometimes assigns an outgoing message a
+              // temporary, non-"mid.$" numeric fb_message_id first, then a
+              // permanent "mid.$..." id on a later scan once fully confirmed.
+              // The pending-match above only bridges the FIRST id-arrival (it
+              // consumes the pending row, flipping it to 'sent'); the second
+              // id-arrival finds no pending row left and no existing row
+              // under its own id, so without this check it falls through to
+              // a plain insert - a real duplicate row for the same send.
+              // Recognize "already sent, same content, different id, very
+              // recent" as an id upgrade and update in place instead.
+              if (m.fb_message_id) {
+                const recentSent = db.prepare(`
+                  SELECT id, client_message_id, fb_message_id FROM messages
+                  WHERE thread_id = ? AND content = ? AND is_outgoing = 1 AND delivery_status = 'sent'
+                    AND fb_message_id IS NOT NULL AND fb_message_id != ?
+                    AND datetime(created_at) >= datetime('now', '-8 seconds')
+                  ORDER BY id DESC LIMIT 1
+                `).get(m.thread_id, m.content, m.fb_message_id);
+                if (recentSent) {
+                  db.prepare('UPDATE messages SET fb_message_id = ? WHERE id = ?').run(m.fb_message_id, recentSent.id);
+                  console.log(`[WS] Nâng cấp fb_message_id tạm ${recentSent.fb_message_id} -> ${m.fb_message_id} (id ${recentSent.id}), cùng 1 tin gửi đi`);
+                  console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_ID_UPGRADED', thread_id: String(m.thread_id), from_fb_message_id: recentSent.fb_message_id, to_fb_message_id: m.fb_message_id, at: new Date().toISOString() }));
+                  break;
+                }
+              }
+
+              // Mismatch guard: exactly 1 pending in same thread within 10s, but content differs
+              const recentPendings = db.prepare(`
+                SELECT id, client_message_id, content FROM messages
+                WHERE thread_id = ? AND is_outgoing = 1 AND delivery_status = 'pending'
+                  AND datetime(created_at) >= datetime('now', '-10 seconds')
+                ORDER BY id DESC
+              `).all(m.thread_id);
+              if (recentPendings.length === 1) {
+                const mismatchPending = recentPendings[0];
+                const pendingContent = String(mismatchPending.content || '').trim();
+                const domContent = String(m.content || '').trim();
+                // Only mark mismatch if DOM content looks related to the pending attempt
+                // (e.g. "what" -> "whatwhat", "alo 123" -> "aloalo 123")
+                // Unrelated old messages like "Long ngu" won't accidentally fail a pending "what"
+                const looksLikeSameAttempt = pendingContent && domContent &&
+                  (domContent.includes(pendingContent) || pendingContent.includes(domContent));
+                if (looksLikeSameAttempt) {
+                  console.warn(`[WS] ⚠️ COMPOSER_CONTENT_MISMATCH: pending content="${pendingContent.substring(0, 40)}" vs DOM content="${domContent.substring(0, 40)}" | thread=${m.thread_id}`);
+                  console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_CONTENT_MISMATCH', thread_id: String(m.thread_id), client_message_id: mismatchPending.client_message_id, pending_len: pendingContent.length, dom_len: domContent.length, at: new Date().toISOString() }));
+                  db.prepare(`
+                    UPDATE messages SET delivery_status = 'failed', delivery_error = 'COMPOSER_CONTENT_MISMATCH'
+                    WHERE id = ?
+                  `).run(mismatchPending.id);
+                  io.emit('MESSAGE_SEND_FAILED', { thread_id: m.thread_id, client_message_id: mismatchPending.client_message_id, success: false, status: 'failed', error: 'COMPOSER_CONTENT_MISMATCH', error_code: 'COMPOSER_CONTENT_MISMATCH' });
+                  // Discard the mismatched DOM bubble entirely — do not insert it
+                  break;
+                }
+              }
+            }
+          }
+          // Lưu tin nhắn vào bảng messages
+          const stableMessageId = m.fb_message_id || m.client_message_id || ConversationRepository.fingerprint(m.thread_id, m);
+          const insertMsgResult = db.prepare(`
+            INSERT OR IGNORE INTO messages
+              (thread_id, fb_message_id, sender_id, content, media_type, media_url, local_media_path, is_outgoing, direction_status, timestamp_ms, timestamp_source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(m.thread_id, stableMessageId, safeSenderId, m.content,
+            m.media_type || 'text', m.media_url, m.local_media_path, isOutgoing, directionStatus, tsMs, tsSource, createdAt);
+
+          let wasNewMessage = insertMsgResult.changes > 0;
+          let directionWasUpdated = false;
+
+          if (!wasNewMessage) {
+            // Tin đã tồn tại: nhờ ConversationRepository quyết định có cần nâng cấp
+            // timestamp/is_outgoing không (logic dùng chung, có test riêng).
+            const reconcile = ConversationRepository.reconcileExistingMessage(
+              stableMessageId,
+              {
+                source: m.source,
+                isOutgoing: directionStatus === 'pending' ? null : isOutgoing,
+                direction_status: directionStatus,
+                direction_confidence: m.direction_confidence,
+                tsMs,
+                tsSource,
+                createdAt
+              },
+              db
+            );
+            if (reconcile.reason === 'not_found') {
+              break; // Duplicate vì client_message_id hoặc lý do khác
+            }
+            if (!reconcile.updated) {
+              console.log(`[WS] Bỏ qua tin nhắn đã tồn tại (fb_message_id: ${m.fb_message_id})`);
+              break;
+            }
+            if (reconcile.timestampUpdated) {
+              console.log(`[WS] ⏳ Nâng cấp Timestamp Rank cho fb_message_id ${m.fb_message_id}: ${reconcile.previousTimestampSource} -> ${tsSource}`);
+            }
+            if (reconcile.directionUpdated) {
+              directionWasUpdated = true;
+              console.log('[WS] Direction updated for message ' + m.fb_message_id + ': ' + (reconcile.previousIsOutgoing ? 1 : 0) + ' -> ' + (isOutgoing ? 1 : 0));
+            }
+            // Direction promotion is emitted so an already-open CRM thread can
+            // move the bubble without inserting a duplicate message.
+          }
+
+          // Avatar backfill: apply regardless of whether this message is a brand-new
+          // insert or a re-scan of an existing one, so a thread whose messages were
+          // already stored before contact-avatar extraction existed still gets
+          // corrected. Skip entirely once a real (non-placeholder) avatar is already
+          // stored, so we don't re-download/re-write on every scan tick.
+          if (isConfirmedIncoming && wasNewMessage) {
+            const avatarData = m.avatar_base64 || m.avatar_url || m.contact_avatar || '';
+            if (avatarData) {
+              const existingContact = db.prepare('SELECT avatar_url FROM contacts WHERE thread_id = ?').get(m.thread_id);
+              if (!existingContact || !existingContact.avatar_url) {
+                try {
+                  const localAvatarPath = await saveAvatarFromBase64OrUrl(avatarData, m.thread_id);
+                  if (localAvatarPath) {
+                    const avatarResult = ConversationRepository.setContactAvatarIfMissing(m.thread_id, m.contact_name, localAvatarPath, db);
+                    if (avatarResult.updated) {
+                      io.emit('CONTACT_UPDATED', { thread_id: m.thread_id, avatar_url: localAvatarPath });
+                    }
+                  }
+                } catch (err) {
+                  console.warn('[WS] Avatar save failed:', err.message);
+                }
+              }
+            }
+          }
+
+          if (!wasNewMessage && !directionWasUpdated) break; // Ignore a replay with no persisted change.
+          if (wasNewMessage) ConversationRepository.touchThread(m.thread_id, m.content);
+
+          // Auto Lead Extraction (avatar handled above, applies regardless of wasNewMessage)
+          if (wasNewMessage && isConfirmedIncoming && m.content) {
+            const { emails } = extractLeadInfo(m.content);
+            if (emails.length > 0) {
+              db.prepare(`
+                INSERT INTO contacts (thread_id, name, email)
+                VALUES (?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                  email = COALESCE(NULLIF(excluded.email,''), contacts.email)
+              `).run(m.thread_id, m.contact_name || 'Khách hàng', emails[0] || null);
+            }
+
+            // Phone capture (spec 035): exact-prefix detection, immutable
+            // evidence per candidate, fill-only contact phone (never
+            // overwrites a manual/legacy/already-selected value). Runs
+            // independently of email extraction above.
+            const { threadId: capturedThreadId, createdCaptures } = PhoneCaptureService.processIncomingMessage({
+              threadId: m.thread_id,
+              accountId: targetAccountId,
+              messageId: stableMessageId,
+              content: m.content,
+              messageTimestampMs: tsMs
+            }, { database: db });
+
+            if (emails.length > 0 || createdCaptures.length > 0) {
+              // Kept additive/compatible with any existing LEAD_EXTRACTED
+              // consumer - phones here are normalized capture values, not
+              // raw regex matches.
+              io.emit('LEAD_EXTRACTED', {
+                thread_id: m.thread_id,
+                phones: createdCaptures.map((c) => c.normalized_phone),
+                emails
+              });
+            }
+            if (createdCaptures.length > 0) {
+              // Global CRM rule is opt-in and applies to every genuine incoming
+              // capture. A configured campaign policy runs immediately after it
+              // and is the explicit per-campaign override when it has a target.
+              const globalPhoneAutomation = GlobalPhoneAutomationService.applyCaptures(capturedThreadId, createdCaptures, db);
+              if (globalPhoneAutomation.applied) {
+                console.log(`[PhoneCapture] Global automation applied status ${globalPhoneAutomation.settings.status_id} for ${capturedThreadId}`);
+              }
+
+              // Includes the fully-resolved contact phone view so the
+              // frontend can merge it directly without a round-trip fetch -
+              // it needs this regardless of which thread is active, so the
+              // background cache stays correct for whenever the operator
+              // switches to it (contracts/phone-capture.md's contact payload shape).
+              const phoneView = PhoneCaptureService.getContactPhoneView(capturedThreadId, db);
+              io.emit('PHONE_CAPTURED', {
+                thread_id: capturedThreadId,
+                captures: createdCaptures.map((c) => ({
+                  id: c.id,
+                  normalized_phone: c.normalized_phone,
+                  raw_phone: c.raw_phone,
+                  message_id: c.message_id,
+                  message_timestamp_ms: c.message_timestamp_ms,
+                  selection_state: c.selection_state
+                })),
+                phone: phoneView.phone,
+                phone_source: phoneView.phone_source,
+                phone_captured_at: phoneView.phone_captured_at,
+                phone_capture: phoneView.phone_capture,
+                phone_candidates: phoneView.phone_candidates
+              });
+              io.emit('CONTACT_UPDATED', { thread_id: capturedThreadId });
+
+              // Campaign phone-capture policy (spec 035) - runs after the
+              // capture is durably saved and broadcast, per the contract
+              // ("invoke campaign reaction only after durable capture").
+              // Awaited: thank_then_stop waits for its acknowledgement to
+              // settle before stopping remaining work, so this can take up
+              // to the poll timeout - acceptable here since it only runs for
+              // the (rare) capture-bearing message, not every message.
+              try {
+                const affectedCampaignIds = await CampaignPhoneCaptureService.handleCaptures(capturedThreadId, createdCaptures, {
+                  database: db,
+                  capabilityOptions: getRichMessageCapabilityOptions()
+                });
+                for (const campaignId of affectedCampaignIds) {
+                  CampaignEventService.emit(io, CampaignRepository.getCampaign(campaignId, db));
+                }
+                // Emit one authoritative post-policy view. The earlier
+                // PHONE_CAPTURED event makes the number feel instant; this
+                // complete patch is what makes every active panel, sidebar
+                // chip and status filter converge after policy handling.
+                const updatedContact = db.prepare(`
+                  SELECT c.phone, c.phone_source, c.phone_captured_at,
+                         c.status_id, ls.name AS status_name, ls.color AS status_color
+                  FROM contacts c LEFT JOIN lead_statuses ls ON ls.id = c.status_id
+                  WHERE c.thread_id = ?
+                `).get(capturedThreadId);
+                io.emit('CONTACT_UPDATED', { thread_id: capturedThreadId, ...updatedContact });
+              } catch (err) {
+                console.error('[PhoneCapture] Campaign policy application failed:', err.message);
+              }
+            }
+          }
+
+          if (wasNewMessage && isConfirmedIncoming) {
+            followupService.restoreOnIncoming(m.thread_id);
+          }
+
+          // Emit payload đầy đủ lên frontend
+          const msgPayload = {
+            ...m,
+            timestamp_ms: tsMs,
+            timestamp_source: tsSource,
+            created_at: createdAt,
+            is_outgoing: !!isOutgoing,
+            direction_status: directionStatus
+          };
+          console.log(`[WS] Emitting NEW_MESSAGE to Socket.io clients:`, JSON.stringify(msgPayload).substring(0, 200));
+          io.emit('NEW_MESSAGE', msgPayload);
+
+          // Auto-Reply & AI
+          if (wasNewMessage && isConfirmedIncoming) {
+            const replied = await autoReplyEngine.processIncoming(m, sendViaExtension);
+            if (!replied) {
+              await aiMediator.processIncoming(m, sendViaExtension);
+            }
+          }
+          break;
+        }
+
+        case 'SYNC_THREADS_RESULT': {
+          const { account_id, threads } = msg.data;
+          console.log(`[WS] Nhận ${threads?.length || 0} threads từ extension tài khoản: ${account_id}`);
+          domReplaySuppressUntil.set(account_id, Date.now() + 5000);
+          if (threads?.length) {
+            const txn = db.transaction((account_id, threads) => {
+              for (const t of threads) {
+                const threadId = String(t.thread_id);
+                let name = t.name || t.contact_name || null;
+                
+                const PRESENCE_EXACT = /^(?:Đang|Đang hoạt động.*|Hoạt động(?:\s+\d+.*)?|Đã hoạt động.*|Active now|Active recently|Active \d+.*|Online|Offline)$/i;
+                if (name && PRESENCE_EXACT.test(name.trim())) {
+                  const existing = db.prepare('SELECT contact_name FROM threads WHERE id = ?').get(threadId);
+                  let existingName = existing?.contact_name;
+                  if (existingName && PRESENCE_EXACT.test(existingName.trim())) existingName = null;
+                  name = existingName || 'Khách hàng';
+                }
+                
+                // Double check để loại bỏ trường hợp 'Đang' tuyệt đối
+                if (name === 'Đang') name = 'Khách hàng';
+                let cleanLastMsg = cleanMessageText(t.last_message);
+                if (!cleanLastMsg || isSystemOrMetadataText(cleanLastMsg) || cleanLastMsg === 'Đang tải...') {
+                  const dbMsgs = db.prepare(`
+                    SELECT content, media_url FROM messages
+                    WHERE thread_id = ?
+                    ORDER BY timestamp_ms DESC, created_at DESC, id DESC
+                    LIMIT 10
+                  `).all(threadId);
+
+                  // A media message with no caption is a valid "last message" too -
+                  // preview it as [Ảnh] instead of falling through to an older text
+                  // message or "Chưa có tin nhắn".
+                  const validInDb = dbMsgs.find(m => {
+                    if (m.media_url) return true;
+                    const c = cleanMessageText(m.content);
+                    return c && !isSystemOrMetadataText(c) && c !== 'Đang tải...';
+                  });
+
+                  cleanLastMsg = validInDb
+                    ? (cleanMessageText(validInDb.content) || (validInDb.media_url ? '[Ảnh]' : ''))
+                    : 'Chưa có tin nhắn';
+                }
+
+                ConversationRepository.upsertThread({
+                  id: threadId,
+                  account_id: account_id,
+                  thread_url: t.thread_url || null,
+                  contact_name: name,
+                  last_message: cleanLastMsg,
+                  is_unread: t.is_unread
+                });
+                
+                const currentContact = db.prepare('SELECT avatar_url FROM contacts WHERE thread_id = ?').get(threadId);
+                let initialAvatar = currentContact?.avatar_url || null;
+                if (t.avatar_url && !t.avatar_url.startsWith('http')) {
+                  initialAvatar = t.avatar_url;
+                }
+                db.prepare(`
+                  INSERT INTO contacts (thread_id, name, avatar_url)
+                  VALUES (?, ?, ?)
+                  ON CONFLICT(thread_id) DO UPDATE SET
+                    name = excluded.name,
+                    avatar_url = COALESCE(excluded.avatar_url, contacts.avatar_url)
+                `).run(threadId, name, initialAvatar);
+              }
+            });
+            txn(account_id, threads);
+
+            for (const t of threads) {
+              const threadId = String(t.thread_id);
+              const avatarData = t.avatar_base64 || t.avatar_url;
+              if (avatarData) {
+                saveAvatarFromBase64OrUrl(avatarData, threadId).then(localFilename => {
+                  if (localFilename) {
+                    db.prepare('UPDATE contacts SET avatar_url = ? WHERE thread_id = ?').run(localFilename, threadId);
+                    io.emit('CONTACT_UPDATED', { thread_id: threadId, avatar_url: localFilename });
+                  }
+                }).catch(() => {});
+              }
+            }
+          }
+          const allThreads = db.prepare(`
+            SELECT t.*, c.phone, c.email, c.address, c.tags, c.lead_captured, c.avatar_url,
+              c.status_id, ls.name AS status_name, ls.color AS status_color,
+              r.due_at AS reminder_due_at, r.note AS reminder_note, r.status AS reminder_status
+            FROM threads t
+            LEFT JOIN contacts c ON c.thread_id = t.id
+            LEFT JOIN lead_statuses ls ON ls.id = c.status_id
+            LEFT JOIN conversation_reminders r ON r.thread_id = t.id AND r.status = 'active'
+            WHERE t.account_id = ?
+            ORDER BY t.last_activity DESC
+          `).all(account_id);
+          io.emit('THREADS_SYNCED', { account_id, threads: allThreads });
+          console.log(`[WS] Đã emit THREADS_SYNCED lên frontend: ${allThreads.length} threads`);
+          break;
+        }
+
+        case 'THREAD_MESSAGES_SYNCED': {
+          const { account_id, thread_id, messages, reason, mode, checkpoint, fetched_count } = msg.data;
+          console.log(`[WS] THREAD_MESSAGES_SYNCED: thread=${thread_id} mode=${mode||'full'} count=${messages?.length || 0}${reason ? ` reason=${reason}` : ''}`);
+
+          if (reason) {
+            const temporaryReasons = ['url_mismatch', 'sidebar_mismatch', 'marker_mismatch', 'no_rows', 'no_main_container', 'loading', 'timeout'];
+            if (temporaryReasons.includes(reason)) {
+              if (!global.syncRetries) global.syncRetries = {};
+              if (!global.syncRetries[thread_id]) global.syncRetries[thread_id] = 0;
+              
+              if (global.syncRetries[thread_id] < 2) {
+                global.syncRetries[thread_id]++;
+                console.log(`[WS] 🔄 Retry sync thread ${thread_id} (Lần ${global.syncRetries[thread_id]}) sau 2s...`);
+                setTimeout(() => {
+                  const extWs = extensionConnections.get(account_id);
+                  if (extWs && extWs.readyState === 1 /* WebSocket.OPEN */) {
+                    const threadRow = db.prepare('SELECT thread_url FROM threads WHERE id = ?').get(thread_id);
+                    const retryThreadUrl = msg.data.thread_url || (threadRow ? threadRow.thread_url : null);
+                    // Pass the old checkpoint back if available
+                    const HistorySyncManager = require('./services/HistorySyncManager');
+                    const syncState = HistorySyncManager.getSyncState(thread_id);
+                    extWs.send(JSON.stringify({
+                      type: 'SYNC_THREAD_MESSAGES',
+                      data: { account_id, thread_id, thread_url: retryThreadUrl, mode: syncState?.sync_cursor?.mode || 'initial', cursor: syncState?.sync_cursor }
+                    }));
+                  }
+                }, 2000);
+              } else {
+                console.log(`[WS] ❌ Hủy sync thread ${thread_id} sau 2 lần retry thất bại (reason=${reason})`);
+                global.syncRetries[thread_id] = 0;
+                const HistorySyncManager = require('./services/HistorySyncManager');
+                HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
+              }
+            } else {
+              const HistorySyncManager = require('./services/HistorySyncManager');
+              HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
+            }
+            return; // Không ghi đè hoặc emit UI
+          }
+
+          if (global.syncRetries && global.syncRetries[thread_id]) {
+            global.syncRetries[thread_id] = 0;
+          }
+
+          const HistorySyncManager = require('./services/HistorySyncManager');
+          
+          if (Array.isArray(messages) && messages.length > 0) {
+            const validMessages = messages.map(m => ({ ...m, content: cleanMessageText(m.content) }))
+              .filter(m => String(m.thread_id || thread_id) === String(thread_id)
+                && (m.media_url || (m.content && !isSystemOrMetadataText(m.content))));
+
+            const threadRow = db.prepare('SELECT id, account_id FROM threads WHERE id = ?').get(thread_id);
+            if (!threadRow) {
+              ConversationRepository.upsertThread({
+                id: String(thread_id),
+                account_id,
+                contact_name: 'Khách hàng',
+                is_unread: false
+              });
+            }
+            
+            const persistence = ConversationRepository.saveMessagesTransaction(thread_id, validMessages.map(m => ({
+              ...m,
+              account_id,
+              timestamp_source: m.timestamp_source || 'fallback'
+            })));
+            const deltaIds = [...persistence.insertedIds, ...persistence.updatedIds];
+            const fetchedTotal = Number.isFinite(Number(fetched_count)) ? Number(fetched_count) : messages.length;
+            const skippedTotal = Math.max(0, fetchedTotal - deltaIds.length);
+            console.log(`[WS] Diagnostics thread=${thread_id}: fetched=${fetchedTotal} inserted=${persistence.insertedIds.length} updated=${persistence.updatedIds.length} skipped=${skippedTotal}`);
+
+            if (checkpoint) {
+              HistorySyncManager.updateSyncStatus(thread_id, 'SYNCED', checkpoint);
+            }
+
+            const latest = validMessages[validMessages.length - 1];
+            if (latest) ConversationRepository.touchThread(thread_id, latest.content);
+
+            if (deltaIds.length === 0) break;
+            const placeholders = deltaIds.map(() => '?').join(',');
+            const deltaMsgsRows = db.prepare(`
+              SELECT * FROM messages WHERE fb_message_id IN (${placeholders}) ORDER BY timestamp_ms ASC, created_at ASC, id ASC
+            `).all(...deltaIds);
+            const cleanMsgs = deltaMsgsRows.map(m => {
+              const cleaned = cleanMessageText(m.content);
+              return { ...m, cleaned };
+            }).filter(m => m.media_url || (m.cleaned && !isSystemOrMetadataText(m.cleaned) && m.cleaned !== 'Đang tải...')).map(m => withAttachmentAccessUrl({
+              ...m,
+              content: m.cleaned
+            }));
+
+            io.emit('THREAD_MESSAGES_UPDATED', { thread_id, messages: cleanMsgs });
+          } else {
+             // Empty messages list but no error means we might have reached the end or just no new messages
+             if (checkpoint) {
+               HistorySyncManager.updateSyncStatus(thread_id, 'SYNCED', checkpoint);
+             }
+          }
+          break;
+        }
+
+        case 'QUEUED_MESSAGE_RESULT': {
+          // Previously missing entirely: handleSendQueuedMessage (background.js)
+          // always sends this back after processing a queued Page send, but
+          // with no case for it here it fell to `default: break` - silently
+          // dropped. That's why every message_queue row, going back days, was
+          // stuck at status='processing' forever, and any genuine send
+          // failure left the CRM bubble hung in "Đang gửi" with no way to
+          // ever learn it failed.
+          const { queue_id, success, error, client_message_id } = msg.data;
+          console.log(`[WS] QUEUED_MESSAGE_RESULT: queue_id=${queue_id} success=${success} error=${error || 'none'}`);
+          const richQueue = db.prepare(
+            'SELECT * FROM message_queue WHERE id = ? AND outbound_attempt_id IS NOT NULL'
+          ).get(queue_id);
+          if (richQueue) {
+            const outcome = msg.data.outcome;
+            const dispatched = outcome === 'dispatched' ||
+              error === 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION' ||
+              (outcome == null && success === true);
+            if (dispatched) {
+              OutboundAttemptRepository.transition(
+                richQueue.outbound_attempt_id,
+                ['queued', 'dispatching'],
+                'awaiting_confirmation',
+                {
+                  dispatch_method: msg.data.adapter_version || 'rich-message-v1',
+                  dispatched_at: new Date().toISOString()
+                },
+                db
+              );
+              const attempt = OutboundAttemptRepository.getById(
+                richQueue.outbound_attempt_id,
+                db
+              );
+              const message = attempt
+                ? db.prepare('SELECT * FROM messages WHERE id = ?').get(attempt.message_id)
+                : null;
+              if (message) {
+                io.emit('MESSAGE_SEND_STATUS', {
+                  thread_id: message.thread_id,
+                  client_message_id: message.client_message_id,
+                  message_id: message.id,
+                  attempt_id: attempt.id,
+                  status: 'awaiting_confirmation',
+                  fb_message_id: null,
+                  confirmation_source: null,
+                  error: null,
+                  updated_at: new Date().toISOString()
+                });
+              }
+              break;
+            }
+
+            const reason = msg.data.error_code || error || 'FACEBOOK_SEND_REJECTED';
+            MessageQueueRepository.updateStatus(queue_id, 'failed', reason);
+            OutboundAttemptRepository.transition(
+              richQueue.outbound_attempt_id,
+              ['queued', 'dispatching', 'awaiting_confirmation'],
+              'failed',
+              { error_code: reason, error_message: error || reason },
+              db
+            );
+            if (richQueue.attachment_id) {
+              OutboundAttachmentRepository.transition(
+                richQueue.attachment_id,
+                ['queued', 'sending'],
+                'failed',
+                { validation_error: reason },
+                db
+              );
+            }
+            const failedAttempt = OutboundAttemptRepository.getById(
+              richQueue.outbound_attempt_id,
+              db
+            );
+            if (failedAttempt) {
+              const failedMessage = db.prepare('SELECT * FROM messages WHERE id = ?').get(
+                failedAttempt.message_id
+              );
+              db.prepare(
+                "UPDATE messages SET delivery_status = 'failed', delivery_error = ? WHERE id = ?"
+              ).run(error || reason, failedAttempt.message_id);
+              if (failedMessage) {
+                io.emit('MESSAGE_SEND_STATUS', {
+                  thread_id: failedMessage.thread_id,
+                  client_message_id: failedMessage.client_message_id,
+                  message_id: failedMessage.id,
+                  attempt_id: failedAttempt.id,
+                  status: 'failed',
+                  fb_message_id: null,
+                  confirmation_source: null,
+                  error: { code: reason, message: error || reason },
+                  updated_at: new Date().toISOString()
+                });
+              }
+            }
+            break;
+          }
+
+          if (success) {
+            MessageQueueRepository.updateStatus(queue_id, 'sent');
+            break;
+          }
+
+          if (error === 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION') {
+            // CDP dispatch itself succeeded - not a real failure yet. The
+            // actual outcome is decided separately via DOM confirmation
+            // (the pending-correlation / feature 020 temp-id-upgrade paths
+            // in the NEW_MESSAGE_RECEIVED case above). Leave message_queue
+            // as 'processing' until/unless a genuine failure follows.
+            break;
+          }
+
+          // Genuine failure (extension not connected, composer never found
+          // even after feature 016's poll+reload+poll, CDP dispatch itself
+          // threw, etc.) - reuse the exact same failure path QueueWorker
+          // already uses for its own EXTENSION_NOT_CONNECTED case, so both
+          // failure sources behave identically.
+          const queueRow = db.prepare('SELECT thread_id FROM message_queue WHERE id = ?').get(queue_id);
+          MessageQueueRepository.updateStatus(queue_id, 'failed', error);
+          if (queueWorker.onQueueFail) {
+            queueWorker.onQueueFail({ id: queue_id, thread_id: queueRow ? queueRow.thread_id : null }, error);
+          }
+          break;
+        }
+
+        case 'MSG_UNSEND': {
+          const { fb_message_id } = msg.data;
+          db.prepare("UPDATE messages SET is_unsent=1 WHERE fb_message_id=?").run(fb_message_id);
+          io.emit('MESSAGE_UNSENT', { fb_message_id });
+          break;
+        }
+
+        default: break;
+      }
+    } catch (err) {
+      console.error('[WS] Error:', err.message);
+    }
+  });
+
+  ws.on('close', () => {
+    if (ws.accountId) {
+      extensionConnections.delete(ws.accountId);
+      domReplaySuppressUntil.delete(ws.accountId);
+      db.prepare("UPDATE accounts SET status='DISCONNECTED' WHERE id=?").run(ws.accountId);
+      io.emit('ACCOUNT_STATUS_CHANGED', { account_id: ws.accountId, status: 'DISCONNECTED' });
+      io.emit('EXTENSION_CONNECTION_CHANGED', { account_id: ws.accountId, is_connected: false });
+    }
+  });
+});
+
+// ────────────────────────────────────────────────
+// Socket.io: Nhân viên gửi tin nhắn → AI auto-pause 30 phút
+// ────────────────────────────────────────────────
+io.on('connection', (socket) => {
+  socket.on('REQUEST_SYNC_THREADS', ({ account_id }) => {
+    if (!account_id) return;
+    const extWs = extensionConnections.get(account_id);
+    if (extWs && extWs.readyState === WebSocket.OPEN) {
+      console.log(`[Socket.io] Nhận yêu cầu đồng bộ lại hội thoại cho account: ${account_id}`);
+      extWs.send(JSON.stringify({ type: 'SYNC_THREADS', data: { account_id } }));
+    } else {
+      console.warn(`[Socket.io] Extension cho account ${account_id} chưa sẵn sàng WebSocket.`);
+    }
+  });
+
+  socket.on('REQUEST_SYNC_THREAD_MESSAGES', ({ account_id, thread_id, thread_url }) => {
+    let targetAccId = account_id;
+    if (!targetAccId && extensionConnections.size > 0) {
+      targetAccId = extensionConnections.keys().next().value;
+    }
+    if (!targetAccId || !thread_id) return;
+
+    const extWs = extensionConnections.get(targetAccId);
+    if (extWs && extWs.readyState === WebSocket.OPEN) {
+      const HistorySyncManager = require('./services/HistorySyncManager');
+      const syncState = HistorySyncManager.getSyncState(thread_id);
+      let mode = 'incremental';
+      if (!syncState || !syncState.sync_cursor) {
+        mode = 'initial';
+      }
+      
+      console.log(`[Socket.io] Yêu cầu sync tin nhắn cho thread ${thread_id} (account ${targetAccId}) mode=${mode}`);
+      extWs.send(JSON.stringify({
+        type: 'SYNC_THREAD_MESSAGES',
+        data: { account_id: targetAccId, thread_id, thread_url, mode, cursor: syncState?.sync_cursor || null }
+      }));
+    }
+  });
+
+  socket.on('SEND_MESSAGE', async (payload = {}) => {
+    const { thread_id, content, client_message_id, attachment_id, contract_version } = payload;
+    const isRichMessage = Number(contract_version) === 2 || Boolean(attachment_id);
+
+    // Nhân viên gõ tay → tạm dừng AI 30 phút
+    const pauseResult = aiMediator.pauseForThread(thread_id);
+    io.emit('AI_PAUSED', { thread_id, until: pauseResult.until });
+
+    try {
+      if (isRichMessage) {
+        if (isLoopbackAddress(socket.handshake?.address) === false) {
+          throw new RichMessageService.Error(
+            'LOCAL_CRM_REQUIRED',
+            'Rich-message chỉ được phép từ CRM chạy trên máy này.',
+            403
+          );
+        }
+        const forbiddenRoutingFields = ['account_id', 'source_id', 'source_type', 'page_id'];
+        if (forbiddenRoutingFields.some((field) => Object.prototype.hasOwnProperty.call(payload, field))) {
+          throw new RichMessageService.Error(
+            'ROUTING_FIELDS_FORBIDDEN',
+            'CRM không được tự chỉ định tài khoản hoặc nguồn gửi.',
+            400
+          );
+        }
+        const accepted = RichMessageService.submit({
+          threadId: thread_id,
+          clientMessageId: client_message_id,
+          content,
+          attachmentId: attachment_id || null
+        }, {
+          database: db,
+          capabilityOptions: getRichMessageCapabilityOptions()
+        });
+        const message = db.prepare('SELECT * FROM messages WHERE id = ?').get(accepted.message_id);
+        socket.emit('MESSAGE_SEND_ACCEPTED', accepted);
+        io.emit('NEW_MESSAGE', withAttachmentAccessUrl({
+          ...message,
+          status: accepted.status,
+          attempt_id: accepted.attempt_id,
+          queue_id: accepted.queue_id,
+          attachment: accepted.attachment
+        }));
+        return;
+      }
+
+      await sendViaExtension(thread_id, content, client_message_id);
+    } catch (err) {
+      console.error('[Socket] Lỗi gửi tin nhắn:', err.message);
+      socket.emit('SEND_ERROR', {
+        error: err.message,
+        code: err.code || 'SEND_FAILED',
+        client_message_id
+      });
+      io.emit('MESSAGE_SEND_FAILED', {
+        thread_id,
+        client_message_id,
+        success: false,
+        error: err.message,
+        error_code: err.code || 'SEND_FAILED'
+      });
+    }
+  });
+
+  socket.on('RETRY_MESSAGE', (payload = {}) => {
+    try {
+      if (isLoopbackAddress(socket.handshake?.address) === false) {
+        throw new RichMessageService.Error(
+          'LOCAL_CRM_REQUIRED',
+          'Rich-message chỉ được phép từ CRM chạy trên máy này.',
+          403
+        );
+      }
+      const accepted = RichMessageService.retry({
+        threadId: payload.thread_id,
+        messageId: payload.message_id,
+        expectedLatestAttemptId: payload.expected_latest_attempt_id
+      }, {
+        database: db,
+        capabilityOptions: getRichMessageCapabilityOptions()
+      });
+      socket.emit('MESSAGE_SEND_ACCEPTED', accepted);
+      io.emit('MESSAGE_SEND_STATUS', {
+        thread_id: accepted.thread_id,
+        client_message_id: accepted.client_message_id,
+        message_id: accepted.message_id,
+        attempt_id: accepted.attempt_id,
+        status: accepted.status,
+        fb_message_id: null,
+        confirmation_source: null,
+        error: null,
+        updated_at: new Date().toISOString()
+      });
+    } catch (error) {
+      socket.emit('SEND_ERROR', {
+        error: error.message,
+        code: error.code || 'RETRY_FAILED',
+        message_id: payload.message_id
+      });
+    }
+  });
+});
+
+// ────────────────────────────────────────────────
+// REST API
+// ────────────────────────────────────────────────
+
+app.get('/api/health', (req, res) => res.json({
+  status: 'OK', uptime: process.uptime(),
+  db: 'SQLite WAL Mode', activeExtensions: extensionConnections.size
+}));
+
+// Accounts
+app.get('/api/accounts', (req, res) => {
+  const accounts = db.prepare('SELECT * FROM accounts').all();
+  const result = accounts.map(acc => ({
+    ...acc,
+    is_extension_connected: extensionConnections.has(acc.id) && extensionConnections.get(acc.id).readyState === WebSocket.OPEN
+  }));
+  res.json(result);
+});
+app.post('/api/accounts/:id/start', (req, res) => {
+  res.json({ success: processManager.startAccountProcess(req.params.id) });
+});
+app.post('/api/accounts/new-session', (req, res) => {
+  const now = new Date();
+  const dateStr = now.toISOString().replace(/[-T:.Z]/g, '').substring(0, 14);
+  const randomStr = Math.random().toString(36).substring(2, 7);
+  const pendingKey = `pending_${dateStr}_${randomStr}`;
+
+  console.log(`[API] Tạo phiên đăng ký tài khoản Facebook mới: ${pendingKey}`);
+  const success = processManager.startNewAccountProcess(pendingKey);
+  res.json({ success, pending_key: pendingKey });
+});
+
+// Threads
+app.get('/api/threads', (req, res) => {
+  const { user_id = 1, role = 'ADMIN', tab = 'ALL' } = req.query;
+  const threads = assignmentManager.getThreadsByFilter(Number(user_id), role, tab);
+  res.json(threads);
+});
+
+
+function sendFollowupError(res, error) {
+  return res.status(error.statusCode || 500).json({ error: error.message || 'Không thể cập nhật follow-up.' });
+}
+
+app.put('/api/threads/:id/reminder', (req, res) => {
+  try {
+    res.json(followupService.setReminder(req.params.id, req.body?.due_at, req.body?.note));
+  } catch (error) {
+    sendFollowupError(res, error);
+  }
+});
+app.post('/api/threads/:id/reminder/complete', (req, res) => {
+  try {
+    res.json(followupService.completeReminder(req.params.id));
+  } catch (error) {
+    sendFollowupError(res, error);
+  }
+});
+app.delete('/api/threads/:id/reminder', (req, res) => {
+  try {
+    res.json(followupService.cancelReminder(req.params.id));
+  } catch (error) {
+    sendFollowupError(res, error);
+  }
+});
+app.post('/api/threads/:id/archive', (req, res) => {
+  try {
+    const result = followupService.archive(req.params.id);
+    res.json({ success: true, archived_at: result.archived_at });
+  } catch (error) {
+    sendFollowupError(res, error);
+  }
+});
+app.post('/api/threads/:id/restore', (req, res) => {
+  try {
+    followupService.restore(req.params.id);
+    res.json({ success: true, archived_at: null });
+  } catch (error) {
+    sendFollowupError(res, error);
+  }
+});
+
+app.post('/api/threads/:id/assign', (req, res) => {
+  const { user_id } = req.body;
+  if (!user_id) return res.status(400).json({ error: 'Thiếu user_id' });
+  const result = assignmentManager.assignThread(req.params.id, user_id);
+  if (result.success) io.emit('THREAD_ASSIGNED', { thread_id: req.params.id, user_id });
+  res.json(result);
+});
+
+app.post('/api/threads/:id/complete', (req, res) => {
+  const result = assignmentManager.completeThread(req.params.id);
+  io.emit('THREAD_COMPLETED', { thread_id: req.params.id });
+  res.json(result);
+});
+
+
+
+// Contacts / Leads
+// CRM one-to-one rich-message capabilities and thread-bound staging.
+// This server has no user session layer yet, so new file operations fail
+// closed outside loopback and content URLs additionally require a short-lived HMAC.
+app.get(
+  '/api/threads/:threadId/rich-message-capabilities',
+  requireLocalCrmRequest,
+  (req, res) => {
+    try {
+      res.json(RichMessageCapabilityService.getForThread(
+        req.params.threadId,
+        getRichMessageCapabilityOptions()
+      ));
+    } catch (error) {
+      sendRichMessageError(res, error);
+    }
+  }
+);
+
+app.post(
+  '/api/threads/:threadId/outbound-attachments',
+  requireLocalCrmRequest,
+  express.raw({ type: 'multipart/form-data', limit: '9mb' }),
+  (req, res) => {
+    try {
+      const operatorId = getLocalOperatorId();
+      if (operatorId == null) {
+        return res.status(401).json({ code: 'AUTH_REQUIRED', error: 'CRM chưa có operator hợp lệ.' });
+      }
+      const parsed = OutboundAttachmentService.parseMultipartBody(
+        req.body,
+        req.headers['content-type']
+      );
+      const attachment = OutboundAttachmentService.stageUpload({
+        threadId: req.params.threadId,
+        createdBy: operatorId,
+        originalName: parsed.file.originalName,
+        declaredMimeType: parsed.file.declaredMimeType,
+        buffer: parsed.file.buffer
+      }, {
+        database: db,
+        capabilityOptions: getRichMessageCapabilityOptions()
+      });
+      const access = createAttachmentContentToken(attachment.id);
+      res.status(201).json({
+        attachment: {
+          ...attachment,
+          preview_url: '/api/outbound-attachments/' + attachment.id +
+            '/content?expires=' + access.expires + '&token=' + access.token
+        }
+      });
+    } catch (error) {
+      sendRichMessageError(res, error);
+    }
+  }
+);
+
+app.delete(
+  '/api/threads/:threadId/outbound-attachments/:attachmentId',
+  requireLocalCrmRequest,
+  (req, res) => {
+    try {
+      const operatorId = getLocalOperatorId();
+      if (operatorId == null) {
+        return res.status(401).json({ code: 'AUTH_REQUIRED', error: 'CRM chưa có operator hợp lệ.' });
+      }
+      const discarded = OutboundAttachmentService.discard(
+        req.params.threadId,
+        req.params.attachmentId,
+        operatorId,
+        { database: db }
+      );
+      if (discarded === false) {
+        return res.status(409).json({
+          code: 'ATTACHMENT_NOT_DISCARDABLE',
+          error: 'File không thuộc hội thoại này hoặc không còn ở trạng thái chờ gửi.'
+        });
+      }
+      res.status(204).end();
+    } catch (error) {
+      sendRichMessageError(res, error);
+    }
+  }
+);
+
+app.get(
+  '/api/outbound-attachments/:attachmentId/content',
+  requireLocalCrmRequest,
+  (req, res) => {
+    try {
+      if (verifyAttachmentContentToken(
+        req.params.attachmentId,
+        req.query.expires,
+        req.query.token
+      ) === false) {
+        return res.status(403).json({
+          code: 'ATTACHMENT_TOKEN_INVALID',
+          error: 'Liên kết file không hợp lệ hoặc đã hết hạn.'
+        });
+      }
+      const attachment = OutboundAttachmentService.resolveContent(
+        req.params.attachmentId,
+        { database: db }
+      );
+      if (attachment == null) {
+        return res.status(404).json({ code: 'ATTACHMENT_NOT_FOUND', error: 'Không tìm thấy file.' });
+      }
+      const disposition = attachment.media_type === 'image' ? 'inline' : 'attachment';
+      res.set('Cache-Control', 'private, no-store');
+      res.set('Content-Type', attachment.mime_type);
+      res.set(
+        'Content-Disposition',
+        disposition + "; filename*=UTF-8''" + encodeURIComponent(attachment.safe_name)
+      );
+      res.sendFile(attachment.storage_path);
+    } catch (error) {
+      sendRichMessageError(res, error);
+    }
+  }
+);
+
+app.get('/api/contacts/:thread_id', (req, res) => {
+  const contact = db.prepare('SELECT * FROM contacts WHERE thread_id=?').get(req.params.thread_id) || {};
+  const phoneView = PhoneCaptureService.getContactPhoneView(req.params.thread_id, db);
+  res.json({ ...contact, phone_candidates: phoneView.phone_candidates, phone_capture: phoneView.phone_capture });
+});
+
+app.put('/api/contacts/:thread_id', (req, res) => {
+  let updatedContact;
+  try {
+    updatedContact = ContactService.update(req.params.thread_id, req.body, db);
+  } catch (error) {
+    if (error instanceof ContactService.PhoneCaptureNotFoundError) {
+      return res.status(400).json({ error: error.message });
+    }
+    throw error;
+  }
+  const phoneView = PhoneCaptureService.getContactPhoneView(req.params.thread_id, db);
+  const status = updatedContact.status_id == null ? null : db.prepare(
+    'SELECT name AS status_name, color AS status_color FROM lead_statuses WHERE id = ?'
+  ).get(updatedContact.status_id);
+  const contact = { ...updatedContact, ...phoneView, ...(status || {}) };
+  io.emit('CONTACT_UPDATED', {
+    thread_id: req.params.thread_id,
+    phone: contact.phone,
+    status_id: contact.status_id,
+    status_name: contact.status_name || null,
+    status_color: contact.status_color || null,
+    phone_source: contact.phone_source,
+    phone_captured_at: contact.phone_captured_at
+  });
+  res.json({ success: true, contact });
+});
+
+// Lead Statuses — staff-created, reusable, color-coded (feature 022)
+app.get('/api/lead-statuses', (req, res) => {
+  res.json(db.prepare('SELECT id, name, color FROM lead_statuses ORDER BY id ASC').all());
+});
+
+app.post('/api/lead-statuses', (req, res) => {
+  try {
+    res.json(LeadStatusService.create(req.body, db));
+  } catch (error) {
+    if (error instanceof LeadStatusService.LeadStatusValidationError) {
+      return res.status(400).json({ error: error.message });
+    }
+    console.error('[LeadStatus] Create failed:', error);
+    return res.status(500).json({ error: 'Không thể tạo trạng thái mới.' });
+  }
+});
+
+app.delete('/api/lead-statuses/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id không hợp lệ' });
+  const txn = db.transaction(() => {
+    const { changes: unassignedCount } = db.prepare('UPDATE contacts SET status_id = NULL WHERE status_id = ?').run(id);
+    // campaigns.phone_capture_status_id deliberately has no FK constraint
+    // (spec 035, FR-012) - a campaign may keep pointing at a since-deleted
+    // status; a capture arriving afterward reports phone_capture_status_unavailable
+    // instead of silently losing the fact that a status was ever configured.
+    db.prepare('DELETE FROM lead_statuses WHERE id = ?').run(id);
+    return unassignedCount;
+  });
+  const unassignedCount = txn();
+  res.json({ success: true, unassigned_count: unassignedCount });
+});
+
+// Avatar serving - serves local avatar files
+app.get('/api/avatars/:filename', serveAvatar);
+
+// Search
+app.get('/api/search', (req, res) => {
+  const { q, limit } = req.query;
+  if (!q) return res.status(400).json({ error: 'Thiếu query q' });
+  res.json(searchService.searchMessages(q, Number(limit) || 50));
+});
+
+// Leads export
+app.get('/api/leads', (req, res) => res.json(searchService.getCapturedLeads()));
+app.post('/api/leads/export/excel', async (req, res) => {
+  try { res.download(await exportService.exportLeadsToExcel()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/leads/export/csv', (req, res) => {
+  try { res.download(exportService.exportLeadsToCSV()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Task 4.1: Auto-Reply CRUD ──
+app.get('/api/accounts/:id/auto-replies', (req, res) => {
+  res.json(autoReplyEngine.getRules(req.params.id));
+});
+app.post('/api/accounts/:id/auto-replies', (req, res) => {
+  const { trigger_keyword, response_template } = req.body;
+  res.json(autoReplyEngine.createRule({
+    account_id: req.params.id, trigger_keyword, response_template
+  }));
+});
+app.patch('/api/auto-replies/:id/toggle', (req, res) => {
+  res.json(autoReplyEngine.toggleRule(Number(req.params.id), req.body.is_active));
+});
+app.delete('/api/auto-replies/:id', (req, res) => {
+  res.json(autoReplyEngine.deleteRule(Number(req.params.id)));
+});
+
+
+function sendCampaignError(res, error) {
+  const statusByCode = {
+    CAMPAIGN_NOT_FOUND: 404,
+    CAMPAIGN_STATE_CONFLICT: 409,
+    RECIPIENT_ALREADY_SENT: 409,
+    ATTACHMENT_TOO_LARGE: 413
+  };
+  const status = statusByCode[error.code] || 400;
+  return res.status(status).json({
+    error: {
+      code: error.code || "CAMPAIGN_ERROR",
+      message: error.message || "Campaign request failed",
+      details: error.details || null
+    }
+  });
+}
+
+function addOperatorCampaignAudit(campaignId, eventType, payload = {}, recipientId = null) {
+  const campaign = db.prepare('SELECT created_by FROM campaigns WHERE id = ?').get(campaignId);
+  return CampaignRepository.addAudit(
+    campaignId,
+    eventType,
+    payload,
+    recipientId,
+    db,
+    {
+      actorUserId: campaign?.created_by || 1,
+      actorType: 'operator'
+    }
+  );
+}
+
+app.get('/api/settings/phone-automation', (req, res) => {
+  res.json(GlobalPhoneAutomationService.get(db));
+});
+
+app.put('/api/settings/phone-automation', (req, res) => {
+  try {
+    const settings = GlobalPhoneAutomationService.update(req.body || {}, db);
+    io.emit('PHONE_AUTOMATION_SETTINGS_UPDATED', settings);
+    res.json(settings);
+  } catch (error) {
+    res.status(400).json({ error: error.message, code: error.code || 'PHONE_AUTOMATION_ERROR' });
+  }
+});
+
+app.get('/api/campaigns/config', (req, res) => {
+  const { testSourceIds, ...publicConfig } = CampaignService.getConfig();
+  res.json({ ...publicConfig, testSourceCount: testSourceIds.length });
+});
+
+app.get("/api/campaigns", (req, res) => {
+  res.json(CampaignRepository.listCampaigns(req.query.limit));
+});
+
+app.post("/api/campaigns", (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const campaign = CampaignService.createDraft(req.body || {}, db, {
+      getConnection: (accountId) => accountsWs[accountId]
+    });
+    res.status(201).json(campaign);
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.get("/api/campaigns/:id", (req, res) => {
+  const campaign = CampaignRepository.getCampaign(req.params.id);
+  if (!campaign) return sendCampaignError(res, { code: "CAMPAIGN_NOT_FOUND", message: "Không tìm thấy chiến dịch." });
+  res.json(campaign);
+});
+
+app.patch('/api/campaigns/:id', (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const campaign = CampaignService.updateDraft(req.params.id, req.body || {});
+    CampaignEventService.emit(io, campaign);
+    res.json(campaign);
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.post("/api/campaigns/:id/preview", (req, res) => {
+  try {
+    res.json(CampaignService.preview(req.params.id));
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+app.post('/api/campaigns/:id/attachments', express.raw({ type: 'multipart/form-data', limit: '9mb' }), (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const parsed = CampaignAttachmentService.parseMultipartBody(req.body, req.headers['content-type']);
+    const attachment = CampaignAttachmentService.saveUpload({
+      campaignId: req.params.id,
+      campaignMessageId: parsed.fields.campaign_message_id,
+      originalName: parsed.file.originalName,
+      declaredMimeType: parsed.file.declaredMimeType,
+      buffer: parsed.file.buffer
+    }, { database: db, imageEnabled: CampaignService.getConfig().imageEnabled });
+    const campaign = CampaignRepository.getCampaign(req.params.id);
+    CampaignEventService.emit(io, campaign);
+    res.status(201).json({ attachment, campaign });
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.delete('/api/campaigns/:id/attachments/:attachmentId', (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const removed = CampaignAttachmentService.removeAttachment(req.params.id, req.params.attachmentId, { database: db });
+    const campaign = CampaignRepository.getCampaign(req.params.id);
+    CampaignEventService.emit(io, campaign);
+    res.json({ removed, campaign });
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+
+app.post("/api/campaigns/:id/start", (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    CampaignService.validateReadyForStart(req.params.id);
+    const transitioned = CampaignRepository.updateCampaignStatus(req.params.id, "ready", "running");
+    if (!transitioned) {
+      throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Campaign đã được xử lý bởi yêu cầu khác.');
+    }
+    addOperatorCampaignAudit(req.params.id, 'started', { status: 'running' });
+    campaignRunner.start(req.params.id);
+    CampaignEventService.emit(io, CampaignRepository.getCampaign(req.params.id));
+    res.json(CampaignRepository.getCampaign(req.params.id));
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.post("/api/campaigns/:id/pause", (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const campaign = CampaignService.assertTransition(req.params.id, "pause");
+    if (!CampaignRepository.updateCampaignStatus(req.params.id, "running", "pausing")) {
+      throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Yêu cầu pause bị trùng.');
+    }
+    addOperatorCampaignAudit(req.params.id, 'pause_requested', { status: 'pausing' });
+    CampaignEventService.emit(io, CampaignRepository.getCampaign(req.params.id));
+    res.json(CampaignRepository.getCampaign(req.params.id));
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.post("/api/campaigns/:id/resume", (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const campaign = CampaignService.assertTransition(req.params.id, "resume");
+    campaign.recipients
+      .filter((recipient) => recipient.status === 'pending')
+      .forEach((recipient) => CampaignEligibilityService.revalidateSnapshotRecipient(recipient, db, {
+        getConnection: (accountId) => accountsWs[accountId]
+      }));
+    if (!CampaignRepository.updateCampaignStatus(req.params.id, "paused", "running")) {
+      throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Yêu cầu resume bị trùng.');
+    }
+    addOperatorCampaignAudit(req.params.id, 'resumed', { status: 'running' });
+    campaignRunner.start(req.params.id);
+    CampaignEventService.emit(io, CampaignRepository.getCampaign(req.params.id));
+    res.json(CampaignRepository.getCampaign(req.params.id));
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.post("/api/campaigns/:id/cancel", (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    const campaign = CampaignService.assertTransition(req.params.id, "cancel");
+    if (!CampaignRepository.updateCampaignStatus(req.params.id, campaign.status, "cancelling")) {
+      throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Yêu cầu cancel bị trùng.');
+    }
+    addOperatorCampaignAudit(req.params.id, 'cancel_requested', { status: 'cancelling' });
+    campaignRunner.start(req.params.id);
+    CampaignEventService.emit(io, CampaignRepository.getCampaign(req.params.id));
+    res.json(CampaignRepository.getCampaign(req.params.id));
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+app.post("/api/campaigns/:id/recipients/:recipientId/retry", (req, res) => {
+  try {
+    CampaignService.assertFeatureEnabled();
+    let campaign = CampaignRepository.getCampaign(req.params.id);
+    if (!campaign) return sendCampaignError(res, { code: "CAMPAIGN_NOT_FOUND", message: "Không tìm thấy chiến dịch." });
+    if (["running", "pausing", "cancelling"].includes(campaign.status)) {
+      return sendCampaignError(res, { code: "CAMPAIGN_STATE_CONFLICT", message: "Hãy tạm dừng chiến dịch trước khi retry thủ công." });
+    }
+    const recipient = campaign.recipients.find((item) => item.id === req.params.recipientId);
+    if (!recipient) {
+      throw new CampaignService.CampaignError('INVALID_RECIPIENT', 'Recipient không thuộc campaign.');
+    }
+    if (recipient.status === 'sent') {
+      throw new CampaignService.CampaignError('RECIPIENT_ALREADY_SENT', 'Recipient đã gửi thành công.');
+    }
+    if (recipient.status !== 'failed') {
+      throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Chỉ recipient failed mới có thể retry.');
+    }
+    CampaignEligibilityService.revalidateSnapshotRecipient(recipient, db, {
+      getConnection: (accountId) => accountsWs[accountId]
+    });
+    CampaignRepository.retryRecipient(req.params.id, req.params.recipientId);
+    campaign = CampaignRepository.getCampaign(req.params.id);
+    const shouldRun = ['completed_with_errors', 'failed', 'cancelled'].includes(campaign.status);
+    if (shouldRun) {
+      if (!CampaignRepository.updateCampaignStatus(req.params.id, campaign.status, 'ready')) {
+        throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Retry đã được xử lý bởi yêu cầu khác.');
+      }
+      CampaignService.validateReadyForStart(req.params.id);
+      if (!CampaignRepository.updateCampaignStatus(req.params.id, 'ready', 'running')) {
+        throw new CampaignService.CampaignError('CAMPAIGN_STATE_CONFLICT', 'Không thể khởi động retry.');
+      }
+    }
+    addOperatorCampaignAudit(
+      req.params.id,
+      'recipient_retry_requested',
+      { recipient_id: req.params.recipientId, status: shouldRun ? 'running' : campaign.status },
+      req.params.recipientId
+    );
+    if (shouldRun) campaignRunner.start(req.params.id);
+    const latest = CampaignRepository.getCampaign(req.params.id);
+    CampaignEventService.emit(io, latest, latest.recipients.find((item) => item.id === req.params.recipientId));
+    res.json(latest);
+  } catch (error) {
+    sendCampaignError(res, error);
+  }
+});
+
+
+// ── Task 4.2: Broadcast ──
+app.get('/api/accounts/:id/broadcast/quota', (req, res) => {
+  res.json(broadcastEngine.getDailyQuota(req.params.id));
+});
+
+app.post('/api/accounts/:id/broadcast', async (req, res) => {
+  const { thread_ids, message } = req.body;
+  if (!thread_ids?.length || !message) {
+    return res.status(400).json({ error: 'Thiếu thread_ids hoặc message' });
+  }
+  try {
+    const campaignId = await broadcastEngine.startCampaign({
+      account_id: req.params.id,
+      thread_ids,
+      message,
+      sendFn: sendViaExtension,
+      onProgress: (progress) => io.emit('BROADCAST_PROGRESS', progress)
+    });
+    res.json({ success: true, campaignId });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/broadcast/:campaignId/cancel', (req, res) => {
+  res.json(broadcastEngine.cancelCampaign(req.params.campaignId));
+});
+
+// ── Task 4.3: AI Config CRUD ──
+app.get('/api/accounts/:id/ai-config', (req, res) => {
+  const config = aiMediator.getConfig(req.params.id);
+  // Mask API key trước khi trả về
+  if (config?.api_key) config.api_key = config.api_key.slice(0, 8) + '***';
+  res.json(config || {});
+});
+
+app.put('/api/accounts/:id/ai-config', (req, res) => {
+  res.json(aiMediator.upsertConfig({ account_id: req.params.id, ...req.body }));
+});
+
+app.patch('/api/accounts/:id/ai-config/toggle', (req, res) => {
+  res.json(aiMediator.toggleAI(req.params.id, req.body.is_active));
+});
+
+app.post('/api/threads/:id/ai/pause', (req, res) => {
+  res.json(aiMediator.pauseForThread(req.params.id));
+});
+
+app.post('/api/threads/:id/ai/resume', (req, res) => {
+  res.json(aiMediator.resumeForThread(req.params.id));
+});
+
+app.get('/api/ollama/health', async (req, res) => {
+  const isOnline = await aiMediator.checkOllamaHealth();
+  res.json({ online: isOnline });
+});
+
+// Messages REST API - With UI Guard Filter
+app.get('/api/threads/:id/messages', (req, res) => {
+  const msgs = db.prepare('SELECT * FROM messages WHERE thread_id=? ORDER BY timestamp_ms ASC, created_at ASC, id ASC').all(req.params.id);
+  const cleanMsgs = msgs.map(m => {
+    const cleaned = cleanMessageText(m.content);
+    return { ...m, cleaned };
+  // Same exemption as the WS ingest guard (server.js NEW_MESSAGE_RECEIVED handler):
+  // a media message (photo/sticker) can legitimately have no caption at all -
+  // empty content there doesn't mean "junk", so it must not be dropped from history.
+  }).filter(m => m.media_url || (m.cleaned && !isSystemOrMetadataText(m.cleaned) && m.cleaned !== 'Đang tải...')).map(m => withAttachmentAccessUrl({
+    ...m,
+    content: m.cleaned
+  }));
+  res.json(cleanMsgs);
+});
+
+// Lightweight sync-hint endpoint: fb_message_id + timestamp_ms only, no
+// content/media - used by page_content.js/content.js to re-seed their
+// client-side timestamp-anchor map after a script restart (feature 014).
+app.get('/api/threads/:id/message-timestamps', (req, res) => {
+  res.json(ConversationRepository.getMessageTimestamps(req.params.id));
+});
+
+// SPA fallback
+app.get('*', (req, res) => {
+  res.sendFile(path.join(clientDistPath, 'index.html'));
+});
+
+// ────────────────────────────────────────────────
+const PORT = process.env.PORT || 5050;
+function startServer() {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Server] http://localhost:${PORT}`);
+    console.log(`[Server] WebSocket ws://localhost:${PORT}`);
+  });
+
+  // Drains message_queue (Page-thread sends routed there by sendViaExtension,
+  // feature 015) and dispatches SEND_QUEUED_MESSAGE to the right extension
+  // connection. Was never wired up here before feature 015, so queued messages
+  // had nothing to pop them.
+  queueWorker.configure({
+    getConnection: (accountId) => extensionConnections.get(accountId),
+    campaignEnabled: () => CampaignService.getConfig().enabled,
+    onQueueFail: (message, reason) => {
+      if (message.outbound_attempt_id) {
+        const attempt = OutboundAttemptRepository.getById(message.outbound_attempt_id, db);
+        const richMessage = attempt
+          ? db.prepare('SELECT * FROM messages WHERE id = ?').get(attempt.message_id)
+          : null;
+        if (richMessage) {
+          db.prepare(
+            "UPDATE messages SET delivery_status = 'failed', delivery_error = ? WHERE id = ?"
+          ).run(reason, richMessage.id);
+          io.emit('MESSAGE_SEND_STATUS', {
+            thread_id: richMessage.thread_id,
+            client_message_id: richMessage.client_message_id,
+            message_id: richMessage.id,
+            attempt_id: message.outbound_attempt_id,
+            status: 'failed',
+            fb_message_id: null,
+            confirmation_source: null,
+            error: { code: reason, message: reason },
+            updated_at: new Date().toISOString()
+          });
+        }
+        return;
+      }
+      const clientMessageId = `queue_${message.id}`;
+      db.prepare(`
+        UPDATE messages SET delivery_status = 'failed', delivery_error = ?
+        WHERE client_message_id = ?
+      `).run(reason, clientMessageId);
+      io.emit('MESSAGE_SEND_FAILED', { thread_id: message.thread_id, client_message_id: clientMessageId, success: false, status: 'failed', error: reason });
+    }
+  });
+  campaignRunner.configure({
+    enqueueMessage: enqueueCampaignMessage,
+    emit: (campaign, recipient) => CampaignEventService.emit(io, campaign, recipient)
+  });
+  const recoverySummary = CampaignRecoveryService.reconcile({ database: db });
+  console.log('[CampaignRecovery]', recoverySummary);
+  queueWorker.start();
+  if (CampaignService.getConfig().enabled) {
+    setTimeout(() => campaignRunner.recover(), 1500);
+  }
+}
+
+module.exports = { app, server, startServer, extensionConnections, io };

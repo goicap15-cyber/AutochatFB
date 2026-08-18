@@ -1,16 +1,20 @@
 /**
  * leadExtractor.js
- * Trích xuất tự động SĐT & Email từ nội dung tin nhắn bằng Regex chuẩn Việt Nam.
+ * Trích xuất Email và số điện thoại di động từ nội dung tin nhắn. Số điện
+ * thoại được ủy quyền cho vietnamPhone.js (spec 035) - danh sách đầu số
+ * chính xác thay vì regex phỏng đoán theo thập phân - nên các giá trị trả
+ * về đã là dạng normalized (10 số, không phải chuỗi gốc regex khớp được).
+ * server.js's own inbound pipeline dùng PhoneCaptureService trực tiếp để
+ * lưu bằng chứng/provenance; export này giữ lại cho bất kỳ nơi nào khác chỉ
+ * cần quét nhanh phones/emails.
  */
-
-// Regex SĐT Việt Nam: 10 chữ số, bắt đầu 03x, 05x, 07x, 08x, 09x
-const VN_PHONE_REGEX = /(?<!\d)(0(?:3[2-9]|5[6-9]|7[0|6-9]|8[0-9]|9[0-9])\d{7})(?!\d)/g;
+const { findPhoneNumbers } = require('./vietnamPhone');
 
 // Regex Email chuẩn RFC
 const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
 
 /**
- * Trích xuất danh sách SĐT & Email từ chuỗi nội dung tin nhắn
+ * Trích xuất danh sách SĐT (normalized) & Email từ chuỗi nội dung tin nhắn
  * @param {string} content - Nội dung tin nhắn cần phân tích
  * @returns {{ phones: string[], emails: string[] }}
  */
@@ -19,13 +23,10 @@ function extractLeadInfo(content) {
     return { phones: [], emails: [] };
   }
 
-  const phones = [...content.matchAll(VN_PHONE_REGEX)].map((m) => m[0]);
-  const emails = [...content.matchAll(EMAIL_REGEX)].map((m) => m[0]);
+  const phones = [...new Set(findPhoneNumbers(content).map((match) => match.normalized))];
+  const emails = [...new Set([...content.matchAll(EMAIL_REGEX)].map((m) => m[0]))];
 
-  return {
-    phones: [...new Set(phones)],
-    emails: [...new Set(emails)]
-  };
+  return { phones, emails };
 }
 
 module.exports = { extractLeadInfo };

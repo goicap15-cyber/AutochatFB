@@ -1,0 +1,121 @@
+# Data Model: Bulk Message Campaigns
+
+## Campaign
+
+Represents one operator-created outbound operation.
+
+| Field | Type | Rules |
+|---|---|---|
+| id | string | Primary key; immutable |
+| name | string | Required; operator-facing label |
+| source_scope | string/null | Optional source restriction; recipients still carry their own source |
+| account_scope | string/null | Optional account restriction |
+| status | enum | `draft`, `ready`, `running`, `pausing`, `paused`, `cancelling`, `cancelled`, `completed`, `completed_with_errors`, `failed` |
+| start_position | integer | 1-based position within the recipient snapshot |
+| direction | enum | `asc` or `desc` |
+| pacing_policy | object | Minimum delay, retry limit, quiet hours, send cap |
+| created_by | integer | Authorized staff/user id |
+| created_at/updated_at | datetime | Required |
+| started_at/finished_at | datetime/null | Lifecycle timestamps |
+
+State transitions:
+
+```text
+draft -> ready -> running -> pausing -> paused -> running
+running -> cancelling -> cancelled
+running -> completed
+running -> completed_with_errors
+running -> failed
+paused -> cancelling -> cancelled
+```
+
+Only `draft`/`ready` may be edited. A `running` campaign cannot have its recipient snapshot or message order changed.
+
+## Campaign Recipient
+
+Immutable recipient snapshot plus mutable delivery state.
+
+| Field | Type | Rules |
+|---|---|---|
+| id | string | Primary key |
+| campaign_id | string | Required foreign key |
+| thread_id | string | Required foreign key to conversation |
+| source_id | string | Required snapshot of the inbox source |
+| account_id | string | Required snapshot of the owning account |
+| selection_order | integer | Unique within campaign |
+| execution_order | integer | Unique within campaign after preview/start |
+| eligibility_status | enum | `eligible`, `ineligible`, `opted_out`, `unsupported`, `invalid_route` |
+| eligibility_reason | string/null | Required when not eligible |
+| status | enum | `pending`, `processing`, `sent`, `failed`, `skipped`, `cancelled` |
+| attempt_count | integer | Non-negative |
+| last_error_code/last_error | string/null | Latest outcome |
+| sent_at | datetime/null | Set on confirmed send |
+
+Uniqueness: `(campaign_id, thread_id)` and `(campaign_id, execution_order)` must be unique. A retry updates the same recipient row and creates a new attempt row.
+
+## Campaign Message
+
+One item in the common message sequence.
+
+| Field | Type | Rules |
+|---|---|---|
+| id | string | Primary key |
+| campaign_id | string | Required foreign key |
+| sequence_order | integer | Unique within campaign |
+| text_content | string/null | At least text or attachment required |
+| validation_status | enum | `pending`, `valid`, `invalid` |
+| validation_error | string/null | Required when invalid |
+
+## Campaign Attachment
+
+Stored upload referenced by one campaign message.
+
+| Field | Type | Rules |
+|---|---|---|
+| id | string | Primary key |
+| campaign_message_id | string | Required foreign key |
+| media_type | enum | `image`, `video`, `file` |
+| original_name | string | Required |
+| mime_type | string | Validated allowlist |
+| byte_size | integer | Enforced maximum |
+| storage_path | string | Server-local managed path; never trust client path |
+| checksum | string | Used to deduplicate the upload |
+| validation_status | enum | `pending`, `valid`, `invalid`, `unavailable` |
+
+## Campaign Attempt
+
+Immutable record for an explicit dispatch attempt.
+
+| Field | Type | Rules |
+|---|---|---|
+| id | string | Primary key |
+| campaign_recipient_id | string | Required foreign key |
+| campaign_message_id | string | Required foreign key |
+| attempt_number | integer | Monotonic per recipient |
+| idempotency_key | string | Unique; prevents duplicate dispatch |
+| queue_id/client_message_id | string/null | Link to transport layer |
+| status | enum | `created`, `dispatched`, `confirmed`, `failed`, `unknown` |
+| error_code/error_message | string/null | Outcome details |
+| created_at/confirmed_at | datetime/null | Required timestamps |
+
+## Campaign Audit Event
+
+Immutable record of operator/system actions such as create, preview, start, pause, resume, cancel, retry, dispatch, confirmation, and failure.
+
+## Existing relationships
+
+```text
+Campaign 1--N CampaignRecipient N--1 Thread
+Campaign 1--N CampaignMessage 1--N CampaignAttachment
+CampaignRecipient 1--N CampaignAttempt
+Campaign 1--N CampaignAuditEvent
+Thread N--1 InboxSource N--1 Account
+```
+
+## Validation rules
+
+- A campaign cannot start without at least one eligible recipient and one valid campaign message.
+- Every recipient must retain its original source/account route; dispatch must fail if that route is no longer active.
+- `start_position` must be within the snapshot range; execution order must be computed before the first dispatch.
+- Only an explicit operator retry may create a new attempt after a failed or unknown attempt.
+- Attachment storage paths are generated by the server; client-provided paths are ignored.

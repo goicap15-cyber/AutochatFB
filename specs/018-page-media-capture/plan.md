@@ -1,0 +1,44 @@
+# Implementation Plan: Page Media Capture (Emoji, Stickers, Photos)
+
+## Architecture
+
+Entirely contained within `src/extension/page_content.js`. Adds a new per-wrapper media-detection pass inside `scanForMessages()`, parallel to (not replacing) the existing TreeWalker text-node pass. No change to `background.js`'s message shape beyond already-supported fields, no change to `server.js` (its `INSERT` already accepts `media_type`/`media_url`).
+
+## Phases
+
+1. **Extract a `resolveMessageContent(messageIdNode)` helper**: given a `[data-message-id]` wrapper element, inspect it (not the whole document) and return one of:
+   - `{ kind: 'text', text }` — unchanged existing behavior, when the wrapper's `innerText`/`textContent` is non-empty (today's `fullText` logic in `processPotentialMessage()`, `page_content.js:348`).
+   - `{ kind: 'emoji_text', text }` — when the wrapper has no real text but contains one or more `img[alt]` whose `alt` looks like a short emoji/character sequence (FR-002's heuristic, e.g. `alt.length <= 8` and no ASCII letters — tune against the real "💩" sample); concatenate their `alt` values in DOM order as the text.
+   - `{ kind: 'media', mediaUrl, caption }` — when the wrapper contains an `img[src]` with empty/missing `alt` pointing at a Facebook CDN host (FR-003), OR a `div[role="img"]` with a `background-image: url(...)` in its `style` attribute (FR-004, extract via `/url\(['"]?([^'")]+)['"]?\)/`); `caption` from `aria-label` if present, else `null`.
+   - `{ kind: 'none' }` — wrapper has neither real text nor recognizable media (defensive fallback; today's behavior for such a wrapper is to be skipped anyway since no text node ever reaches `processPotentialMessage()`).
+
+2. **New per-wrapper pass in `scanForMessages()`** (`page_content.js:313-317`, right after `messageEls`/`horizontalMidpoint`/`orderedIds` are computed): for each element in `messageEls` not already handled this tick by the text-node TreeWalker pass (tracked via the existing `processedWrappersThisTick` set, hoisted one level so both passes share it), call `resolveMessageContent(el)`. For `kind: 'media'` or `kind: 'emoji_text'` results, build and forward a payload directly (mirroring `processPotentialMessage()`'s identity/direction/timestamp/dedup steps — see phase 3) instead of relying on the TreeWalker ever visiting that wrapper.
+
+3. **Reuse, don't duplicate, existing per-message logic**: refactor the tail of `processPotentialMessage()` (identity via `fbMessageId`, `isMessageOutgoing`, timestamp assignment, `processedHashes` dedup, structural filtering, the `NEW_PAGE_MESSAGE_FROM_DOM` send) into a shared function taking `(messageIdNode, resolvedContent)` so both the existing text-node entry point and the new phase-2 media pass call the same identity/dedup/forward code — only the "what is the content" step (phase 1) differs by entry point. This keeps feature 017's upcoming pending-ID logic (which lives in this same tail section) automatically applied to media messages too, with no separate implementation.
+
+4. **Payload shape**: extend `payloadData` (`page_content.js:434-445`) with `media_type: 'image'` and `media_url` when `resolvedContent.kind === 'media'`; `content` becomes `resolvedContent.caption || ''` in that case. For `kind: 'emoji_text'`, `content` is the resolved emoji text, `media_type` stays unset (defaults to `'text'` server-side, unchanged).
+
+5. **CDN-host + caption-sentence heuristics**: hardcode the two confirmed CDN hosts (`static.xx.fbcdn.net` for emoji, `scontent...fbcdn.net` — match by substring `scontent` + `fbcdn.net`) as a sanity check, not a strict allowlist (Facebook CDN subdomains vary, e.g. `fna1`, `fhan19-1`). Distinguish `emoji_text` vs `media` primarily by whether `alt` is empty (media) vs non-empty-and-short (emoji) — not by hostname, since hostname could plausibly vary further. For `aria-label`-as-caption (FR-004), do NOT treat it as emoji text even if short — it's only ever read for `div[role="img"]`, never for `img[alt]`, so the two paths don't collide.
+
+6. **Validation**: same constraint as feature 017 — `page_content.js` isn't part of `node --test` (browser-DOM-only code). Validate with a standalone Node/jsdom-free simulation script that constructs the three confirmed real HTML snippets (emoji `<img>`, CDN `<img>` with empty alt, `div[role="img"]` with background-image) as plain strings, feeds them to `resolveMessageContent` via a minimal DOM shim or by extracting the pure string/regex logic into testable functions, and asserts the expected `{kind, ...}` result for each. Then a live manual test on the actual Page thread for all three cases plus a plain-text control message.
+
+## Addendum — discovered during live testing: backend dropped media with no caption
+
+Live test (2026-08-08) confirmed the emoji and CSS-background-sticker paths end-to-end (both landed in the CRM, the sticker rendering correctly via the existing `MediaViewer`). But the plain `<img>` case (real photo, and image-based stickers) never appeared — `server.js`'s `NEW_MESSAGE_RECEIVED` handler ran `cleanMessageText(m.content)` and dropped the message as "rác/hệ thống" whenever `cleanedContent` was empty, which it always is for a `kind: 'media'` message with no caption (`content: ''`). This silently discarded the `media_url` before it ever reached the download/insert step. Fixed in `server.js:281` by exempting messages that carry `m.media_url` from the empty-content guard — a media attachment with no caption is not junk. Not part of the original plan (scoped to `page_content.js` only) but required for US2 to actually work end-to-end; `npm run test:persistence` still 18/18 after the change.
+
+**Second occurrence of the same bug, found after the first fix**: a direct DB query confirmed both empty-content media rows *were* correctly inserted with valid `media_url`/`local_media_path` after the `server.js:281` fix — yet they still never appeared in the CRM even after a full page refresh. Root cause: `GET /api/threads/:id/messages` (`server.js:978`, the REST endpoint that loads/reloads a thread's message history — exactly what a page refresh triggers) has its *own*, independent empty-content filter (`.filter(m => m.cleaned && !isSystemOrMetadataText(m.cleaned) && ...)`), never touched by the first fix. Fixed the same way: exempt rows with `m.media_url` from the emptiness check. `npm run test:persistence` still 20/20 after this second change. Lesson: the same "empty content ≠ junk when media is attached" invariant existed in two separate places in `server.js` (live ingest vs. history reload) and needed the exemption applied to both.
+
+**Grepped for every other call site, found and fixed three more** (all in the personal-messenger bulk history-sync path, `SYNC_THREADS_RESULT`/`THREAD_MESSAGES_SYNCED` — a different pipeline than the Page/Business-Suite path this feature targeted, but the exact same underlying bug):
+- `server.js:552-566` (sidebar last-message preview fallback, `SYNC_THREADS_RESULT`): a captionless media message being the actual latest message would get skipped in favor of an older text message or "Chưa có tin nhắn". Fixed by treating a row with `media_url` as valid too, previewing it as `[Ảnh]` when it has no text.
+- `server.js:666-668` (`THREAD_MESSAGES_SYNCED`'s `validMessages` filter, pre-insert): worse than the other cases — this ran *before* `saveMessagesTransaction`, so a captionless media message from a bulk sync would never even reach the DB, not just be hidden from display. Fixed with the same `m.media_url ||` exemption.
+- `server.js:702-705` (`THREAD_MESSAGES_SYNCED`'s post-sync `cleanMsgs`/`THREAD_MESSAGES_UPDATED` emit): same pattern as the two already-fixed spots, fixed identically.
+
+`npm run test:persistence` still 20/20 after all three. None of this personal-messenger sync path has been live-tested with an actual media message (feature 018 only targeted the Page/DOM-capture path) — the fix is applied on the strength of matching the already-confirmed bug pattern, not a fresh live reproduction.
+
+## Safety Gates
+
+- Do not change `server.js` or `background.js`'s message-forwarding shape beyond fields the schema/INSERT already supports.
+- Do not change `content.js` (personal-messenger path) — explicitly out of scope (FR-007).
+- The new media pass must not cause a message to be forwarded twice (once via text-node TreeWalker, once via the new per-wrapper pass) — share `processedWrappersThisTick`/`processedHashes` between both passes, don't run them independently.
+- Do not attempt to download media to `local_media_path` in this feature (see spec Assumptions) — `media_url` only.
+- Must land cleanly whether feature 017 (pending-ID dedup) is implemented before or after this feature — phase 3's refactor point is exactly where 017's defer-or-forward logic also lives, so implement whichever lands second by rebasing on the other's tail-section shape, not by duplicating logic.

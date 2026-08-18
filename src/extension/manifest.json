@@ -45,6 +45,15 @@
       ],
       "js": ["textFilter.js", "content.js"],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://business.facebook.com/*",
+        "https://*.facebook.com/*"
+      ],
+      "js": ["pageDirection.js", "page_content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
     }
   ]
 }

@@ -329,6 +329,30 @@
     /Thông báo$/i,
   ];
 
+  // Shared bubble-text cleanup, extracted so both the per-bubble text loop
+  // and the image-caption extraction below use the exact same rules.
+  function cleanBubbleText(rawText) {
+    let cleanText = (rawText || '').trim();
+    if (!cleanText) return '';
+    const filter = globalThis.FbCrmTextFilter;
+    if (filter?.cleanMessageText) {
+      cleanText = filter.cleanMessageText(cleanText);
+    } else {
+      cleanText = cleanText.replace(/^(?:Nhập,\s*)?Tin nhắn do [\s\S]+? gửi lúc [^\n]*?(?:ch:|\b\d{1,2}:\d{2}(?:ch)?:|\b\d{1,2}:\d{2}(?:ch)?\s+)\s*/i, '').trim();
+      cleanText = cleanText.replace(/^Nhập,\s*/i, '').trim();
+      cleanText = cleanText.replace(/^[:\s]+/, '').trim();
+      const sentEmojiMatch = cleanText.match(/^[^,\n]{1,80}\s+(?:đã gửi|sent),\s*(.+)$/i);
+      if (sentEmojiMatch) {
+        const payload = sentEmojiMatch[1].trim();
+        if (payload && !/[A-Za-zÀ-ỹ0-9]/.test(payload)) cleanText = payload;
+      }
+      cleanText = cleanText.replace(/(?:\n|\r|\s{2,})(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen|Nhấn Enter để gửi)\s*$/i, '').trim();
+      cleanText = cleanText.replace(/^\d{1,2}:\d{2}\s*(?:T[2-7]|CN|AM|PM)?\s*$/i, '').replace(/(?:\n|\r)\s*\d{1,2}:\d{2}\s*(?:T[2-7]|CN|AM|PM)?$/i, '').trim();
+      cleanText = cleanText.replace(/^[:\s]+/, '').trim();
+    }
+    return cleanText;
+  }
+
   function parseMessagesFromDOMNode(node, isRealtime = false) {
     if (!node || node.nodeType !== 1) return [];
 
@@ -341,7 +365,12 @@
     if (!inMain || inComposer) return [];
 
     // ── Xác minh node thuộc hoặc chứa message row thật ──
-    const messageRow = node.closest?.('div[role="row"]') || node;
+    // Facebook đã chuyển message container từ role="row" sang role="article"
+    // (xác nhận qua live DOM inspection 2026-08-13) - một tin ảnh có caption
+    // hiển thị caption và <img> dưới dạng 2 node con riêng biệt của cùng 1
+    // article; MutationObserver chỉ báo node vừa thêm (thường là node caption
+    // nhỏ), nên phải leo lên article mới thấy được cả <img> anh em của nó.
+    const messageRow = node.closest?.('div[role="article"]') || node.closest?.('div[role="row"]') || node;
 
     // ── STALE DOM GUARD (Self-Tagging Marker) ──
     if (messageRow && messageRow.dataset) {
@@ -355,6 +384,49 @@
       }
     }
 
+    // ── Media detection (ảnh gửi/nhận trên Messenger cá nhân) ──
+    // Live DOM inspection (2026-08-13, real sent-photo message) found the
+    // photo <img>'s alt is always the fixed UI action label "Mở ảnh" ("Open
+    // photo") - not empty, and not a description. An avatar/read-receipt
+    // <img> next to a bubble always carries the contact's real name instead
+    // (e.g. alt="Thu Oanh Nguyen" or "Thu Oanh Nguyen đã xem lúc..."), so
+    // matching on this fixed label (rather than "alt is empty", which does
+    // NOT hold here) reliably tells a sent/received photo apart from an
+    // avatar without ever matching a real name. The <img> src for a
+    // just-sent photo is often an inline `data:image/...;base64,...`
+    // thumbnail rather than a real fbcdn/scontent URL - only forward src as
+    // media_url when it's a real CDN link (an unusable, multi-KB data: URI
+    // has no value to the backend, which never uses this value for
+    // confirmation matching - only media_type - and would just waste a
+    // failed download attempt in MediaDownloader).
+    //
+    // Checked BEFORE the aria-label-based hasMessageLabel gate below and
+    // used to bypass it entirely when a photo is found: live testing showed
+    // an image-only row's accessibility label (the "Tin nhắn do ... gửi
+    // lúc" helper text) is not always present yet at the exact moment
+    // MutationObserver's callback fires - React appears to hydrate it a
+    // beat after inserting the <img> itself - so gating on that label made
+    // every real-time photo detection silently miss (return []) while the
+    // *separate*, later-arriving caption-only row (which has its own label
+    // already attached) went through fine. The <img alt="Mở ảnh"> itself is
+    // static markup set at creation time, not hydrated later, so it doesn't
+    // have this race and is sufficient proof on its own that this is a real
+    // message row, not composer/avatar/unrelated UI.
+    const OPEN_PHOTO_ALT_PATTERN = /^(?:Mở ảnh|Xem ảnh|Open photo|View photo)$/i;
+    let isPhotoMessage = false;
+    let mediaUrl = null;
+    const rowImgs = messageRow.querySelectorAll?.('img[src]') || [];
+    for (const img of rowImgs) {
+      if (img.closest(COMPOSER_EXCLUDE)) continue;
+      const src = img.getAttribute('src') || '';
+      const alt = (img.getAttribute('alt') || '').trim();
+      if (src && OPEN_PHOTO_ALT_PATTERN.test(alt)) {
+        isPhotoMessage = true;
+        mediaUrl = /^https?:\/\/.*(?:fbcdn\.net|scontent)/i.test(src) ? src : null;
+        break;
+      }
+    }
+
     const rowAriaLabel = messageRow.getAttribute?.('aria-label') || '';
     const childMsgEl = !rowAriaLabel ? messageRow.querySelector?.('[aria-label*="Tin nhắn do"], [aria-label*="Message sent"]') : null;
     const effectiveLabel = rowAriaLabel || (childMsgEl?.getAttribute?.('aria-label') || '');
@@ -363,13 +435,15 @@
     const nativeIdEl = messageRow.querySelector?.('[data-id], [id^="mid."]');
     const hasNativeId = !!nativeIdEl;
 
-    if (!hasMessageLabel && !hasNativeId) return []; // Không phải message row
+    if (!hasMessageLabel && !hasNativeId && !isPhotoMessage) return []; // Không phải message row
 
     const rawText = (node.textContent || '').trim();
-    if (!rawText) return [];
+    if (!isPhotoMessage) {
+      if (!rawText) return [];
 
-    for (const pat of EXCLUDED_PATTERNS) {
-      if (pat.test(rawText)) return [];
+      for (const pat of EXCLUDED_PATTERNS) {
+        if (pat.test(rawText)) return [];
+      }
     }
 
     // ── Tìm tất cả leaf bubbles ──
@@ -408,7 +482,7 @@
       });
     }
 
-    if (finalBubbles.length === 0) return [];
+    if (finalBubbles.length === 0 && !isPhotoMessage) return [];
 
     let sender_name = '';
     let is_outgoing = false;
@@ -434,32 +508,42 @@
       }
     }
 
-    const results = [];
     const filter = globalThis.FbCrmTextFilter;
 
+    // ── Ảnh: trả về đúng 1 kết quả duy nhất cho cả row ──
+    // Live DOM inspection found Facebook renders a sent photo+caption pair
+    // as two SEPARATE message articles (an image-only one with no text
+    // bubble, immediately followed by a text-only one for the caption) -
+    // not one combined bubble. This branch only ever fires for the
+    // image-only article (finalBubbles is empty there), so caption always
+    // comes back '' here; the caption's own article runs through the normal
+    // per-bubble loop below as its own independent text event, unaffected.
+    if (isPhotoMessage) {
+      let caption = '';
+      for (const bubble of finalBubbles) {
+        const cleaned = cleanBubbleText(bubble.textContent);
+        if (!cleaned || cleaned.length > 1000) continue;
+        if (filter?.isSystemOrMetadataText && filter.isSystemOrMetadataText(cleaned)) continue;
+        caption = cleaned;
+        break;
+      }
+      return [{
+        sender_name: sender_name || (is_outgoing ? 'Bạn' : ''),
+        content: caption,
+        is_outgoing,
+        native_id: nativeIdEl?.getAttribute('data-id') || nativeIdEl?.getAttribute('id') || messageRow.getAttribute?.('data-id') || null,
+        effective_label: effectiveLabel,
+        is_valid: true,
+        bubble_idx: 0,
+        media_type: 'image',
+        media_url: mediaUrl
+      }];
+    }
+
+    const results = [];
     let bubble_idx = 0;
     for (const bubble of leafBubbles) {
-      let cleanText = (bubble.textContent || '').trim();
-      if (!cleanText) {
-        bubble_idx++;
-        continue;
-      }
-
-      if (filter?.cleanMessageText) {
-        cleanText = filter.cleanMessageText(cleanText);
-      } else {
-        cleanText = cleanText.replace(/^(?:Nhập,\s*)?Tin nhắn do [\s\S]+? gửi lúc [^\n]*?(?:ch:|\b\d{1,2}:\d{2}(?:ch)?:|\b\d{1,2}:\d{2}(?:ch)?\s+)\s*/i, '').trim();
-        cleanText = cleanText.replace(/^Nhập,\s*/i, '').trim();
-        cleanText = cleanText.replace(/^[:\s]+/, '').trim();
-        const sentEmojiMatch = cleanText.match(/^[^,\n]{1,80}\s+(?:đã gửi|sent),\s*(.+)$/i);
-        if (sentEmojiMatch) {
-          const payload = sentEmojiMatch[1].trim();
-          if (payload && !/[A-Za-zÀ-ỹ0-9]/.test(payload)) cleanText = payload;
-        }
-        cleanText = cleanText.replace(/(?:\n|\r|\s{2,})(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen|Nhấn Enter để gửi)\s*$/i, '').trim();
-        cleanText = cleanText.replace(/^\d{1,2}:\d{2}\s*(?:T[2-7]|CN|AM|PM)?\s*$/i, '').replace(/(?:\n|\r)\s*\d{1,2}:\d{2}\s*(?:T[2-7]|CN|AM|PM)?$/i, '').trim();
-        cleanText = cleanText.replace(/^[:\s]+/, '').trim();
-      }
+      const cleanText = cleanBubbleText(bubble.textContent);
 
       if (!cleanText || cleanText.length < 1 || cleanText.length > 1000) {
         bubble_idx++;
@@ -623,7 +707,7 @@
 
         try {
           if (chrome?.runtime?.id) {
-            console.log(`[DOM Observer] matched message: thread_id=${thread_id} | id=${fbMessageId} | content="${parsed.content.substring(0, 40)}" | tsMs=${tsMs}`);
+            console.log(`[DOM Observer] matched message: thread_id=${thread_id} | id=${fbMessageId} | media_type=${parsed.media_type || 'text'} | content="${parsed.content.substring(0, 40)}" | tsMs=${tsMs}`);
             chrome.runtime.sendMessage({
               type: 'NEW_MESSAGE_FROM_FB',
               data: {
@@ -633,7 +717,8 @@
                 content: parsed.content,
                 is_outgoing: parsed.is_outgoing,
                 fb_message_id: fbMessageId,
-                media_type: 'text',
+                media_type: parsed.media_type || 'text',
+                media_url: parsed.media_url || null,
                 timestamp_ms: tsMs,
                 timestamp_source: tsSource,
                 created_at: new Date(tsMs || Date.now()).toISOString(),

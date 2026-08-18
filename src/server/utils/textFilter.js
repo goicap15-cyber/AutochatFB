@@ -1,4 +1,5 @@
 // AutoChatbot - Text Filter Utility for Backend & Script Cleanup
+const { isKnownPageSystemNotice } = require('./pageSystemNotice');
 
 const SYSTEM_PATTERNS = [
   // E2EE & Security Notices
@@ -33,13 +34,23 @@ const SYSTEM_PATTERNS = [
 
   // Standalone Timestamps (e.g. 09:09, 16:36 T5, 18:00 T5, 12:30 AM, T5, CN)
   /^\d{1,2}:\d{2}(?:\s*(?:T[2-7]|CN|AM|PM))?$/i,
-  /^(?:T[2-7]|CN)$/i
+  /^(?:T[2-7]|CN)$/i,
+
+  // Full date/time separator header Business Suite renders between message
+  // groups (e.g. "13:52 6 Tháng 8, 2026") - not covered by the short
+  // standalone-clock-time pattern above. Without this, page_content.js's
+  // 1s-interval full-page rescan re-detects this separator as a "new"
+  // message every tick forever (its direction never resolves, so the
+  // dedup Set never remembers it) - one missing pattern here becomes an
+  // unbounded stream of duplicate rows, not just one.
+  /^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i
 ];
 
 function isSystemOrMetadataText(text) {
   if (!text || typeof text !== 'string') return true;
   const trimmed = text.trim();
   if (!trimmed) return true;
+  if (isKnownPageSystemNotice(trimmed)) return true;
 
   for (const pat of SYSTEM_PATTERNS) {
     if (pat.test(trimmed)) return true;

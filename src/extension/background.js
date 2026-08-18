@@ -1,4 +1,6 @@
 // AutoChatbot FB Engine - Service Worker Background Script
+importScripts('tabCreationCoordinator.js', 'queueEnvelopeValidation.js');
+const tabCreationCoordinator = self.FbCrmTabCreationCoordinator.createTabCreationCoordinator();
 let ws = null;
 let fb_dtsg = null;
 const TRUSTED_SEND_ADAPTER_VERSION = "trusted-send-v1";
@@ -92,6 +94,9 @@ function connectWebSocket() {
         case 'SEND_MESSAGE':
           await handleSendMessage(message.data);
           break;
+        case 'SEND_QUEUED_MESSAGE':
+          await handleSendQueuedMessage(message.data);
+          break;
         case 'SYNC_THREADS':
           console.log("[FB Engine] 🔄 Đang sync threads sidebar cho account:", message.data);
           await handleSync100Threads(message.data);
@@ -175,16 +180,228 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log(`[FB Engine] 📤 Forward tin nhắn → Backend: "${(msgData.content || '').substring(0, 50)}"`);
   }
 
+  // Temporary diagnostic (spec 040 T020) - relays page_content.js's raw
+  // <img> inspection for a text+image message that didn't match as media.
+  if (message.type === 'CONTENT_DEBUG') {
+    sendToBackend('CONTENT_DEBUG', message.data);
+  }
+
+  if (message.type === 'NEW_PAGE_MESSAGE_FROM_DOM') {
+    const msgData = message.data;
+    console.log('[FB Engine] 📨 NEW_PAGE_MESSAGE_FROM_DOM từ page_content:', JSON.stringify(msgData).substring(0, 300));
+    sendToBackend('NEW_MESSAGE_RECEIVED', {
+      ...msgData,
+      source_type: 'page_messenger',
+      // The backend uses `account_id` or `source` to match.
+      // We will pass page_id as a hint for the backend to resolve the source.
+    });
+  }
+
+  // Lets a content script re-seed its client-side timestamp-anchor map after
+  // a restart from the backend's persistent record (feature 014) - fixes
+  // messages that are genuinely new to the backend getting stamped with "now"
+  // when the content script's in-memory anchors were just wiped by a reload.
+  if (message.type === 'GET_THREAD_TIMESTAMPS') {
+    const { threadId } = message.data || {};
+    fetchThreadTimestamps(threadId).then((timestamps) => sendResponse({ timestamps }));
+    return true; // keep the message channel open for the async sendResponse above
+  }
+
   return false;
 });
 
+function getBackendHttpBase() {
+  try {
+    if (ws && ws.url) {
+      const u = new URL(ws.url);
+      return `http://${u.host}`;
+    }
+  } catch (e) {}
+  return 'http://127.0.0.1:5050';
+}
+
+// Never throws and never hangs the caller: resolves to [] on any failure or
+// timeout, so a missing/slow backend degrades gracefully instead of blocking
+// message capture (FR-003).
+async function fetchThreadTimestamps(threadId, timeoutMs = 2000) {
+  if (!threadId) return [];
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${getBackendHttpBase()}/api/threads/${encodeURIComponent(threadId)}/message-timestamps`, { signal: controller.signal });
+    if (!res.ok) return [];
+    return await res.json();
+  } catch (e) {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ── Tab role registry (personal:<accountId> / page:<pageId> -> tabId) ──────
+// The extension serves two independent flows (personal messenger + per-Page
+// inbox) from the same Chrome install. Re-discovering "the right tab" by
+// query/cookie-matching on every sync is what let a Business Suite tab get
+// misidentified as the personal-messenger tab (same login cookie, no other
+// personal tab open) and forcibly redirected away from the Page inbox the
+// user was actively using. Once a tab is confirmed for a role, remember it
+// here instead of re-guessing. Persisted in chrome.storage.session so it
+// survives Manifest V3 service worker restarts, which happen often (visible
+// as repeated REGISTER_ACCOUNT/SYNC_THREADS churn in the backend logs) and
+// would otherwise force the flawed discovery path to run again on every wake.
+const TAB_REGISTRY_STORAGE_KEY = 'fb_engine_tab_registry';
+let tabRegistry = new Map();
+let tabRegistryLoaded = null;
+
+function loadTabRegistry() {
+  if (!tabRegistryLoaded) {
+    tabRegistryLoaded = new Promise((resolve) => {
+      chrome.storage.session.get([TAB_REGISTRY_STORAGE_KEY], (result) => {
+        const stored = result?.[TAB_REGISTRY_STORAGE_KEY];
+        if (stored && typeof stored === 'object') {
+          tabRegistry = new Map(Object.entries(stored));
+        }
+        resolve();
+      });
+    });
+  }
+  return tabRegistryLoaded;
+}
+
+function persistTabRegistry() {
+  // Returned so callers can await it - the service worker may be suspended
+  // immediately after this call returns, and a fire-and-forget write could
+  // be lost before it reaches disk.
+  return chrome.storage.session.set({ [TAB_REGISTRY_STORAGE_KEY]: Object.fromEntries(tabRegistry) });
+}
+
+async function registerTab(role, tabId) {
+  if (!tabId) return;
+  await loadTabRegistry();
+  tabRegistry.set(role, tabId);
+  await persistTabRegistry();
+}
+
+async function unregisterTab(role) {
+  await loadTabRegistry();
+  if (tabRegistry.delete(role)) await persistTabRegistry();
+}
+
+// Returns the registered tab for a role only if it still exists; evicts a
+// stale entry (tab was closed) so the caller falls back to fresh discovery.
+async function getRegisteredTab(role) {
+  await loadTabRegistry();
+  const tabId = tabRegistry.get(role);
+  if (!tabId) return null;
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch (e) {
+    await unregisterTab(role);
+    return null;
+  }
+}
+
+chrome.tabs.onRemoved.addListener((closedTabId) => {
+  loadTabRegistry().then(async () => {
+    let changed = false;
+    for (const [role, tabId] of tabRegistry.entries()) {
+      if (tabId === closedTabId) {
+        tabRegistry.delete(role);
+        changed = true;
+      }
+    }
+    if (changed) await persistTabRegistry();
+  });
+});
+
+function isBusinessSuiteUrl(url) {
+  try {
+    return new URL(String(url || '')).hostname === 'business.facebook.com';
+  } catch (e) {
+    return false;
+  }
+}
+
+// ── Tab-creation cooldown (personal <-> Page shared-identity conflict) ────
+// Facebook ties "which surface /messages resolves to" to a single active
+// identity per login session (personal profile vs. a managed Page). Since
+// personal-messenger sync and Page/Business-Suite sync for the same account
+// share one Chrome profile/cookie jar, using one surface can flip the other's
+// already-registered tab to the wrong hostname out from under us - not a
+// genuine "no tab exists" case. Without a cooldown, getFacebookTab's exclusion
+// of business.facebook.com tabs (feature 013, FR-001) makes
+// ensureFacebookMessagesTab treat every flip as "missing" and spin up a
+// replacement tab every sync cycle, which itself gets flipped, piling up
+// orphaned tabs forever. This cooldown stops that: after a detected flip, wait
+// before trying to create another tab for that role, giving Facebook's
+// identity state a chance to settle back on its own first.
+const TAB_COOLDOWN_STORAGE_KEY = 'fb_engine_tab_cooldowns';
+const TAB_CREATION_COOLDOWN_MS = 3 * 60 * 1000; // 3 minutes
+let tabCreationCooldowns = new Map(); // role -> timestamp when cooldown ends
+let tabCooldownsLoaded = null;
+
+function loadTabCooldowns() {
+  if (!tabCooldownsLoaded) {
+    tabCooldownsLoaded = new Promise((resolve) => {
+      chrome.storage.session.get([TAB_COOLDOWN_STORAGE_KEY], (result) => {
+        const stored = result?.[TAB_COOLDOWN_STORAGE_KEY];
+        if (stored && typeof stored === 'object') {
+          tabCreationCooldowns = new Map(Object.entries(stored));
+        }
+        resolve();
+      });
+    });
+  }
+  return tabCooldownsLoaded;
+}
+
+function persistTabCooldowns() {
+  return chrome.storage.session.set({ [TAB_COOLDOWN_STORAGE_KEY]: Object.fromEntries(tabCreationCooldowns) });
+}
+
+async function startTabCreationCooldown(role) {
+  await loadTabCooldowns();
+  tabCreationCooldowns.set(role, Date.now() + TAB_CREATION_COOLDOWN_MS);
+  await persistTabCooldowns();
+}
+
+async function isTabCreationOnCooldown(role) {
+  await loadTabCooldowns();
+  const until = tabCreationCooldowns.get(role);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    tabCreationCooldowns.delete(role);
+    await persistTabCooldowns();
+    return false;
+  }
+  return true;
+}
+
 // ── Lấy tab Facebook tương ứng với account_id (khớp c_user cookie) ─────────
+// Never returns a business.facebook.com tab: that host is exclusively for
+// Page inboxes (see getBusinessSuiteTab) and must never be treated as "the"
+// personal-messenger tab, even if it happens to share the same login cookie.
 async function getFacebookTab(accountId) {
+  const role = `personal:${accountId}`;
+  const registered = await getRegisteredTab(role);
+  if (registered && !isBusinessSuiteUrl(registered.url)) return registered;
+  if (registered) {
+    // The tab we previously registered as "personal" now resolves to
+    // business.facebook.com. This is Facebook's shared-identity session
+    // flipping it, not a stale/closed-tab case - start a cooldown so the
+    // caller doesn't immediately spin up a replacement that just gets
+    // flipped again (see cooldown block above getFacebookTab).
+    await unregisterTab(role);
+    await startTabCreationCooldown(role);
+  }
+
   return new Promise((resolve) => {
     chrome.tabs.query({ url: ['*://*.facebook.com/*', '*://*.messenger.com/*'] }, async (tabs) => {
-      if (!tabs || tabs.length === 0) return resolve(null);
+      const candidates = (tabs || []).filter(t => !isBusinessSuiteUrl(t.url));
+      if (candidates.length === 0) return resolve(null);
 
-      for (const tab of tabs) {
+      const matchingTabs = [];
+      for (const tab of candidates) {
         if (tab.discarded || !tab.id) continue;
         try {
           const res = await chrome.scripting.executeScript({
@@ -193,20 +410,130 @@ async function getFacebookTab(accountId) {
           });
           const tabUserId = res?.[0]?.result;
           if (accountId && String(tabUserId) === String(accountId)) {
-            return resolve(tab);
+            matchingTabs.push(tab);
           }
         } catch (e) {}
       }
 
-      const active = tabs.find(t => !t.discarded);
-      resolve(active || null);
+      // No fallback to "any" Facebook/Messenger tab here: with multiple
+      // accounts (or Facebook's own multi-profile switcher) open in the same
+      // Chrome instance, a tab that doesn't match this account's c_user
+      // cookie could belong to a completely different account. Reporting
+      // "not found" and letting the caller open/redirect a fresh tab is
+      // safe; silently reusing a mismatched tab could sync or send under
+      // the wrong account.
+      let resolved = null;
+      if (matchingTabs.length > 0) {
+        const messagesTab = matchingTabs.find(t => /\/messages(?:\/|$|\?)/.test(String(t.url || '')));
+        resolved = messagesTab || matchingTabs[0];
+      }
+
+      if (resolved?.id) await registerTab(role, resolved.id);
+      resolve(resolved);
     });
   });
 }
+async function ensureFacebookMessagesTab(accountId, reason = 'background_sync') {
+  const role = `personal:${accountId}`;
+  let tab = await getFacebookTab(accountId);
+  if (!tab) {
+    if (await isTabCreationOnCooldown(role)) {
+      console.log(`[FB Engine] [BACKGROUND_TAB] account=${accountId} đang trong cooldown sau khi bị Facebook chuyển identity sang Page. Bỏ qua tạo tab lần này. reason=${reason}`);
+      return null;
+    }
+    console.log(`[FB Engine] [BACKGROUND_TAB] Không có tab Messenger cho account=${accountId}. Tạo tab nền. reason=${reason}`);
+    tab = await tabCreationCoordinator.run(
+      role,
+      () => getFacebookTab(accountId),
+      async () => {
+        const created = await new Promise((resolve) => {
+          chrome.tabs.create({ url: 'https://www.facebook.com/messages', active: false }, resolve);
+        });
+        if (created?.id) {
+          await registerTab(role, created.id);
+          await Promise.race([waitForTabComplete(created.id, 12000), delay(4000)]);
+          await delay(1200);
+          try {
+            const settled = await chrome.tabs.get(created.id);
+            if (isBusinessSuiteUrl(settled.url)) {
+              console.log(`[FB Engine] [BACKGROUND_TAB] Tab mới cho account=${accountId} bị Facebook chuyển sang Business Suite ngay sau khi mở (identity dùng chung). Bắt đầu cooldown.`);
+              await unregisterTab(role);
+              await startTabCreationCooldown(role);
+            }
+          } catch (e) {}
+        }
+        return created || null;
+      }
+    );
+    return tab || null;
+  }
+
+  if (!/\/messages(?:\/|$|\?)/.test(String(tab.url || ''))) {
+    console.log(`[FB Engine] [BACKGROUND_TAB] Tab account=${accountId} không ở Messenger, chuyển sang /messages. reason=${reason}`);
+    try {
+      const loadPromise = waitForTabComplete(tab.id, 10000);
+      await chrome.tabs.update(tab.id, { url: 'https://www.facebook.com/messages' });
+      await Promise.race([loadPromise, delay(3500)]);
+      await delay(1000);
+      tab = await chrome.tabs.get(tab.id);
+    } catch (e) {
+      console.warn(`[FB Engine] [BACKGROUND_TAB] Không thể chuyển tab sang Messenger: ${e.message}`);
+    }
+  }
+
+  return tab;
+}
 
 // ── Gửi tin nhắn qua Facebook GraphQL API ──────────────────────────────────
-async function handleSendMessage({ thread_id, content, text, client_message_id }) {
+// Attachments never use the GraphQL text mutation below (it has no media
+// parameter) - they always go through the composer, staged via the same
+// CDP file-chooser mechanism as the Page adapter, then submitted through
+// typeAndSubmitComposer (DOM click on the real send control, CDP Enter
+// fallback).
+async function handleSendPersonalMessageWithAttachment({ thread_id, content, attachment, attachmentManifest = null, client_message_id, account_id = user_id }) {
+  const trace = (stage, extra = {}) => console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage, thread_id: String(thread_id), client_message_id, at: new Date().toISOString(), ...extra }));
+  trace('EXTENSION_SEND_RECEIVED', { text_length: String(content || '').length, has_attachment: true });
+
+  // Unlike the plain-text path's getFacebookTab (look-only, matches existing
+  // proven behavior there), this actively opens a Messenger tab if none is
+  // open yet - confirmed live 2026-08-13 that a Chrome window with only a
+  // Business Suite tab open (from Page testing) has no personal Messenger
+  // tab for getFacebookTab to find.
+  const tab = await ensureFacebookMessagesTab(account_id, 'rich_message_attachment_send');
+  if (!tab) {
+    sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không tìm thấy Tab Facebook hoạt động', error_code: 'FACEBOOK_TAB_NOT_FOUND' });
+    return;
+  }
+
+  // thread_id here is the CRM's compound "account_id:psid" (matches
+  // handleSendPageMessage's recipientPsid extraction below) - Facebook's own
+  // Messenger URLs and ensureTabOnThread's matching only know the plain PSID,
+  // so passing the compound id straight through would never match.
+  const recipientPsid = thread_id.includes(':') ? thread_id.split(':')[1] : thread_id;
+  const onThread = await ensureTabOnThread(tab, recipientPsid, null);
+  if (!onThread) {
+    throw new Error('Không thể điều hướng đúng hội thoại Messenger để gửi attachment');
+  }
+
+  await stagePersonalMessengerAttachment(tab.id, attachmentManifest || attachment);
+  await typeAndSubmitComposer(tab.id, content);
+
+  console.log('[FB Engine] ✅ Đã dispatch tin nhắn (có đính kèm) qua Messenger cá nhân');
+  sendToBackend('SEND_MESSAGE_RESULT', {
+    thread_id,
+    client_message_id,
+    success: false,
+    error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION',
+    stage: 'PERSONAL_MESSENGER_CDP',
+    error_code: 'COMPOSER_DISPATCHED'
+  });
+}
+
+async function handleSendMessage({ thread_id, content, text, attachment = null, attachmentManifest = null, client_message_id, account_id = user_id }) {
   const messageText = content ?? text;
+  if (attachment || attachmentManifest) {
+    return handleSendPersonalMessageWithAttachment({ thread_id, content: messageText, attachment, attachmentManifest, client_message_id, account_id });
+  }
   let lastSendError = null;
   const trace = (stage, extra = {}) => console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage, thread_id: String(thread_id), client_message_id, at: new Date().toISOString(), ...extra }));
   if (!messageText || !messageText.trim()) {
@@ -216,7 +543,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
   }
   trace('EXTENSION_SEND_RECEIVED', { text_length: String(messageText).length });
 
-  console.log(`[SEND_MESSAGE] 📤 Đang gửi tin nhắn: account=${user_id} thread=${thread_id} client_msg_id=${client_message_id}`);
+  console.log(`[SEND_MESSAGE] 📤 Đang gửi tin nhắn: account= thread= client_msg_id=${client_message_id}`);
 
   // Cách 1: Thử gửi trực tiếp qua Service Worker Fetch nếu có token
   if (fb_dtsg) {
@@ -230,7 +557,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           query_params: {
             data: {
               client_mutation_id: client_message_id || Date.now().toString(),
-              actor_id: user_id,
+              actor_id: account_id,
               thread_id,
               message: { text: messageText }
             }
@@ -279,7 +606,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
 
   // Cách 2: Fallback gửi tin nhắn trong Tab Context của Facebook (Đảm bảo đầy đủ Session, Cookie và Token dtsg)
   try {
-    const tab = await getFacebookTab(user_id);
+    const tab = await getFacebookTab(account_id);
     if (!tab) {
       sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không tìm thấy Tab Facebook hoạt động', error_code: 'FACEBOOK_TAB_NOT_FOUND' });
       return;
@@ -330,7 +657,7 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
           return { success: false, error: err.message };
         }
       },
-      args: [thread_id, messageText, client_message_id, fb_dtsg, user_id]
+      args: [thread_id, messageText, client_message_id, fb_dtsg, account_id]
     });
 
     const tabRes = tabSendResult?.[0]?.result;
@@ -480,14 +807,658 @@ async function handleSendMessage({ thread_id, content, text, client_message_id }
   }
 }
 
+// ── Xử lý tin nhắn từ message_queue ──────────────────────────────────────────
+async function validateRichQueuedEnvelope(payload) {
+  return self.FbCrmQueueEnvelopeValidation.validateQueuedEnvelope(payload, {
+    expectedAccountId: user_id
+  });
+}
+
+// Feature 016: repeatedly checks for the Business Suite message composer
+// instead of a single immediate check, mirroring the poll-loop idiom already
+// used elsewhere in this file (e.g. waitForThreadDomReady) for DOM readiness
+// that can't be pinned to a single "loaded" event. Business Suite's SPA
+// render (see the loading-skeleton state confirmed live) can take longer than
+// any single fixed delay, so this returns as soon as the composer appears
+// rather than giving up (or checking too early) on one fixed wait.
+async function pollForComposer(tabId, timeoutMs = 7000, intervalMs = 400) {
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => document.querySelectorAll('[contenteditable="true"], [role="textbox"]').length > 0
+    }).catch(() => null);
+    if (result?.[0]?.result) return true;
+    await delay(intervalMs);
+  }
+  return false;
+}
+
+// ── CDP-based native file-chooser interception ─────────────────────────────
+// Live testing found that Business Suite's attach icon no longer exposes a
+// scriptable <input type="file"> - clicking it opens the OS-native file
+// chooser directly (zero <input type="file"> elements exist in the DOM
+// before or after that click). A script-dispatched click() also cannot open
+// that chooser, since only a browser-trusted input event satisfies the
+// activation requirement modern file pickers enforce - the same reason
+// dispatchTrustedEnter/dispatchTrustedText use CDP instead of DOM events.
+// Page.setInterceptFileChooserDialog covers both the classic <input> and
+// native-picker cases: instead of the OS dialog appearing, Chrome emits
+// Page.fileChooserOpened (with the file input's backendNodeId), answered
+// here with DOM.setFileInputFiles and a real local path - the extension and
+// backend always run on the same machine, so the staged attachment's bytes
+// already exist on disk (see QueueWorker.buildAttachment's local_path).
+// There is no "Page.handleFileChooser" CDP method - DOM.setFileInputFiles
+// against the event's backendNodeId is the actual fulfillment call.
+const pendingFileChoosers = new Map(); // tabId -> resolve(params)
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method !== 'Page.fileChooserOpened') return;
+  const resolve = pendingFileChoosers.get(source.tabId);
+  if (resolve) {
+    pendingFileChoosers.delete(source.tabId);
+    resolve(params);
+  }
+});
+
+function waitForFileChooserOpened(tabId, timeoutMs = 6000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingFileChoosers.delete(tabId);
+      reject(new Error('Hết thời gian chờ hộp thoại chọn file (Page.fileChooserOpened)'));
+    }, timeoutMs);
+    pendingFileChoosers.set(tabId, (params) => {
+      clearTimeout(timer);
+      resolve(params);
+    });
+  });
+}
+
+// Shared by both Business Suite and personal Messenger: the attach icon's
+// accessible label has been observed as either "Đính kèm file" (generic) or
+// split into "Đính kèm ảnh" / "Đính kèm PDF" on Business Suite. Personal
+// Messenger's real label ("Đính kèm file có kích thước tối đa là 100MB") was
+// confirmed live 2026-08-13 via DevTools inspection (the button is a
+// `<div role="button" aria-label="...">`, not a real `<button>`, but the
+// aria-label selector still matches it). If staging ever fails again with
+// "Không tìm thấy icon đính kèm", check the real label live rather than
+// guessing further blind.
+async function findAttachButtonCenter(tabId, timeoutMs = 6000) {
+  const execution = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (payload) => {
+      // Exact-match labels for Business Suite, plus a starts-with match for
+      // personal Messenger's longer label ("Đính kèm file có kích thước tối
+      // đa là ...MB") - a prefix match avoids depending on getting every
+      // diacritic in the trailing, size-dependent portion exactly right.
+      const exactLabels = ['Đính kèm file', 'Đính kèm ảnh', 'Đính kèm PDF'];
+      const prefixLabels = ['Đính kèm file có kích thước'];
+      const find = () => {
+        for (const label of exactLabels) {
+          const el = document.querySelector(`[aria-label="${label}"]`);
+          if (el) return el;
+        }
+        for (const prefix of prefixLabels) {
+          const el = document.querySelector(`[aria-label^="${prefix}"]`);
+          if (el) return el;
+        }
+        return null;
+      };
+      const deadline = Date.now() + (payload.timeoutMs || 6000);
+      let el = find();
+      while (!el && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        el = find();
+      }
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    },
+    args: [{ timeoutMs }]
+  });
+  return execution?.[0]?.result || null;
+}
+
+// Spec 040 T020: two independent live sends (2026-08-17, a 2-file .txt
+// manifest then a 2-file .png image manifest, both to the same authorized
+// test thread) showed the fixed 800ms delay below was not proof the
+// attachment ever registered - both times the caption sent and Facebook
+// confirmed it, but zero files ever appeared in the real thread, with no
+// error surfaced anywhere in the pipeline. A third live test (still
+// 2026-08-17) proved the attach step itself is NOT the problem: Business
+// Suite staged both files fine as generic-file preview chips, displayed by
+// their on-disk storage filename (the hashed basename of local_path, e.g.
+// "c414cd...ce77.png") - NOT the original upload name - so this polls for
+// that basename, plus a new blob: image as a fallback signal for whatever
+// Facebook's image-preview markup turns out to be. Any one signal appearing
+// for a given file counts - the point is only to rule out "nothing happened
+// at all", not to model Facebook's exact markup. Scoped to the file/manifest
+// path only (media_type 'file', or any manifest) - the plain single-image
+// path already has a live-verified-working 800ms delay (.env: "Page image:
+// verified 2026-08-12") and is left untouched to avoid regressing it without
+// its own live re-verification.
+async function pollForAttachmentEvidence(tabId, fileNames, timeoutMs = 8000, intervalMs = 400) {
+  const names = fileNames.filter(Boolean);
+  const baseline = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => document.querySelectorAll('img[src^="blob:"]').length
+  }).then((r) => r?.[0]?.result || 0).catch(() => 0);
+  const startTime = Date.now();
+  while (Date.now() - startTime < timeoutMs) {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (searchNames) => {
+        const blobImages = document.querySelectorAll('img[src^="blob:"]').length;
+        const haystacks = [document.body.innerText || ''];
+        document.querySelectorAll('[aria-label]').forEach((el) => haystacks.push(el.getAttribute('aria-label') || ''));
+        const text = haystacks.join('\n');
+        return { blobImages, matchedNames: searchNames.filter((name) => text.includes(name)) };
+      },
+      args: [names]
+    }).catch(() => null);
+    const r = result?.[0]?.result;
+    if (r && (r.blobImages > baseline || r.matchedNames.length >= names.length)) {
+      return { ok: true, blobImages: r.blobImages, matchedNames: r.matchedNames };
+    }
+    await delay(intervalMs);
+  }
+  return { ok: false };
+}
+
+// Core CDP mechanic shared by every surface that stages an attachment via
+// file-chooser interception (see Decision 9 in research.md): intercept the
+// native chooser, CDP-click the attach control to open it, then fulfill it
+// with DOM.setFileInputFiles against the backendNodeId the chooser reports.
+// attachmentOrList: a single attachment object (spec 039 shape, unchanged)
+// or an array of attachment objects (spec 040 manifest - several
+// independently-selected files, or one folder ZIP as its single member).
+// DOM.setFileInputFiles natively accepts multiple paths in one call, so a
+// manifest attaches in the same one file-chooser interaction as a lone file
+// - not verified live yet whether Facebook's composer actually keeps every
+// member as a separate attachment vs. only the first; do not enable
+// RICH_MESSAGE_*_FILE_ENABLED for more than one file per message until that
+// live check happens (see research.md/quickstart.md).
+async function stageAttachmentViaFileChooser(tabId, point, attachmentOrList) {
+  const items = Array.isArray(attachmentOrList) ? attachmentOrList : [attachmentOrList];
+  const paths = items.map((item) => item.local_path);
+  const isFileTransport = Array.isArray(attachmentOrList) || attachmentOrList?.media_type === 'file';
+  const target = { tabId };
+  await chrome.debugger.attach(target, '1.3');
+  try {
+    await chrome.debugger.sendCommand(target, 'Page.enable');
+    await chrome.debugger.sendCommand(target, 'DOM.enable');
+    await chrome.debugger.sendCommand(target, 'Page.setInterceptFileChooserDialog', { enabled: true });
+    const chooserOpened = waitForFileChooserOpened(tabId, 6000);
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mousePressed', x: point.x, y: point.y, button: 'left', clickCount: 1
+    });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x: point.x, y: point.y, button: 'left', clickCount: 1
+    });
+    const chooserParams = await chooserOpened;
+    if (!chooserParams?.backendNodeId) {
+      throw new Error('Page.fileChooserOpened không trả về backendNodeId');
+    }
+    await chrome.debugger.sendCommand(target, 'DOM.setFileInputFiles', {
+      files: paths,
+      backendNodeId: chooserParams.backendNodeId
+    });
+    if (isFileTransport) {
+      // Facebook displays the on-disk storage filename (local_path's
+      // basename, a content hash), not the original upload name - confirmed
+      // live 2026-08-17 (see pollForAttachmentEvidence's comment above).
+      const basenames = paths.map((p) => p.split(/[\\/]/).pop());
+      const evidence = await pollForAttachmentEvidence(tabId, basenames);
+      if (!evidence.ok) {
+        const error = new Error('Facebook không hiển thị bằng chứng đã nhận file đính kèm sau khi chọn file');
+        error.code = 'ATTACHMENT_STAGE_FAILED';
+        throw error;
+      }
+    } else {
+      await delay(800);
+    }
+  } finally {
+    try { await chrome.debugger.sendCommand(target, 'Page.setInterceptFileChooserDialog', { enabled: false }); } catch (e) {}
+    try { await chrome.debugger.detach(target); } catch (e) {}
+  }
+}
+
+function assertValidImageAttachment(attachment) {
+  // Kept under the old name for compatibility with the image path, but the
+  // campaign file transport intentionally accepts any backend-validated file.
+  if (!attachment || !attachment.local_path || !attachment.mime_type) {
+    const error = new Error('Attachment không hợp lệ hoặc không được hỗ trợ');
+    error.code = 'ATTACHMENT_INVALID';
+    throw error;
+  }
+}
+
+function assertValidAttachmentOrManifest(attachmentOrList) {
+  const list = Array.isArray(attachmentOrList) ? attachmentOrList : [attachmentOrList];
+  if (Array.isArray(attachmentOrList) && list.length === 0) {
+    const error = new Error('Manifest đính kèm không có file nào');
+    error.code = 'ATTACHMENT_INVALID';
+    throw error;
+  }
+  list.forEach(assertValidImageAttachment);
+}
+
+async function stageBusinessSuiteAttachment(tabId, attachmentOrManifest) {
+  if (!attachmentOrManifest) return;
+  assertValidAttachmentOrManifest(attachmentOrManifest);
+
+  const point = await findAttachButtonCenter(tabId);
+  if (!point) {
+    const error = new Error('Không tìm thấy icon đính kèm của Business Suite');
+    error.code = 'ATTACHMENT_STAGE_FAILED';
+    throw error;
+  }
+
+  try {
+    await stageAttachmentViaFileChooser(tabId, point, attachmentOrManifest);
+  } catch (error) {
+    const wrapped = new Error(error?.message || 'Business Suite không nhận attachment');
+    wrapped.code = 'ATTACHMENT_STAGE_FAILED';
+    throw wrapped;
+  }
+}
+
+// Personal Messenger's exact composer/send-control DOM has not been verified
+// live yet (unlike Business Suite's, which was confirmed via T025/T054 live
+// testing) - this mirrors the same proven CDP file-chooser + DOM-click-send
+// mechanism, but findAttachButtonCenter's personal-Messenger labels are best
+// guesses. Do not enable RICH_MESSAGE_PERSONAL_IMAGE_ENABLED until a live
+// send has actually been confirmed the same way Page's was.
+async function stagePersonalMessengerAttachment(tabId, attachmentOrManifest) {
+  if (!attachmentOrManifest) return;
+  assertValidAttachmentOrManifest(attachmentOrManifest);
+
+  const point = await findAttachButtonCenter(tabId);
+  if (!point) {
+    const error = new Error('Không tìm thấy icon đính kèm của Messenger');
+    error.code = 'ATTACHMENT_STAGE_FAILED';
+    throw error;
+  }
+
+  try {
+    await stageAttachmentViaFileChooser(tabId, point, attachmentOrManifest);
+  } catch (error) {
+    const wrapped = new Error(error?.message || 'Messenger không nhận attachment');
+    wrapped.code = 'ATTACHMENT_STAGE_FAILED';
+    throw wrapped;
+  }
+}
+
+// Focus the composer, type the caption (if any), then submit. Proven pattern
+// (already used by handleSendMessage's plain-text composer fallback below):
+// a native DOM click on the real send control first - Facebook's actual
+// aria-label is "Nhấn Enter để gửi", not "Gửi"/"Send" - falling back to CDP
+// Enter only if that click can't be found/doesn't clear the composer. An
+// earlier attempt here used a CDP-simulated pixel-coordinate click on the
+// wrong label and was never actually confirmed working live; the "success"
+// seen during that test turned out to be the operator manually clicking
+// Send out of impatience, not the code.
+async function typeAndSubmitComposer(tabId, content) {
+  const composerPrepResult = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      // Spec 040 T020: "last textbox in DOM order" was proven correct on a
+      // bare composer, but with a file/manifest attachment staged, Business
+      // Suite's generic-file preview chip adds its own [role="textbox"]-like
+      // element (it shows/edits the filename) - "last" then no longer
+      // reliably lands on the actual message composer. Confirmed live
+      // 2026-08-17: a manual send through the real composer worked
+      // perfectly, but the automated flow consistently typed/sent through
+      // something else, dropping the staged files with zero error. Prefer a
+      // true contenteditable node (Facebook's real composer) over a plain
+      // role=textbox, and among those pick the largest by rendered area -
+      // the real message input is reliably bigger than an inline filename
+      // field or similar incidental control.
+      const candidates = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')];
+      if (!candidates.length) return { success: false, error: 'Không tìm thấy ô soạn tin nhắn' };
+      const scored = candidates.map((el) => {
+        const rect = el.getBoundingClientRect();
+        return { el, area: rect.width * rect.height, isContentEditable: el.getAttribute('contenteditable') === 'true' };
+      });
+      const contentEditableOnly = scored.filter((c) => c.isContentEditable);
+      const pool = contentEditableOnly.length ? contentEditableOnly : scored;
+      pool.sort((a, b) => b.area - a.area);
+      const box = pool[0].el;
+      box.focus();
+      return { success: true, candidateCount: candidates.length, chosenArea: pool[0].area };
+    }
+  });
+
+  if (!composerPrepResult?.[0]?.result?.success) {
+    throw new Error(composerPrepResult?.[0]?.result?.error || 'Lỗi chuẩn bị ô soạn tin nhắn');
+  }
+  // Diagnostic only (spec 040 T020) - relayed to the backend since the
+  // service worker's own console isn't reachable during live debugging;
+  // cheap enough to always send, not gated behind the file-transport path.
+  sendToBackend('COMPOSER_DEBUG', { stage: 'prep', ...composerPrepResult[0].result });
+
+  if (content) {
+    const insertResult = await dispatchTrustedText(tabId, content);
+    if (!insertResult.success) {
+      throw new Error('CDP Insert Text failed: ' + insertResult.error);
+    }
+  }
+
+  await delay(500);
+
+  const clickResult = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async () => {
+      const SEND_SELECTOR = 'button[aria-label="Nhấn Enter để gửi"], [role="button"][aria-label="Nhấn Enter để gửi"], ' +
+        'button[aria-label*="Gửi"], button[aria-label*="Send"]';
+      // Spec 040 T020: live-confirmed 2026-08-17 - with a file/manifest
+      // attachment staged, Business Suite's send control has no matching
+      // aria-label at all (SEND_SELECTOR found nothing anywhere on the page,
+      // not just out of scope); the automated send only went through that
+      // time via the CDP-Enter fallback below. A manual send used a plain
+      // "Gửi" text button. Fall back to matching short, exact visible text
+      // ("Gửi"/"Send") on a button/role=button when no aria-label matches -
+      // still scoped to the focused composer's ancestors first to avoid
+      // grabbing an unrelated same-labeled control elsewhere on the page.
+      const isTextSendButton = (el) => {
+        if (!el.matches?.('button, [role="button"]')) return false;
+        const text = (el.textContent || '').trim();
+        return /^(Gửi|Send)$/i.test(text);
+      };
+      const findInScope = (scope) => scope.querySelector?.(SEND_SELECTOR) ||
+        [...(scope.querySelectorAll?.('button, [role="button"]') || [])].find(isTextSendButton) || null;
+      // Spec 040 T020: an unscoped document-wide search can match an
+      // unrelated "Gửi"/"Send"-labeled control elsewhere on Business Suite's
+      // page instead of the composer's own send button, silently clicking
+      // the wrong one while the real composer (with its staged files) is
+      // never submitted. Walk up from the currently-focused composer box
+      // (set by the previous executeScript call - focus persists across
+      // separate calls since it's page state) and search each ancestor's own
+      // subtree first, only falling back to a global search if none of them
+      // contain a matching control.
+      const findSendButton = () => {
+        let scope = document.activeElement;
+        for (let i = 0; scope && i < 8; i += 1) {
+          const found = findInScope(scope);
+          if (found) return found;
+          scope = scope.parentElement;
+        }
+        return findInScope(document);
+      };
+      let sendButton = findSendButton();
+      for (let i = 0; !sendButton && i < 20; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        sendButton = findSendButton();
+      }
+      if (!sendButton) return { success: false, error: 'Không tìm thấy nút Gửi' };
+      const composerBefore = document.activeElement;
+      const textBefore = (composerBefore?.innerText || composerBefore?.textContent || '').trim();
+      sendButton.click();
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      // Spec 040 T020: confirmed live 2026-08-18 - a script-dispatched
+      // .click() on a real, correctly-matched send button can report success
+      // (the call itself never throws) while doing nothing at all - the
+      // composer was still sitting there as an untouched draft afterward,
+      // files and caption both still staged. This mirrors the exact reason
+      // the file-chooser needs a CDP-dispatched trusted mouse event instead
+      // of element.click() elsewhere in this file - Facebook's send control
+      // likely also requires a trusted event. Verify the composer actually
+      // emptied out before trusting this path; if not, report failure so the
+      // caller falls through to the CDP Enter fallback below, which is the
+      // one mechanism live-confirmed to actually submit in this state.
+      const textAfter = (composerBefore?.innerText || composerBefore?.textContent || '').trim();
+      if (textBefore && textAfter === textBefore) {
+        return { success: false, error: 'Bấm nút Gửi không xóa được nội dung composer (có thể click không phải trusted event)', aria_label: sendButton.getAttribute('aria-label') };
+      }
+      return { success: true, aria_label: sendButton.getAttribute('aria-label') };
+    }
+  });
+
+  sendToBackend('COMPOSER_DEBUG', { stage: 'send_click', ...(clickResult?.[0]?.result || { success: false, error: 'no_result' }) });
+
+  if (!clickResult?.[0]?.result?.success) {
+    console.log('[FB Engine] DOM click nút gửi thất bại, thử CDP Enter:', clickResult?.[0]?.result?.error);
+    const cdpResult = await dispatchTrustedEnter(tabId);
+    if (!cdpResult.success) {
+      throw new Error('CDP Enter failed: ' + cdpResult.error);
+    }
+  }
+}
+
+async function handleSendPageMessage({ thread_id, content, page_id, client_message_id, attachment = null, attachmentManifest = null }) {
+  console.log(`[FB Engine] 📤 Bắt đầu gửi qua Business Suite: page_id=${page_id} thread=${thread_id}`);
+
+  // Extract recipient PSID from thread_id (format is "sourceId:recipientPsid" or just "recipientPsid")
+  const recipientPsid = thread_id.includes(':') ? thread_id.split(':')[1] : thread_id;
+  const targetUrl = `https://business.facebook.com/latest/inbox/messenger?asset_id=${page_id}&selected_item_id=${recipientPsid}`;
+
+  const role = `page:${page_id}`;
+  let tab = await getBusinessSuiteTab(page_id);
+  let composerReady;
+
+  if (!tab) {
+    if (await isTabCreationOnCooldown(role)) {
+      throw new Error(`Tab Business Suite cho page_id=${page_id} đang trong cooldown (vừa bị lật identity), bỏ qua lần gửi này.`);
+    }
+    console.log(`[FB Engine] Không tìm thấy tab Business Suite cho page_id=${page_id}. Tạo tab nền mới.`);
+    tab = await tabCreationCoordinator.run(
+      role,
+      () => getBusinessSuiteTab(page_id),
+      async () => {
+        const created = await new Promise(resolve => {
+          chrome.tabs.create({ url: targetUrl, active: false, pinned: true }, resolve);
+        });
+        if (created?.id) {
+          await registerTab(role, created.id);
+          await Promise.race([waitForTabComplete(created.id, 10000), delay(4000)]);
+          // Confirm the tab actually settled on Business Suite for this exact
+          // page before trusting it for a send - same "don't blindly trust a
+          // just-created tab" check as ensureFacebookMessagesTab, so a shared-
+          // identity flip right after creation can't silently misdirect a send.
+          const settled = await chrome.tabs.get(created.id).catch(() => null);
+          if (!settled || !isBusinessSuiteUrl(settled.url) || !String(settled.url || '').includes(`asset_id=${page_id}`)) {
+            await unregisterTab(role);
+            await startTabCreationCooldown(role);
+            throw new Error(`Tab Business Suite cho page_id=${page_id} không ổn định vào đúng trang sau khi mở (identity dùng chung).`);
+          }
+          return settled;
+        }
+        return created || null;
+      }
+    );
+    composerReady = await pollForComposer(tab.id, 10000);
+  } else {
+    // Business Suite is an SPA - switching conversations happens via
+    // client-side routing and does not reliably update tab.url, so checking
+    // the URL first and reloading on any mismatch was forcing an unnecessary
+    // reload (and its slow loading-skeleton state, confirmed live) before
+    // nearly every send, even when already on the right conversation. Try
+    // the composer on the tab as-is first; only navigate if it's genuinely
+    // not there after polling.
+    composerReady = await pollForComposer(tab.id);
+    if (!composerReady) {
+      console.log(`[FB Engine] Composer chưa sẵn sàng trên tab hiện tại, điều hướng lại đúng thread.`);
+      await chrome.tabs.update(tab.id, { url: targetUrl });
+      await Promise.race([waitForTabComplete(tab.id, 10000), delay(4000)]);
+      composerReady = await pollForComposer(tab.id);
+    }
+  }
+
+  if (!composerReady) {
+    throw new Error('Không tìm thấy ô soạn tin nhắn Business Suite');
+  }
+
+  await stageBusinessSuiteAttachment(tab.id, attachmentManifest || attachment);
+
+  await typeAndSubmitComposer(tab.id, content);
+
+  console.log('[FB Engine] ✅ Đã dispatch tin nhắn qua Business Suite');
+  sendToBackend('SEND_MESSAGE_RESULT', {
+    thread_id,
+    client_message_id,
+    success: false,
+    error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION',
+    stage: 'BUSINESS_SUITE_CDP',
+    error_code: 'COMPOSER_DISPATCHED'
+  });
+}
+
+async function handleSendQueuedMessage(data) {
+  const client_message_id = `queue_${data.queue_id}`;
+  console.log(`[FB Engine] 📥 Nhận SEND_QUEUED_MESSAGE: queue_id=${data.queue_id} source_type=${data.source_type} thread_id=${data.thread_id}`);
+
+  // 1. Envelope validation
+  try {
+    if (typeof self !== 'undefined' && self.FbCrmQueueEnvelopeValidation?.validateQueuedEnvelope) {
+      self.FbCrmQueueEnvelopeValidation.validateQueuedEnvelope(data, { expectedAccountId: user_id });
+    }
+  } catch (err) {
+    console.error('[FB Engine] Lỗi validate envelope SEND_QUEUED_MESSAGE:', err);
+    sendToBackend('QUEUED_MESSAGE_RESULT', {
+      contract_version: data.contract_version || 1,
+      queue_id: data.queue_id,
+      outbound_attempt_id: data.outbound_attempt_id || null,
+      thread_id: data.thread_id,
+      client_message_id,
+      outcome: 'invalid_contract',
+      stage: 'ENVELOPE_VALIDATION',
+      adapter_version: 'rich-message-v1',
+      error_code: err.code || 'CONTRACT_VALIDATION_FAILED',
+      error: err.message,
+      success: false
+    });
+    return;
+  }
+
+  // 2. Dispatch according to source_type
+  if (data.source_type === 'page_messenger' || data.page_id) {
+    try {
+      await handleSendPageMessage({
+        thread_id: data.thread_id,
+        content: data.content,
+        page_id: data.page_id,
+        client_message_id,
+        attachment: data.attachment || null,
+        attachmentManifest: Array.isArray(data.attachment_manifest) ? data.attachment_manifest : null
+      });
+      sendToBackend('QUEUED_MESSAGE_RESULT', {
+        contract_version: data.contract_version || 1,
+        queue_id: data.queue_id,
+        outbound_attempt_id: data.outbound_attempt_id || null,
+        thread_id: data.thread_id,
+        client_message_id,
+        outcome: 'dispatched',
+        stage: 'BUSINESS_SUITE_CDP',
+        adapter_version: 'rich-message-v1',
+        error_code: null,
+        error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION',
+        success: true
+      });
+    } catch (err) {
+      console.error('[FB Engine] Lỗi gửi Page Message từ Queue:', err);
+      sendToBackend('QUEUED_MESSAGE_RESULT', {
+        contract_version: data.contract_version || 1,
+        queue_id: data.queue_id,
+        outbound_attempt_id: data.outbound_attempt_id || null,
+        thread_id: data.thread_id,
+        client_message_id,
+        outcome: 'rejected',
+        stage: 'BUSINESS_SUITE_CDP',
+        adapter_version: 'rich-message-v1',
+        error_code: err.code || 'PAGE_SEND_FAILED',
+        error: err.message,
+        success: false
+      });
+    }
+  } else if (data.source_type === 'personal_messenger' || (!data.source_type && !data.page_id)) {
+    try {
+      await handleSendMessage({
+        thread_id: data.thread_id,
+        content: data.content,
+        text: data.content,
+        attachment: data.attachment || null,
+        attachmentManifest: Array.isArray(data.attachment_manifest) ? data.attachment_manifest : null,
+        client_message_id,
+        account_id: data.account_id || user_id
+      });
+      sendToBackend('QUEUED_MESSAGE_RESULT', {
+        contract_version: data.contract_version || 1,
+        queue_id: data.queue_id,
+        outbound_attempt_id: data.outbound_attempt_id || null,
+        thread_id: data.thread_id,
+        client_message_id,
+        outcome: 'dispatched',
+        stage: 'PERSONAL_MESSENGER_CDP',
+        adapter_version: 'rich-message-v1',
+        error_code: null,
+        error: 'COMPOSER_DISPATCHED_WAITING_CONFIRMATION',
+        success: true
+      });
+    } catch (err) {
+      console.error('[FB Engine] Lỗi gửi Personal Message từ Queue:', err);
+      sendToBackend('QUEUED_MESSAGE_RESULT', {
+        contract_version: data.contract_version || 1,
+        queue_id: data.queue_id,
+        outbound_attempt_id: data.outbound_attempt_id || null,
+        thread_id: data.thread_id,
+        client_message_id,
+        outcome: 'rejected',
+        stage: 'PERSONAL_MESSENGER_CDP',
+        adapter_version: 'rich-message-v1',
+        error_code: err.code || 'PERSONAL_SEND_FAILED',
+        error: err.message,
+        success: false
+      });
+    }
+  } else {
+    sendToBackend('QUEUED_MESSAGE_RESULT', {
+      contract_version: data.contract_version || 1,
+      queue_id: data.queue_id,
+      outbound_attempt_id: data.outbound_attempt_id || null,
+      thread_id: data.thread_id,
+      client_message_id,
+      outcome: 'rejected',
+      stage: 'EXTENSION_DISPATCH',
+      adapter_version: 'rich-message-v1',
+      error_code: 'UNSUPPORTED_SOURCE_TYPE',
+      error: `Loại nguồn không được hỗ trợ: ${data.source_type}`,
+      success: false
+    });
+  }
+}
+
+async function getBusinessSuiteTab(pageId) {
+  const role = `page:${pageId}`;
+  const registered = await getRegisteredTab(role);
+  // Never trust a registered tab blindly: getRegisteredTab only confirms the
+  // tab still exists, not that it's still showing Business Suite for THIS
+  // page. Facebook's shared-identity session (see getFacebookTab) or a
+  // manual navigation can move it elsewhere; without this check a send could
+  // silently land on whatever the tab now shows - the wrong Page or the
+  // personal surface - instead of failing safely.
+  if (registered && isBusinessSuiteUrl(registered.url) && String(registered.url || '').includes(`asset_id=${pageId}`)) {
+    return registered;
+  }
+  if (registered) await unregisterTab(role);
+
+  return new Promise((resolve) => {
+    chrome.tabs.query({ url: ['*://business.facebook.com/*'] }, async (tabs) => {
+      if (!tabs || tabs.length === 0) return resolve(null);
+      const tab = tabs.find(t => t.url && t.url.includes(`asset_id=${pageId}`));
+      if (tab?.id) await registerTab(role, tab.id);
+      resolve(tab || null);
+    });
+  });
+}
+
 // ── Đồng bộ danh sách threads từ sidebar Facebook ──────────────────────────
 // Yêu cầu content.js scrape DOM sidebar của facebook.com/messages
 async function handleSync100Threads({ account_id }) {
   console.log('[FB Engine] 🔄 Đang sync threads sidebar cho account:', account_id);
 
-  const tab = await getFacebookTab(account_id);
+  const tab = await ensureFacebookMessagesTab(account_id, 'sidebar_sync');
   if (!tab) {
-    console.warn('[FB Engine] Không tìm thấy tab Facebook nào đang mở. Mở facebook.com/messages trước.');
+    console.warn('[FB Engine] Không tìm thấy/tạo được tab Facebook để sync sidebar.');
     sendToBackend('SYNC_THREADS_RESULT', { account_id, threads: [] });
     return;
   }
@@ -580,7 +1551,7 @@ function scrapeFacebookSidebar() {
       let rawName = String(rowContainer.innerText || nameEl?.innerText || nameEl?.textContent || '').split(/\n+/)[0].trim();
       rawName = rawName.replace(/(?:Tin nhắn và cuộc gọi|Em chào chị|Bạn và|Các bạn|được bảo mật|hoạt động|vừa xong).*$/i, '').trim();
       rawName = rawName.replace(/\s*\d+\s*(?:ngày|giờ|phút|năm|s|m|h|d|y)\s*$/i, '').trim();
-      
+
       const PRESENCE_EXACT = /^(?:Đang|Đang hoạt động.*|Hoạt động(?:\s+\d+.*)?|Đã hoạt động.*|Active now|Active recently|Active \d+.*|Online|Offline)$/i;
       let name = rawName.substring(0, 60).trim();
       if (PRESENCE_EXACT.test(name) || name === 'Đang') {
@@ -767,10 +1738,10 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
   if (!thread_id) return;
 
   const targetAcc = account_id || user_id;
-  const tab = await getFacebookTab(targetAcc);
+  const tab = await ensureFacebookMessagesTab(targetAcc, 'thread_messages_sync');
   if (!tab) {
-    console.warn('[FB Engine] Không có tab Facebook tương ứng để sync thread messages.');
-    sendToBackend('THREAD_MESSAGES_SYNCED', { account_id: targetAcc, thread_id, messages: [], mode, cursor });
+    console.warn('[FB Engine] Không có/tạo được tab Facebook tương ứng để sync thread messages.');
+    sendToBackend('THREAD_MESSAGES_SYNCED', { account_id: targetAcc, thread_id, messages: [], reason: 'no_background_tab', mode, cursor });
     return;
   }
 
@@ -801,7 +1772,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
         async function waitForThreadDomReady(targetThreadId, timeoutMs = 8000) {
           const startTime = Date.now();
           let lastReason = 'timeout';
-          
+
           while (Date.now() - startTime < timeoutMs) {
             // Kiểm tra URL hiện tại
             const currentThreadMatch = location.href.match(/\/messages\/(?:e2ee\/)?t\/([^\/?#]+)/);
@@ -844,7 +1815,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
               await new Promise(r => setTimeout(r, 400));
               continue;
             }
-            
+
             const existingRows = mainContainer.querySelectorAll('div[role="row"], div[data-scope="messages_table"] div[dir="auto"]');
             if (existingRows.length === 0) {
               lastReason = 'no_rows';
@@ -876,7 +1847,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
         if (!domReadyStatus.ok) {
           return { _reason: domReadyStatus.reason };
         }
-        
+
         const mainContainer = domReadyStatus.mainContainer;
 
         // 2. Helper scroll lazy load nhiều vòng
@@ -886,7 +1857,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
           let maxRounds = 5;
           if (modeStr === 'incremental') maxRounds = 1;
           if (modeStr === 'backfill') maxRounds = 10;
-          
+
           let prevScrollHeight = 0;
           let roundsWithoutIncrease = 0;
           for (let i = 0; i < maxRounds; i++) {
@@ -914,12 +1885,12 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
             } else {
               prevScrollHeight = currentScrollHeight;
             }
-            
+
             if (roundsWithoutIncrease >= 2) {
               console.log('[FB LazyLoad] Không phát hiện chiều cao scroll tăng sau 2 vòng liên tiếp. Dừng.');
               break;
             }
-            
+
             const spinner = container.querySelector('svg[aria-label="Loading"], div[role="progressbar"]');
             if (spinner) {
               await new Promise(r => setTimeout(r, 1000));
@@ -1014,7 +1985,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
           if (!label) return null;
           const timeMatch = label.match(/\b(\d{1,2}):(\d{2})(?:\s*(AM|PM|SA|CH|SÁNG|CHIỀU|TỐI))?/i);
           if (!timeMatch) return null;
-          
+
           let hours = parseInt(timeMatch[1], 10);
           const minutes = parseInt(timeMatch[2], 10);
           const ampm = timeMatch[3]?.toUpperCase();
@@ -1023,7 +1994,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
           } else if (ampm === 'AM' || ampm === 'SA' || ampm === 'SÁNG') {
             if (hours === 12) hours = 0;
           }
-          
+
           const now = new Date();
           now.setHours(hours, minutes, 0, 0);
 
@@ -1061,7 +2032,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
             const fallback = new Date(fallbackDate);
             now.setFullYear(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
           }
-          
+
           if (now.getTime() > Date.now() + 60000) {
             now.setDate(now.getDate() - 1);
           }
@@ -1078,7 +2049,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
 
         // ── Chiến lược: Chỉ lấy tin từ message row đã xác minh ──
         const allRows = Array.from(mainContainer.querySelectorAll('div[role="row"]'));
-        
+
         let dom_order = 0;
         let lastFallbackTime = Date.now();
 
@@ -1093,7 +2064,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
           const nativeIdEl = row.querySelector('[data-id], [id^="mid."]');
           const hasNativeId = !!nativeIdEl;
 
-          if (!hasMessageLabel && !hasNativeId) return; 
+          if (!hasMessageLabel && !hasNativeId) return;
 
           const bubblesInRow = Array.from(row.querySelectorAll('div[dir="auto"], span[dir="auto"]'));
           const leafBubbles = bubblesInRow.filter(b => {
@@ -1105,7 +2076,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
 
           let tsMs = parseTimeFromLabel(effectiveLabel, lastFallbackTime);
           let tsSource = tsMs ? 'facebook_label' : 'fallback';
-          
+
           if (tsMs) {
             lastFallbackTime = tsMs;
           } else {
@@ -1156,7 +2127,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
             if (!messages.some(m => m.fb_message_id === deterministicId)) {
               // Create a microsecond offset based on dom_order to preserve sorting for identical timestamps
               const finalTsMs = tsMs + dom_order;
-              
+
               messages.push({
                 fb_message_id: deterministicId,
                 thread_id: currentThreadId,
@@ -1184,7 +2155,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
     const parsedResult = results?.[0]?.result;
     const parsedMessages = Array.isArray(parsedResult) ? parsedResult : (parsedResult?.messages || []);
     const parserSkipped = Array.isArray(parsedResult) ? 0 : (parsedResult?.skipped_count || 0);
-    
+
     if (parsedResult && parsedResult._reason) {
       console.warn(`[FB Engine] ⚠️ DOM chưa sẵn sàng. Hủy sync. Lý do: ${parsedResult._reason}`);
       sendToBackend('THREAD_MESSAGES_SYNCED', {
@@ -1211,7 +2182,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, mod
       newCursor.newest_timestamp_ms = ordered[ordered.length - 1].timestamp_ms;
       newCursor.newest_message_id = ordered[ordered.length - 1].fb_message_id;
     }
-    
+
     sendToBackend('THREAD_MESSAGES_SYNCED', {
       account_id: targetAcc,
       thread_id,
