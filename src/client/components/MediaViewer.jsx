@@ -7,9 +7,17 @@ export default function MediaViewer({ mediaType, mediaUrl, localMediaPath }) {
 
   if (!displayUrl) return null;
 
-  if (mediaType === 'image') {
+  const isImg = mediaType === 'image' ||
+    /\.(png|jpg|jpeg|webp|gif|bmp)(\?.*)?$/i.test(displayUrl) ||
+    (typeof displayUrl === 'string' && (
+      displayUrl.includes('/outbound-attachments/') ||
+      displayUrl.includes('/campaign-attachments/') ||
+      displayUrl.startsWith('data:image/')
+    ));
+
+  if (isImg) {
     return (
-      <div className="mt-2">
+      <div className="my-0.5">
         <img
           src={displayUrl}
           alt="Attachment"

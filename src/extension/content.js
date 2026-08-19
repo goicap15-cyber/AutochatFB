@@ -14,15 +14,49 @@
     } catch (e) { }
   }
 
+  function triggerCallAnswer(action) {
+    console.log('[CALL_CONTROL] 🎯 Dynamically clicking Facebook call button:', action);
+    var targetLabel = action === 'accept' ? 'Chấp nhận' : 'Từ chối';
+    
+    // 1. Direct query by aria-label
+    var btn = document.querySelector('[aria-label="' + targetLabel + '"][role="button"]') ||
+              document.querySelector('[aria-label="' + targetLabel + '"]');
+    
+    // 2. Fallback: text search in role="button"
+    if (!btn) {
+      var allButtons = document.querySelectorAll('[role="button"]');
+      for (var i = 0; i < allButtons.length; i++) {
+        var txt = (allButtons[i].textContent || '').trim();
+        if (txt === targetLabel || (action === 'accept' && txt.includes('Chấp nhận')) || (action === 'decline' && txt.includes('Từ chối'))) {
+          btn = allButtons[i];
+          break;
+        }
+      }
+    }
+
+    if (btn) {
+      btn.click();
+      console.log('[CALL_CONTROL] ✅ Successfully clicked ' + targetLabel + ' button on Facebook!');
+      return true;
+    } else {
+      console.warn('[CALL_CONTROL] ⚠️ Button ' + targetLabel + ' not found in Facebook DOM');
+      return false;
+    }
+  }
+
   try {
     if (chrome?.runtime?.onMessage) {
-      chrome.runtime.onMessage.addListener((msg) => {
+      chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (msg.type === 'CLEAR_PENDING_KEY') {
           try {
             if (chrome?.storage?.local) {
               chrome.storage.local.remove(['crm_pending_key']);
             }
           } catch (e) {}
+        }
+        if (msg.type === 'ANSWER_INCOMING_CALL') {
+          var success = triggerCallAnswer(msg.action);
+          if (sendResponse) sendResponse({ success: success });
         }
       });
     }
@@ -762,4 +796,198 @@
       observerPaused = false;
     }, 3000);
   }, 1000);
+
+  // ── Call Log Scanner ────────────────────────────────────────────────────────
+  // Quét span[dir="auto"] chứa text cuộc gọi mỗi 2 giây.
+  // Facebook Messenger (www.facebook.com) dùng cấu trúc:
+  //   <span dir="auto">Cuộc gọi thoại</span>
+  //   <span dir="auto">Đã nhỡ cuộc gọi thoại</span>
+  //   <span dir="auto">Cuộc gọi video</span>
+  var _callSentIds = new Set();
+  var _callSeenCounts = new Map();
+  var _lastScannedThreadId = null;
+  var _callBaselineReady = false;
+
+  function callSignatureHash(value) {
+    var hash = 0;
+    var input = String(value || '');
+    for (var index = 0; index < input.length; index++) {
+      hash = ((hash << 5) - hash) + input.charCodeAt(index);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(36);
+  }
+
+  setInterval(function() {
+    try {
+      var threadId = extractThreadIdFromUrl();
+      if (!threadId || !/^\d+$/.test(threadId)) return;
+
+      if (threadId !== _lastScannedThreadId) {
+        _lastScannedThreadId = threadId;
+        _callSentIds.clear();
+        _callSeenCounts.clear();
+        _callBaselineReady = false;
+      }
+
+      var mainContainer = document.querySelector('div[role="main"]') || document.querySelector('div[role="log"]');
+      if (!mainContainer) return;
+
+      var spans = mainContainer.querySelectorAll('span[dir="auto"]');
+      var scanCounts = new Map();
+      var scanCalls = [];
+      for (var i = 0; i < spans.length; i++) {
+        var spanEl = spans[i];
+        var txt = (spanEl.textContent || '').trim();
+        var lower = txt.toLowerCase();
+        if (!txt) continue;
+        if (!lower.includes('cuộc gọi') && !lower.includes('nhỡ') && !lower.includes('bỏ lỡ') && !lower.includes('video')) continue;
+
+        var parentEl = spanEl.closest('[role="button"]') || spanEl.closest('div.x78zum5') || spanEl.parentElement;
+        if (!parentEl || !mainContainer.contains(parentEl)) continue;
+        var parentText = parentEl ? (parentEl.textContent || '').trim() : '';
+        var timeMatch = parentText.match(/(\d{1,2}:\d{2}|\d+\s*(?:giây|phút|giờ|ngày))/i);
+        var timeStr = timeMatch ? timeMatch[1].replace(/[:\s]/g, '') : 'notime';
+        var isOutgoing = false;
+        if (lower.includes('của bạn') || lower.includes('bởi bạn') || lower.includes('do bạn')) {
+          isOutgoing = true;
+        } else if (lower.includes('đã nhỡ')) {
+          isOutgoing = false;
+        } else {
+          var mainContainer = document.querySelector('div[role="main"]') || document.body;
+          var mainRect = mainContainer.getBoundingClientRect();
+          var spanRect = spanEl.getBoundingClientRect();
+          if (mainRect.width > 0 && spanRect.width > 0) {
+            var relativeLeft = spanRect.left - mainRect.left;
+            if (relativeLeft > (mainRect.width * 0.4)) isOutgoing = true;
+          }
+        }
+
+        var durationMatch = parentText.match(/(\d+\s*(?:giây|phút|giờ))/i);
+        var displayContent = txt;
+        if (durationMatch && !txt.includes(durationMatch[1])) displayContent = txt + ' • ' + durationMatch[1];
+
+        // Stable identity: count occurrences among equivalent call rows, rather than
+        // using the global span position (which changes whenever a text message arrives).
+        var signature = threadId + '|' + displayContent.toLowerCase().replace(/\s+/g, ' ').trim() + '|' + timeStr + '|' + (isOutgoing ? 'out' : 'in');
+        var occurrence = (scanCounts.get(signature) || 0) + 1;
+        scanCounts.set(signature, occurrence);
+        scanCalls.push({ signature: signature, occurrence: occurrence, displayContent: displayContent, timeStr: timeStr, isOutgoing: isOutgoing });
+      }
+
+      // First pass only records the calls already visible in Messenger. Without
+      // this baseline, reloading the extension would import all historical calls.
+      if (!_callBaselineReady) {
+        scanCounts.forEach(function(count, signature) { _callSeenCounts.set(signature, count); });
+        _callBaselineReady = true;
+        return;
+      }
+
+      for (var c = 0; c < scanCalls.length; c++) {
+        var call = scanCalls[c];
+        var previouslySeen = _callSeenCounts.get(call.signature) || 0;
+        if (call.occurrence <= previouslySeen) continue;
+        _callSeenCounts.set(call.signature, call.occurrence);
+
+        var callId = 'call_' + callSignatureHash(call.signature) + '_occ' + call.occurrence;
+        if (_callSentIds.has(callId)) continue;
+        _callSentIds.add(callId);
+
+        console.log('[CALL_SCANNER] Tim thay cuoc goi MOI: "' + call.displayContent + '" (' + call.timeStr + ') | isOutgoing=' + call.isOutgoing + ' | thread=' + threadId + ' | id=' + callId);
+        try {
+          if (chrome && chrome.runtime && chrome.runtime.id) {
+            chrome.runtime.sendMessage({
+              type: 'NEW_MESSAGE_FROM_FB',
+              data: {
+                thread_id: threadId,
+                fb_message_id: callId,
+                sender_id: call.isOutgoing ? capturedUserId : null,
+                sender_name: call.isOutgoing ? 'Bạn' : '',
+                content: call.displayContent,
+                is_outgoing: call.isOutgoing,
+                media_type: 'text',
+                source: 'dom_observer',
+                timestamp_ms: Date.now(),
+                timestamp_source: 'realtime_fallback',
+                created_at: new Date().toISOString()
+              }
+            });
+          }
+        } catch(e) {}
+      }
+    } catch(e) {}
+  }, 2000);
+
+  // ── Incoming Call Ringing Scanner ───────────────────────────────────────────
+  // Detect the real Facebook controls; incoming-call overlays do not always keep
+  // /messages/t/<id> in the active URL, so thread_id is optional for this event.
+  var _lastRingingKey = null;
+  setInterval(function() {
+    try {
+      var acceptButton = document.querySelector(
+        '[role="button"][aria-label="Chấp nhận"], [role="button"][aria-label*="Accept"], [aria-label="Chấp nhận"]'
+      );
+      var declineButton = document.querySelector(
+        '[role="button"][aria-label="Từ chối"], [role="button"][aria-label*="Decline"], [aria-label="Từ chối"]'
+      );
+      var callDialog = acceptButton || declineButton;
+      var callerText = '';
+
+      if (callDialog) {
+        var dialogRoot = callDialog.closest('[role="dialog"]') || callDialog.parentElement?.parentElement?.parentElement || callDialog;
+        callerText = (dialogRoot.textContent || '').trim();
+      } else {
+        var allSpans = document.querySelectorAll('span, div');
+        for (var i = 0; i < allSpans.length; i++) {
+          var t = (allSpans[i].textContent || '').trim();
+          var lowerT = t.toLowerCase();
+          if (
+            lowerT.includes('đang gọi cho bạn') ||
+            lowerT.includes('cuộc gọi thoại đến') ||
+            lowerT.includes('cuộc gọi video đến') ||
+            lowerT.includes('incoming audio call') ||
+            lowerT.includes('incoming video call')
+          ) {
+            callDialog = allSpans[i];
+            callerText = t;
+            break;
+          }
+        }
+      }
+
+      if (callDialog) {
+        var threadId = extractThreadIdFromUrl();
+        var ringingKey = (threadId || 'unknown') + '|' + callerText.substring(0, 80);
+        if (_lastRingingKey !== ringingKey) {
+          _lastRingingKey = ringingKey;
+          console.log('[CALL_RINGING] 📞 Phát hiện cuộc gọi ĐANG REO trên Facebook: thread=' + (threadId || 'unknown'));
+          if (chrome && chrome.runtime && chrome.runtime.id) {
+            chrome.runtime.sendMessage({
+              type: 'INCOMING_CALL_RINGING',
+              data: {
+                thread_id: threadId || null,
+                caller_name: callerText.substring(0, 60) || 'Khách hàng',
+                timestamp: Date.now()
+              }
+            });
+          }
+        }
+      } else {
+        if (_lastRingingKey !== null) {
+          console.log('[CALL_RINGING] 📴 Cuộc gọi đã ngừng reo trên Facebook.');
+          if (chrome && chrome.runtime && chrome.runtime.id) {
+            chrome.runtime.sendMessage({
+              type: 'INCOMING_CALL_ENDED',
+              data: { timestamp: Date.now() }
+            });
+          }
+        }
+        _lastRingingKey = null;
+      }
+    } catch(e) {
+      console.warn('[CALL_RINGING] Detector error:', e);
+    }
+  }, 750);
+  // ── End Call Log Scanner ────────────────────────────────────────────────────
 })();
+

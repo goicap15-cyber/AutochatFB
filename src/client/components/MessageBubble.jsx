@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertTriangle, Check, CheckCheck, RefreshCw, Loader2 } from 'lucide-react';
+import { AlertTriangle, Check, CheckCheck, RefreshCw, Loader2, Phone, Video, PhoneMissed, PhoneCall, PhoneIncoming } from 'lucide-react';
 import MediaViewer from './MediaViewer.jsx';
 
 const AVATAR_COLORS = ['#3b82f6', '#8b5cf6', '#10b981', '#ec4899', '#f97316', '#14b8a6', '#6366f1', '#ef4444'];
@@ -27,6 +27,19 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
   const avatarUrl = msg.sender_avatar || activeThread?.avatar_url;
   const avatarInitial = (senderName || activeThread?.contact_name || 'K').charAt(0).toUpperCase();
   const avatarColor = pickAvatarColor(activeThread?.id || senderName);
+
+  const lowerContent = content.toLowerCase();
+  const isCallMessage = Boolean(
+    msg.media_type === 'call' ||
+    lowerContent.includes('cuộc gọi') ||
+    lowerContent.includes('gọi thoại') ||
+    lowerContent.includes('bỏ lỡ cuộc gọi')
+  );
+  const isMissedCall = lowerContent.includes('bỏ lỡ') || lowerContent.includes('nhỡ') || lowerContent.includes('missed');
+  const isVideoCall = lowerContent.includes('video');
+
+  const hasMedia = Boolean(msg.local_media_path || msg.media_url);
+  if (!content && !hasMedia && !isUnsent) return null;
 
   return (
     <div className={`flex ${isOutgoing ? 'justify-end' : 'justify-start'} items-end gap-2`}>
@@ -65,8 +78,22 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
               <span>Khách đã thu hồi</span>
             </div>
           )}
-          {content && <p className="text-inherit leading-relaxed whitespace-pre-wrap break-words">{content}</p>}
-          <MediaViewer mediaType={msg.media_type} mediaUrl={msg.media_url} localMediaPath={msg.local_media_path} />
+          {isCallMessage ? (
+            <div className="flex items-center gap-2.5 py-0.5">
+              <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${isOutgoing ? 'bg-white/20 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200'}`}>
+                {isMissedCall ? <PhoneMissed size={16} /> : isVideoCall ? <Video size={16} /> : isOutgoing ? <PhoneCall size={16} /> : <PhoneIncoming size={16} />}
+              </div>
+              <div className="flex flex-col">
+                <span className="font-semibold text-xs leading-tight">{content}</span>
+                {timeLabel && <span className="text-[11px] opacity-75 font-mono mt-0.5">{timeLabel}</span>}
+              </div>
+            </div>
+          ) : (
+            <>
+              <MediaViewer mediaType={msg.media_type} mediaUrl={msg.media_url} localMediaPath={msg.local_media_path} />
+              {content && <p className={`text-inherit leading-relaxed whitespace-pre-wrap break-words ${hasMedia ? 'mt-1.5' : ''}`}>{content}</p>}
+            </>
+          )}
         </div>
 
         <div className={`flex items-center gap-1 mt-1 text-xs text-[var(--color-text-muted)] ${isOutgoing ? 'justify-end' : 'justify-start'}`}>

@@ -121,11 +121,21 @@ class OutboundDomCorrelationService {
       WHERE id = ?
     `).run(confirmedId, tsMs, tsMs, tsSource, tsSource, pendingRow.id);
     updateQueueStatusFromClientMessage(pendingRow.client_message_id, 'sent', null, database);
-    const createdAt = (rawMessage.created_at && !isNaN(Date.parse(rawMessage.created_at)))
-      ? rawMessage.created_at : new Date().toISOString();
+    const updatedMsg = database.prepare('SELECT * FROM messages WHERE id = ?').get(pendingRow.id);
     if (ioServer) {
-      ioServer.emit('MESSAGE_SENT', { thread_id: rawMessage.thread_id, client_message_id: pendingRow.client_message_id, fb_message_id: confirmedId, status: 'sent' });
-      ioServer.emit('NEW_MESSAGE', { ...rawMessage, client_message_id: pendingRow.client_message_id, fb_message_id: confirmedId, delivery_status: 'sent', status: 'sent', is_outgoing: true, timestamp_ms: tsMs, timestamp_source: tsSource, created_at: createdAt });
+      ioServer.emit('MESSAGE_SENT', { thread_id: pendingRow.thread_id || rawMessage.thread_id, client_message_id: pendingRow.client_message_id, fb_message_id: confirmedId, status: 'sent' });
+      ioServer.emit('NEW_MESSAGE', {
+        ...rawMessage,
+        ...updatedMsg,
+        client_message_id: pendingRow.client_message_id,
+        fb_message_id: confirmedId,
+        delivery_status: 'sent',
+        status: 'sent',
+        is_outgoing: true,
+        timestamp_ms: tsMs || updatedMsg?.timestamp_ms,
+        timestamp_source: tsSource || updatedMsg?.timestamp_source,
+        created_at: createdAt
+      });
     }
     console.log(`[WS] Đã ghép DOM confirmation vào pending outbound ${pendingRow.client_message_id}`);
     return true;

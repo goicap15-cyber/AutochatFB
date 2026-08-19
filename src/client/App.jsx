@@ -13,6 +13,7 @@ import CampaignCreateModal from './components/CampaignCreateModal.jsx';
 import CampaignDetail from './components/CampaignDetail.jsx';
 import AiConfigModal from './components/AiConfigModal.jsx';
 import PhoneAutomationSettingsModal from './components/PhoneAutomationSettingsModal.jsx';
+import IncomingCallModal from './components/IncomingCallModal.jsx';
 import { useSocket } from './hooks/useSocket.js';
 import { MessageSquare } from 'lucide-react';
 
@@ -80,6 +81,7 @@ export default function App() {
   const [selectedCampaignThreadIds, setSelectedCampaignThreadIds] = useState([]);
   const [activeCampaignId, setActiveCampaignId] = useState(null);
   const [campaignRefreshVersion, setCampaignRefreshVersion] = useState(0);
+  const [incomingCallInfo, setIncomingCallInfo] = useState(null);
 
   const loadInboxSources = useCallback(async () => {
     try {
@@ -181,27 +183,51 @@ export default function App() {
   const threadsRef = useRef(threads);
   useEffect(() => { threadsRef.current = threads; }, [threads]);
 
+  const requestThreadNavigation = useCallback((thread) => {
+    if (!thread) return;
+    const threadIdStr = String(thread.id);
+    const externalThreadId = String(thread.external_thread_id || thread.id);
+    setActiveThreadId(thread.id);
+
+    // A click is a navigation intent, not a background-history refresh. Always
+    // dispatch it, including repeated clicks on the same row. Mark the throttle
+    // so the activeThread effect below does not immediately duplicate this request.
+    requestedSyncRef.current.set(threadIdStr, Date.now());
+    if (socket) {
+      socket.emit('REQUEST_SYNC_THREAD_MESSAGES', {
+        account_id: thread.account_id || null,
+        thread_id: externalThreadId,
+        thread_url: thread.thread_url || null,
+        page_id: thread.page_id || thread.source_external_id || null,
+        contact_name: thread.contact_name || thread.name || null
+      });
+    }
+  }, [socket]);
+
   useEffect(() => {
     if (!activeThreadId) return;
     const threadIdStr = String(activeThreadId);
-    if (!messages[threadIdStr]) {
-      fetch(`/api/threads/${threadIdStr}/messages`)
-        .then(r => r.json())
-        .then(data => setMessages(prev => ({ ...prev, [threadIdStr]: data })))
-        .catch(() => {});
-    }
+    fetch(`/api/threads/${threadIdStr}/messages`)
+      .then(r => r.json())
+      .then(data => {
+        if (Array.isArray(data)) {
+          setMessages(prev => ({ ...prev, [threadIdStr]: data }));
+        }
+      })
+      .catch(() => {});
 
-    // Gửi yêu cầu sync lịch sử mới nhất từ Facebook Extension cho thread này (chỉ gửi 1 lần mỗi 60 giây)
+    // Background/history fallback only. Direct row clicks are always dispatched
+    // by requestThreadNavigation above and are never swallowed by this throttle.
     if (socket) {
       const lastSync = requestedSyncRef.current.get(threadIdStr) || 0;
       if (Date.now() - lastSync > 60000) {
         requestedSyncRef.current.set(threadIdStr, Date.now());
         const activeThreadObj = threadsRef.current.find(t => String(t.id) === threadIdStr);
-        if (activeThreadObj?.source_type === 'page_messenger') return;
         socket.emit('REQUEST_SYNC_THREAD_MESSAGES', {
           account_id: activeThreadObj?.account_id || null,
           thread_id: activeThreadObj?.external_thread_id || threadIdStr,
-          thread_url: activeThreadObj?.thread_url || null
+          thread_url: activeThreadObj?.thread_url || null,
+          page_id: activeThreadObj?.page_id || activeThreadObj?.source_external_id || null
         });
       }
     }
@@ -272,7 +298,15 @@ export default function App() {
           );
           if (existsIdx >= 0) {
             updated = [...currentMsgs];
-            updated[existsIdx] = { ...currentMsgs[existsIdx], ...newMsg, client_message_id: newMsg.client_message_id, status: newMsg.status || newMsg.delivery_status || 'sent' };
+            updated[existsIdx] = {
+              ...currentMsgs[existsIdx],
+              ...newMsg,
+              local_media_path: newMsg.local_media_path || currentMsgs[existsIdx].local_media_path,
+              media_url: newMsg.media_url || currentMsgs[existsIdx].media_url,
+              media_type: newMsg.media_type || currentMsgs[existsIdx].media_type,
+              client_message_id: newMsg.client_message_id,
+              status: newMsg.status || newMsg.delivery_status || 'sent'
+            };
           } else {
             updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
           }
@@ -309,6 +343,18 @@ export default function App() {
         return prev;
       });
       loadThreadsRef.current();
+
+      // Auto-refetch latest messages from API so media URLs and attachments load instantly without F5
+      setTimeout(() => {
+        fetch(`/api/threads/${tidStr}/messages`)
+          .then(r => r.json())
+          .then(data => {
+            if (Array.isArray(data)) {
+              setMessages(prev => ({ ...prev, [tidStr]: data }));
+            }
+          })
+          .catch(() => {});
+      }, 500);
     });
 
     socket.on('MESSAGE_SENT', ({ thread_id, client_message_id, fb_message_id }) => {
@@ -320,6 +366,17 @@ export default function App() {
           [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'sent', delivery_status: 'sent', fb_message_id: fb_message_id || m.fb_message_id, error: null } : m)
         };
       });
+      // Auto-refetch after message is marked sent to load full database row with media URL
+      setTimeout(() => {
+        fetch(`/api/threads/${tidStr}/messages`)
+          .then(r => r.json())
+          .then(data => {
+            if (Array.isArray(data)) {
+              setMessages(prev => ({ ...prev, [tidStr]: data }));
+            }
+          })
+          .catch(() => {});
+      }, 300);
     });
 
     socket.on('MESSAGE_SEND_FAILED', ({ thread_id, client_message_id, error }) => {
@@ -331,6 +388,23 @@ export default function App() {
           [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'failed', delivery_status: 'failed', error } : m)
         };
       });
+    });
+
+    socket.on('THREAD_MESSAGES_UPDATED', ({ thread_id, messages: newMsgs }) => {
+      const tidStr = String(thread_id);
+      if (Array.isArray(newMsgs)) {
+        setMessages(prev => ({ ...prev, [tidStr]: newMsgs }));
+      }
+    });
+
+    socket.on('INCOMING_CALL_RINGING', (callData) => {
+      console.log('[Socket.io] 🔔 INCOMING_CALL_RINGING:', callData);
+      setIncomingCallInfo(callData);
+    });
+
+    socket.on('INCOMING_CALL_ENDED', (callData) => {
+      console.log('[Socket.io] 📴 INCOMING_CALL_ENDED:', callData);
+      setIncomingCallInfo(null);
     });
 
     socket.on('MESSAGE_SEND_ACCEPTED', (accepted) => {
@@ -827,6 +901,19 @@ export default function App() {
 
   const gridClass = leadPanelCollapsed ? 'app-grid-collapsed' : 'app-grid';
 
+  const handleStartCall = useCallback((callType = 'audio') => {
+    if (!activeThreadId || !selectedThread) return;
+    if (!socket || !isConnected) {
+      alert('Chưa kết nối đến Server WebSocket!');
+      return;
+    }
+    socket.emit('TRIGGER_CALL', {
+      thread_id: selectedThread.id,
+      account_id: selectedThread.account_id,
+      call_type: callType
+    });
+  }, [activeThreadId, selectedThread, socket, isConnected]);
+
   return (
     <div className={gridClass}>
       {/* Column 1: Sidebar Navigation - 48px */}
@@ -840,7 +927,11 @@ export default function App() {
 
       {/* Column 2: Conversation List */}
       <ConversationSidebar
-        threads={threads} activeThreadId={activeThreadId} onSelectThread={setActiveThreadId}
+        threads={threads} activeThreadId={activeThreadId}
+        onSelectThread={(threadId) => {
+          const clickedThread = threads.find((thread) => String(thread.id) === String(threadId));
+          requestThreadNavigation(clickedThread);
+        }}
         activeTab={activeTab} onTabChange={setActiveTab}
         searchQuery={searchQuery} onSearchChange={setSearchQuery}
         isConnected={isConnected} onOpenSearch={() => setActiveModal('search')}
@@ -867,6 +958,7 @@ export default function App() {
               onPauseAi={handlePauseAi} onResumeAi={handleResumeAi}
               onOpenSearch={() => setActiveModal('search')}
               onShowLeadPanel={() => setShowLeadDrawer(true)}
+              onStartCall={handleStartCall}
               showBackButton={isMobile}
               onGoBack={() => { setActiveThreadId(null); }}
             />
@@ -930,6 +1022,19 @@ export default function App() {
       )}
       {activeModal === 'aiConfig' && <AiConfigModal onClose={() => setActiveModal(null)} />}
       {activeModal === 'phoneAutomation' && <PhoneAutomationSettingsModal leadStatuses={leadStatuses} onClose={() => setActiveModal(null)} />}
+
+      {/* Real-time Incoming Call Overlay */}
+      <IncomingCallModal
+        callInfo={incomingCallInfo}
+        onClose={() => setIncomingCallInfo(null)}
+        onSelectThread={(tid) => setActiveThreadId(tid)}
+        onAnswerCall={(action, thread_id) => {
+          if (socket) {
+            console.log(`[App] 🎯 Emitting ANSWER_INCOMING_CALL (${action}) for thread ${thread_id}`);
+            socket.emit('ANSWER_INCOMING_CALL', { action, thread_id });
+          }
+        }}
+      />
     </div>
   );
 }

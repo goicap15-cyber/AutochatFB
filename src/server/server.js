@@ -53,6 +53,7 @@ const CampaignRecoveryService = require('./services/CampaignRecoveryService');
 const LeadStatusService = require('./services/LeadStatusService');
 const ContactService = require('./services/ContactService');
 const FollowupService = require('./services/FollowupService');
+const InboxSourceService = require('./services/InboxSourceService');
 
 const app = express();
 const followupService = new FollowupService(db);
@@ -501,10 +502,40 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'INCOMING_CALL_RINGING': {
+          const m = msg.data || {};
+          console.log(`[CALL_DEBUG] 🔔 Phát hiện CUỘC GỌI ĐANG REO từ Extension: thread=${m.thread_id || 'unknown'}, caller=${m.caller_name}`);
+          const targetAcct = m.account_id || ws.accountId || null;
+          const internalThreadId = m.thread_id ? resolveInternalThreadId(db, targetAcct, m.thread_id) : null;
+          io.emit('INCOMING_CALL_RINGING', {
+            thread_id: internalThreadId || m.thread_id || null,
+            external_thread_id: m.thread_id || null,
+            account_id: targetAcct,
+            caller_name: m.caller_name || 'Khách hàng',
+            timestamp: m.timestamp || Date.now()
+          });
+          break;
+        }
+
+        case 'INCOMING_CALL_ENDED': {
+          const m = msg.data || {};
+          console.log(`[CALL_DEBUG] 📴 Cuộc gọi đã ngừng reo: account=${m.account_id || ws.accountId || 'unknown'}`);
+          io.emit('INCOMING_CALL_ENDED', {
+            account_id: m.account_id || ws.accountId || null,
+            timestamp: m.timestamp || Date.now()
+          });
+          break;
+        }
+
         case 'NEW_MESSAGE_RECEIVED': {
           const m = msg.data;
           const threadId = String(m.thread_id || '');
           console.log(`[WS] 📩 Nhận NEW_MESSAGE_RECEIVED | Source: ${m.source || 'unknown'} | Thread: ${threadId} | FB Message ID: ${m.fb_message_id} | Content: "${(m.content || '').substring(0, 80)}"`);
+          const _rawContentLower = (m.content || '').toLowerCase();
+          const isCallLog = _rawContentLower.includes('cuộc gọi') || _rawContentLower.includes('bỏ lỡ') || _rawContentLower.includes('đã nhỡ') || _rawContentLower.includes('nhỡ cuộc') || _rawContentLower.includes('video') || _rawContentLower.includes('chat video');
+          if (isCallLog) {
+            console.log(`[CALL_DEBUG] 📞 Backend nhận CALL LOG từ Extension: content="${m.content}", thread=${threadId}, fb_id=${m.fb_message_id}`);
+          }
           if (!threadId || threadId === 'unknown_dom' || !/^\d+$/.test(threadId)) {
             console.warn(`[WS] ⚠️ Bỏ qua tin nhắn từ Thread ID không hợp lệ: "${threadId}"`);
             break;
@@ -517,6 +548,50 @@ wss.on('connection', (ws, req) => {
           // khác 'text' kèm theo (media_url có thể là null khi DOM chỉ thấy được
           // data: URI cục bộ, không có CDN URL thật - nhưng media_type vẫn đủ để
           // biết đây là ảnh thật, không phải rác).
+          // CALL LOG BYPASS: cuộc gọi không được qua cleanMessageText / system-text guard
+          // vì các từ như "Đã nhỡ cuộc gọi thoại" có thể bị xóa bởi bộ lọc.
+          if (isCallLog && m.content && m.fb_message_id && m.fb_message_id.startsWith('call_')) {
+            const targetAccountIdForCall = m.account_id || ws.accountId || null;
+            ConversationRepository.upsertThread({
+              id: m.thread_id,
+              account_id: targetAccountIdForCall,
+              contact_name: m.contact_name || 'Khách hàng',
+              last_message: m.content,
+              is_unread: true
+            });
+            const stableCallId = m.fb_message_id;
+            const existingCall = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(stableCallId);
+            const callIsOutgoing = (m.is_outgoing === true || m.is_outgoing === 1) ? 1 : 0;
+            const callSenderId = m.sender_id || (callIsOutgoing ? String(targetAccountIdForCall || 'STAFF') : 'CONTACT');
+            if (!existingCall) {
+              const insertCall = db.prepare(`
+                INSERT OR IGNORE INTO messages
+                  (thread_id, fb_message_id, sender_id, content, media_type, is_outgoing, direction_status, timestamp_ms, timestamp_source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              `).run(
+                m.thread_id, stableCallId,
+                callSenderId,
+                m.content, 'text', callIsOutgoing, 'confirmed',
+                m.timestamp_ms || Date.now(),
+                m.timestamp_source || 'realtime_fallback',
+                m.created_at || new Date().toISOString()
+              );
+              if (insertCall.changes > 0) {
+                console.log(`[CALL_DEBUG] ✅ Đã lưu call log vào DB: "${m.content}" (id: ${stableCallId}) | is_outgoing: ${callIsOutgoing}`);
+                const newMsg = db.prepare('SELECT * FROM messages WHERE fb_message_id = ?').get(stableCallId);
+                if (newMsg) {
+                  io.emit('NEW_MESSAGE', newMsg);
+                  io.emit('THREAD_MESSAGES_UPDATED', { thread_id: m.thread_id });
+                }
+              } else {
+                console.log(`[CALL_DEBUG] ⚠️ Call log đã tồn tại, bỏ qua: ${stableCallId}`);
+              }
+            } else {
+              console.log(`[CALL_DEBUG] ⚠️ Call log đã tồn tại trong DB: ${stableCallId}`);
+            }
+            break;
+          }
+
           const cleanedContent = cleanMessageText(m.content);
           const hasMediaPayload = !!(m.media_url || (m.media_type && m.media_type !== 'text'));
 
@@ -643,6 +718,20 @@ wss.on('connection', (ws, req) => {
             is_unread: true
           });
 
+          // Auto-register Page source & rebind thread khi đến từ Business Suite
+          if (m.source === 'page_dom_observer' && m.page_id) {
+            try {
+              InboxSourceService.ensurePageSource({
+                pageId: String(m.page_id),
+                accountId: targetAccountId,
+                threadId: m.thread_id,
+                pageName: m.page_name || null
+              }, db);
+            } catch (pageSourceErr) {
+              console.warn('[PAGE_SOURCE] Lỗi auto-register page source:', pageSourceErr.message);
+            }
+          }
+
           const tsMs = m.timestamp_ms || 0;
           const tsSource = m.timestamp_source || 'unknown';
           const createdAt = (m.created_at && !isNaN(Date.parse(m.created_at))) ? m.created_at : new Date().toISOString();
@@ -697,7 +786,7 @@ wss.on('connection', (ws, req) => {
               // manifest_id here forces such dispatches through the explicit
               // media-confirmation path instead, so they fail safe to
               // 'unknown' on timeout rather than falsely reporting 'sent'.
-              const pending = isMediaConfirmation
+              let pending = isMediaConfirmation
                 ? OutboundDomCorrelationService.matchPendingImageOutbound(db, internalThreadId)
                 : db.prepare(`
                     SELECT outbound.id, outbound.client_message_id FROM messages outbound
@@ -707,6 +796,10 @@ wss.on('connection', (ws, req) => {
                       AND (queued.id IS NULL OR (queued.attachment_id IS NULL AND queued.manifest_id IS NULL))
                     ORDER BY outbound.id DESC LIMIT 1
                   `).get(internalThreadId, m.content);
+
+              if (!pending) {
+                pending = OutboundDomCorrelationService.matchPendingImageOutbound(db, internalThreadId);
+              }
               if (pending) {
                 const confirmed = OutboundDomCorrelationService.confirmPendingOutbound(db, io, pending, {
                   fbMessageId: m.fb_message_id,
@@ -1026,6 +1119,20 @@ wss.on('connection', (ws, req) => {
                   last_message: cleanLastMsg,
                   is_unread: t.is_unread
                 });
+
+                // Auto-bind Page source nếu thread đến từ Business Suite
+                if (t.page_id || t.source_type === 'page_messenger') {
+                  try {
+                    InboxSourceService.ensurePageSource({
+                      pageId: String(t.page_id || ''),
+                      accountId: account_id,
+                      threadId,
+                      pageName: t.page_name || null
+                    }, db);
+                  } catch (psErr) {
+                    console.warn('[PAGE_SOURCE] Lỗi bind thread từ sync:', psErr.message);
+                  }
+                }
                 
                 const currentContact = db.prepare('SELECT avatar_url FROM contacts WHERE thread_id = ?').get(threadId);
                 let initialAvatar = currentContact?.avatar_url || null;
@@ -1059,11 +1166,15 @@ wss.on('connection', (ws, req) => {
           const allThreads = db.prepare(`
             SELECT t.*, c.phone, c.email, c.address, c.tags, c.lead_captured, c.avatar_url,
               c.status_id, ls.name AS status_name, ls.color AS status_color,
-              r.due_at AS reminder_due_at, r.note AS reminder_note, r.status AS reminder_status
+              r.due_at AS reminder_due_at, r.note AS reminder_note, r.status AS reminder_status,
+              s.source_type, s.display_name AS source_name, s.status AS source_status,
+              s.external_id AS source_external_id,
+              CASE WHEN s.source_type = 'page_messenger' THEN s.external_id ELSE NULL END AS page_id
             FROM threads t
             LEFT JOIN contacts c ON c.thread_id = t.id
             LEFT JOIN lead_statuses ls ON ls.id = c.status_id
             LEFT JOIN conversation_reminders r ON r.thread_id = t.id AND r.status = 'active'
+            LEFT JOIN inbox_sources s ON s.id = t.source_id
             WHERE t.account_id = ?
             ORDER BY t.last_activity DESC
           `).all(account_id);
@@ -1077,38 +1188,14 @@ wss.on('connection', (ws, req) => {
           console.log(`[WS] THREAD_MESSAGES_SYNCED: thread=${thread_id} mode=${mode||'full'} count=${messages?.length || 0}${reason ? ` reason=${reason}` : ''}`);
 
           if (reason) {
-            const temporaryReasons = ['url_mismatch', 'sidebar_mismatch', 'marker_mismatch', 'no_rows', 'no_main_container', 'loading', 'timeout'];
-            if (temporaryReasons.includes(reason)) {
-              if (!global.syncRetries) global.syncRetries = {};
-              if (!global.syncRetries[thread_id]) global.syncRetries[thread_id] = 0;
-              
-              if (global.syncRetries[thread_id] < 2) {
-                global.syncRetries[thread_id]++;
-                console.log(`[WS] 🔄 Retry sync thread ${thread_id} (Lần ${global.syncRetries[thread_id]}) sau 2s...`);
-                setTimeout(() => {
-                  const extWs = extensionConnections.get(account_id);
-                  if (extWs && extWs.readyState === 1 /* WebSocket.OPEN */) {
-                    const threadRow = db.prepare('SELECT thread_url FROM threads WHERE id = ?').get(thread_id);
-                    const retryThreadUrl = msg.data.thread_url || (threadRow ? threadRow.thread_url : null);
-                    // Pass the old checkpoint back if available
-                    const HistorySyncManager = require('./services/HistorySyncManager');
-                    const syncState = HistorySyncManager.getSyncState(thread_id);
-                    extWs.send(JSON.stringify({
-                      type: 'SYNC_THREAD_MESSAGES',
-                      data: { account_id, thread_id, thread_url: retryThreadUrl, mode: syncState?.sync_cursor?.mode || 'initial', cursor: syncState?.sync_cursor }
-                    }));
-                  }
-                }, 2000);
-              } else {
-                console.log(`[WS] ❌ Hủy sync thread ${thread_id} sau 2 lần retry thất bại (reason=${reason})`);
-                global.syncRetries[thread_id] = 0;
-                const HistorySyncManager = require('./services/HistorySyncManager');
-                HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
-              }
-            } else {
-              const HistorySyncManager = require('./services/HistorySyncManager');
-              HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
-            }
+            // Never retry SYNC_THREAD_MESSAGES with a delayed timer. That message
+            // also performs tab navigation, so a retry for an older conversation
+            // can arrive after a newer click and pull Messenger back to the old
+            // user. A fresh user click is the only event allowed to navigate.
+            if (global.syncRetries) global.syncRetries[thread_id] = 0;
+            const HistorySyncManager = require('./services/HistorySyncManager');
+            HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
+            console.log(`[WS] Không retry điều hướng thread ${thread_id} (reason=${reason}); chờ click/yêu cầu mới.`);
             return; // Không ghi đè hoặc emit UI
           }
 
@@ -1306,6 +1393,49 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'CALL_ENDED': {
+          // Extension sends this when the call popup window closes.
+          // We save a call log message to DB and emit it to CRM via Socket.io.
+          const { thread_id: callThreadId, account_id: callAccountId, call_type: callCallType, call_label, duration_text, duration_ms, timestamp_ms: callTs } = msg.data || {};
+          if (!callThreadId) break;
+
+          const internalThreadId = resolveInternalThreadId(db, callAccountId || ws.accountId, callThreadId);
+          if (!internalThreadId) {
+            console.warn(`[WS] CALL_ENDED: Không tìm thấy thread ${callThreadId}`);
+            break;
+          }
+
+          const callContent = call_label || (callCallType === 'video' ? 'Cuộc gọi video' : 'Cuộc gọi thoại');
+          const callFbId = `call_ended_${internalThreadId}_${callTs || Date.now()}`;
+          const callTsMs = callTs || Date.now();
+
+          // Save to messages table
+          try {
+            db.prepare(`
+              INSERT OR IGNORE INTO messages
+                (thread_id, fb_message_id, sender_id, content, is_outgoing, direction_status, timestamp_ms, created_at)
+              VALUES (?, ?, 'CONTACT', ?, 0, 'confirmed', ?, CURRENT_TIMESTAMP)
+            `).run(internalThreadId, callFbId, callContent, callTsMs);
+          } catch (dbErr) {
+            console.warn('[WS] CALL_ENDED: Lỗi lưu DB:', dbErr.message);
+          }
+
+          console.log(`[WS] 📞 CALL_ENDED: ${callContent} (${duration_text || '?'}) thread=${callThreadId}`);
+
+          // Emit to CRM immediately
+          io.emit('NEW_MESSAGE', {
+            thread_id: internalThreadId,
+            fb_message_id: callFbId,
+            content: callContent,
+            is_outgoing: false,
+            direction_status: 'confirmed',
+            source: 'call_log',
+            timestamp_ms: callTsMs,
+            status: 'sent'
+          });
+          break;
+        }
+
         default: break;
       }
     } catch (err) {
@@ -1339,7 +1469,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('REQUEST_SYNC_THREAD_MESSAGES', ({ account_id, thread_id, thread_url }) => {
+  socket.on('REQUEST_SYNC_THREAD_MESSAGES', ({ account_id, thread_id, thread_url, page_id, contact_name }) => {
     let targetAccId = account_id;
     if (!targetAccId && extensionConnections.size > 0) {
       targetAccId = extensionConnections.keys().next().value;
@@ -1355,12 +1485,78 @@ io.on('connection', (socket) => {
         mode = 'initial';
       }
       
-      console.log(`[Socket.io] Yêu cầu sync tin nhắn cho thread ${thread_id} (account ${targetAccId}) mode=${mode}`);
+      const pageSource = ConversationRepository.getThreadSource(thread_id);
+      const targetPageId = page_id || pageSource?.pageId || null;
+      let contactName = contact_name;
+      if (!contactName) {
+        const row = db.prepare('SELECT contact_name FROM threads WHERE id = ?').get(thread_id);
+        contactName = row?.contact_name || null;
+      }
+
+      console.log(`[Socket.io] Yêu cầu sync tin nhắn cho thread ${thread_id} (${contactName || 'unknown'}, account ${targetAccId}, page=${targetPageId || 'none'}) mode=${mode}`);
       extWs.send(JSON.stringify({
         type: 'SYNC_THREAD_MESSAGES',
-        data: { account_id: targetAccId, thread_id, thread_url, mode, cursor: syncState?.sync_cursor || null }
+        data: { account_id: targetAccId, thread_id, thread_url, page_id: targetPageId, mode, cursor: syncState?.sync_cursor || null, contact_name: contactName }
       }));
     }
+  });
+
+  socket.on('TRIGGER_CALL', ({ thread_id, call_type = 'audio', account_id }) => {
+    let targetAccId = account_id;
+    if (!targetAccId && thread_id) {
+      const thread = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(thread_id);
+      if (thread?.account_id) targetAccId = thread.account_id;
+    }
+    if (!targetAccId && extensionConnections.size > 0) {
+      targetAccId = extensionConnections.keys().next().value;
+    }
+    if (!targetAccId || !thread_id) {
+      socket.emit('CALL_TRIGGER_RESPONSE', { success: false, error: 'Thiếu thông tin tài khoản hoặc hội thoại' });
+      return;
+    }
+
+    const extWs = extensionConnections.get(targetAccId);
+    if (extWs && extWs.readyState === WebSocket.OPEN) {
+      console.log(`[Socket.io] 📞 Yêu cầu kích hoạt cuộc gọi Messenger ${call_type} cho thread ${thread_id} (account ${targetAccId})`);
+      extWs.send(JSON.stringify({
+        type: 'TRIGGER_MESSENGER_CALL',
+        data: { account_id: targetAccId, thread_id, call_type }
+      }));
+      socket.emit('CALL_TRIGGER_RESPONSE', { success: true, message: 'Đã gửi lệnh kích hoạt cuộc gọi tới Extension' });
+    } else {
+      console.warn(`[Socket.io] Extension cho account ${targetAccId} chưa sẵn sàng WebSocket.`);
+      socket.emit('CALL_TRIGGER_RESPONSE', { success: false, error: 'Extension Facebook chưa được kết nối' });
+    }
+  });
+
+  socket.on('ANSWER_INCOMING_CALL', ({ action, thread_id, account_id } = {}) => {
+    if (action !== 'accept' && action !== 'decline') {
+      socket.emit('ANSWER_INCOMING_CALL_RESPONSE', { success: false, error: 'Hành động cuộc gọi không hợp lệ' });
+      return;
+    }
+
+    let targetAccId = account_id;
+    if (!targetAccId && thread_id) {
+      const thread = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(thread_id);
+      if (thread?.account_id) targetAccId = thread.account_id;
+    }
+    if (!targetAccId && extensionConnections.size > 0) {
+      targetAccId = extensionConnections.keys().next().value;
+    }
+
+    const extWs = targetAccId ? extensionConnections.get(targetAccId) : null;
+    if (extWs && extWs.readyState === WebSocket.OPEN) {
+      console.log(`[Socket.io] 🎯 Gửi lệnh ${action} cuộc gọi tới Extension account ${targetAccId}`);
+      extWs.send(JSON.stringify({
+        type: 'ANSWER_INCOMING_CALL',
+        data: { action, thread_id: thread_id || null, account_id: targetAccId }
+      }));
+      socket.emit('ANSWER_INCOMING_CALL_RESPONSE', { success: true, action });
+      return;
+    }
+
+    console.warn('[Socket.io] Không tìm thấy Extension đang kết nối để điều khiển cuộc gọi.');
+    socket.emit('ANSWER_INCOMING_CALL_RESPONSE', { success: false, error: 'Extension Facebook chưa được kết nối' });
   });
 
   socket.on('SEND_MESSAGE', async (payload = {}) => {
@@ -1648,6 +1844,23 @@ app.delete(
     }
   }
 );
+
+// Serve campaign-attachment images for in-chat preview (local_media_path stores absolute path,
+// but the browser can only fetch via HTTP - use a thin proxy route to pipe the file contents).
+const CAMPAIGN_ATTACHMENTS_DIR = path.join(__dirname, '../../data/campaign-attachments');
+app.get('/api/campaign-attachments/:filename', requireLocalCrmRequest, (req, res) => {
+  try {
+    const filename = path.basename(req.params.filename); // strip any traversal
+    const filePath = path.join(CAMPAIGN_ATTACHMENTS_DIR, filename);
+    if (!filePath.startsWith(CAMPAIGN_ATTACHMENTS_DIR)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    res.set('Cache-Control', 'private, max-age=86400');
+    res.sendFile(filePath);
+  } catch (err) {
+    res.status(404).json({ error: 'File không tồn tại' });
+  }
+});
 
 app.get(
   '/api/outbound-attachments/:attachmentId/content',

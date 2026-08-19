@@ -158,7 +158,7 @@ class ConversationRepository {
       INSERT INTO messages (thread_id, fb_message_id, sender_id, content, timestamp_ms, timestamp_source, is_outgoing, direction_status, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(fb_message_id) DO UPDATE SET
-        content = COALESCE(excluded.content, messages.content),
+        content = CASE WHEN excluded.content IS NOT NULL AND excluded.content <> '' THEN excluded.content ELSE messages.content END,
         timestamp_ms = CASE WHEN excluded.timestamp_ms > messages.timestamp_ms THEN excluded.timestamp_ms ELSE messages.timestamp_ms END,
         timestamp_source = CASE WHEN excluded.timestamp_source <> 'fallback' THEN excluded.timestamp_source ELSE messages.timestamp_source END,
         created_at = CASE WHEN excluded.timestamp_ms > 0 THEN excluded.created_at ELSE messages.created_at END,
@@ -275,7 +275,8 @@ class ConversationRepository {
           timestamp_source = CASE WHEN ? = 1 THEN ? ELSE timestamp_source END,
           created_at = CASE WHEN ? = 1 THEN ? ELSE created_at END,
           is_outgoing = CASE WHEN ? = 1 THEN ? ELSE is_outgoing END,
-          direction_status = CASE WHEN ? = 1 THEN 'confirmed' ELSE direction_status END
+          direction_status = CASE WHEN ? = 1 THEN 'confirmed' ELSE direction_status END,
+          content = CASE WHEN (content IS NULL OR content = '') AND (? IS NOT NULL AND ? != '') THEN ? ELSE content END
       WHERE fb_message_id = ?
     `).run(
       shouldUpdateTimestamp ? 1 : 0, tsMs,
@@ -283,6 +284,7 @@ class ConversationRepository {
       shouldUpdateTimestamp ? 1 : 0, createdAt,
       shouldUpdateDirection ? 1 : 0, normalizedOutgoing,
       shouldUpdateDirection ? 1 : 0,
+      content, content, content,
       stableMessageId
     );
 
