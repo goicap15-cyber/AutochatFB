@@ -94,35 +94,54 @@ if (isBusiness) {
     let isScanning = false;
 
     function resolveCurrentThreadId() {
-        const urlParams = new URLSearchParams(window.location.search);
-        let threadId = urlParams.get('selected_item_id');
+        const href = window.location.href;
+        const urlMatch = href.match(/[?&](?:selected_item_id|thread_id)=(\d+)/) || href.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/);
+        if (urlMatch && urlMatch[1]) {
+            return urlMatch[1];
+        }
 
-        if (!threadId) {
-            const selectors = [
-                '[role="navigation"] [aria-selected="true"] a',
-                '[role="gridcell"] a[href*="selected_item_id="]',
-                'div[role="navigation"] a[aria-current="page"]',
-                'a[href*="selected_item_id="]',
-                'a[href*="/messages/t/"]'
-            ];
-
-            for (const sel of selectors) {
-                const els = document.querySelectorAll(sel);
-                for (const el of els) {
-                    if (el.href) {
-                        const match = el.href.match(/selected_item_id=(\d+)/) || el.href.match(/\/messages\/t\/(\d+)/);
-                        if (match) {
-                            threadId = match[1];
-                            break;
-                        }
-                    }
-                }
-                if (threadId) break;
+        // DOM Fallback: Find currently selected item in Business Suite sidebar
+        const selectedContainer = document.querySelector('[aria-selected="true"]') ||
+                                  document.querySelector('[aria-current="page"]') ||
+                                  document.querySelector('[aria-current="true"]');
+        if (selectedContainer) {
+            const links = selectedContainer.tagName === 'A' ? [selectedContainer] : Array.from(selectedContainer.querySelectorAll('a[href]'));
+            for (const link of links) {
+                const linkHref = link.getAttribute('href') || link.href || '';
+                const m = linkHref.match(/(?:selected_item_id|thread_id)=(\d+)/) || linkHref.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/);
+                if (m && m[1]) return m[1];
             }
         }
 
-        return threadId || 'UNKNOWN_THREAD';
+        const selectors = [
+            '[role="navigation"] [aria-selected="true"] a',
+            '[role="gridcell"] a[href*="selected_item_id="]',
+            'div[role="navigation"] a[aria-current="page"]',
+            'a[href*="selected_item_id="]',
+            'a[href*="/messages/t/"]'
+        ];
+
+        for (const sel of selectors) {
+            const els = document.querySelectorAll(sel);
+            for (const el of els) {
+                const linkHref = el.getAttribute('href') || el.href || '';
+                const match = linkHref.match(/(?:selected_item_id|thread_id)=(\d+)/) || linkHref.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/);
+                if (match && match[1]) {
+                    return match[1];
+                }
+            }
+        }
+
+        return 'UNKNOWN_THREAD';
     }
+
+    window.addEventListener('popstate', () => setTimeout(scanForMessages, 300));
+    window.addEventListener('hashchange', () => setTimeout(scanForMessages, 300));
+    document.addEventListener('click', (e) => {
+        if (e.target?.closest?.('[role="listitem"], [role="row"], a[href]')) {
+            setTimeout(scanForMessages, 500);
+        }
+    }, true);
 
     function isLikelyBacklog(threadId) {
         if (threadId !== lastKnownThreadId) {
@@ -189,9 +208,13 @@ if (isBusiness) {
     // Business Suite sidebar conversation list has its own avatar thumbnails
     // that must never leak into the currently-open thread's contact info.
     function findMessageListContainer() {
-        const anchor = document.querySelector('[data-message-id]');
-        if (!anchor) return null;
-        let curr = anchor.parentElement;
+        const anchor = document.querySelector('[data-message-id]')
+            || document.querySelector('[role="main"]')
+            || document.querySelector('[role="grid"]')
+            || document.querySelector('[aria-label*="Đoạn chat"]')
+            || document.querySelector('[aria-label*="tin nhắn"]');
+        if (!anchor) return document.body;
+        let curr = anchor.parentElement || anchor;
         while (curr && curr !== document.body) {
             if (curr.getAttribute) {
                 const label = (curr.getAttribute('aria-label') || '').toLowerCase();
@@ -205,7 +228,7 @@ if (isBusiness) {
             }
             curr = curr.parentElement;
         }
-        return null;
+        return anchor.parentElement || document.body;
     }
 
     // Direction is measured relative to the actual message-list container.
@@ -381,6 +404,46 @@ if (isBusiness) {
                 const { isInsideMessageBubble, inChatContainer } = walkBubbleAncestors(wrapperEl, messageListContainer);
                 forwardResolvedMessage(wrapperEl, wrapperEl, fbMessageId, isInsideMessageBubble, inChatContainer, resolvedContent, messageListContainer);
             }
+
+            // Pass 3 (Call Log): Quét span[dir="auto"] TRONG KHUNG CHAT (messageListContainer)
+            var callSpans = messageListContainer ? messageListContainer.querySelectorAll('span[dir="auto"]') : [];
+            for (var ci = 0; ci < callSpans.length; ci++) {
+                var spanEl = callSpans[ci];
+                var spanText = (spanEl.textContent || '').trim();
+                var lowerSpan = spanText.toLowerCase();
+                if (!spanText) continue;
+                if (!lowerSpan.includes('cuộc gọi') && !lowerSpan.includes('nhỡ') && !lowerSpan.includes('bỏ lỡ')) continue;
+
+                var { isInsideMessageBubble, inChatContainer } = walkBubbleAncestors(spanEl, messageListContainer);
+                if (!inChatContainer || !isInsideMessageBubble) continue;
+
+                var threadId = resolveCurrentThreadId();
+                if (!threadId || threadId === 'UNKNOWN_THREAD') continue;
+                var callId = 'call_' + threadId + '_' + spanText.replace(/\s+/g, '_');
+
+                if (processedHashes.has(callId)) continue;
+                processedHashes.add(callId);
+
+                console.log('[CALL_SCANNER] Phat hien cuoc goi: "' + spanText + '" | ID: ' + callId);
+
+                chrome.runtime.sendMessage({
+                    type: 'NEW_PAGE_MESSAGE_FROM_DOM',
+                    data: {
+                        thread_id: threadId,
+                        fb_message_id: callId,
+                        content: spanText,
+                        is_outgoing: false,
+                        direction_status: 'confirmed',
+                        direction_source: 'call_log_pass',
+                        direction_confidence: 'high',
+                        source: 'page_dom_observer',
+                        timestamp_ms: Date.now(),
+                        timestamp_source: 'realtime_fallback',
+                        contact_name: currentContactName || null
+                    }
+                });
+            }
+
         } finally {
             isScanning = false;
         }
@@ -441,6 +504,12 @@ if (isBusiness) {
     // aria-label is only read on the role="img" div path below.
     function resolveMessageContent(messageIdNode) {
         const fullText = (messageIdNode.innerText || messageIdNode.textContent || '').trim();
+
+        // Call Log Guard: Never treat a call notification wrapper (which may contain avatar/icon <img>) as an image attachment!
+        const lowerFullText = fullText.toLowerCase();
+        if (fullText && (lowerFullText.includes('cuộc gọi') || lowerFullText.includes('bỏ lỡ') || lowerFullText.includes('đã nhỡ') || lowerFullText.includes('nhỡ'))) {
+            return { kind: 'text', text: fullText };
+        }
 
         // Spec 040 T020: a message can combine real caption text with an
         // attached image in the SAME [data-message-id] wrapper - confirmed
@@ -570,6 +639,13 @@ if (isBusiness) {
         const isMedia = resolvedContent.kind === 'media';
         const text = isMedia ? (resolvedContent.caption || '') : resolvedContent.text;
 
+        const isCallLog = Boolean(text && (
+            text.includes('Cuộc gọi thoại') ||
+            text.includes('Cuộc gọi video') ||
+            text.includes('cuộc gọi') ||
+            text.includes('bỏ lỡ')
+        ));
+
         // Keep identity stable across pending -> confirmed direction updates.
         const dedupKey = fbMessageId || text + '_' + (isOutgoing === null ? 'unknown' : isOutgoing);
         const hash = threadId + '_' + dedupKey;
@@ -591,8 +667,8 @@ if (isBusiness) {
         // (its identity/container check above already gates it).
         if (!isMedia) {
             const lowerText = text.toLowerCase();
-            if (!isInsideMessageBubble) {
-                const sysTexts = ['xem thêm', 'đang tải...', 'bắt đầu', 'tin nhắn', 'chưa đọc'];
+            if (!isInsideMessageBubble && !isCallLog) {
+                const sysTexts = ['xem thêm', 'đang tải...', 'chưa đọc'];
                 if (sysTexts.some(t => lowerText.includes(t))) return;
             }
 

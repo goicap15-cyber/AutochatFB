@@ -77,13 +77,25 @@ class MessageQueueRepository {
       ).get(clientMessageId, pendingFbId);
       let messageId = existingMessage?.id || null;
       if (!messageId) {
+        const hasAttachment = !!(messageData.attachment_id || messageData.attachment_path);
+        const mediaType = messageData.attachment_media_type || messageData.media_type || (hasAttachment ? 'image' : 'text');
+        // Convert the absolute local path to a URL the browser can fetch.
+        // The server exposes campaign-attachment files at /api/campaign-attachments/<filename>.
+        let localMediaPath = null;
+        if (messageData.attachment_path) {
+          const fname = messageData.attachment_path.replace(/\\/g, '/').split('/').pop();
+          localMediaPath = '/api/campaign-attachments/' + fname;
+        }
+
         const result = database.prepare(
-          "INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, is_outgoing, delivery_status) VALUES (?, ?, ?, 'SYSTEM', ?, 1, 'pending')"
+          "INSERT INTO messages (thread_id, fb_message_id, client_message_id, sender_id, content, local_media_path, media_type, is_outgoing, delivery_status) VALUES (?, ?, ?, 'SYSTEM', ?, ?, ?, 1, 'pending')"
         ).run(
           messageData.thread_id,
           pendingFbId,
           clientMessageId,
-          messageData.content || ''
+          messageData.content || '',
+          localMediaPath,
+          mediaType
         );
         messageId = result.lastInsertRowid;
       }

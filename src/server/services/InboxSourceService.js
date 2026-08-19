@@ -141,6 +141,36 @@ class InboxSourceService {
     if (!thread || !thread.source_id) return null;
     return this.getSourceById(thread.source_id, database);
   }
+  /**
+   * Ensure a page_messenger source exists for pageId, then bind threadId to it.
+   * Called automatically when page_dom_observer reports a message with a page_id.
+   */
+  static ensurePageSource({ pageId, accountId, threadId, pageName }, database = getDb()) {
+    if (!pageId) return null;
+    const sourceId = 'src_page_' + pageId;
+
+    // 1. Upsert inbox_source row (idempotent)
+    const existing = database.prepare('SELECT id FROM inbox_sources WHERE id = ?').get(sourceId);
+    if (!existing) {
+      database.prepare(`
+        INSERT OR IGNORE INTO inbox_sources
+          (id, source_type, owner_account_id, external_id, display_name, status)
+        VALUES (?, 'page_messenger', ?, ?, ?, 'ACTIVE')
+      `).run(sourceId, accountId || null, String(pageId), pageName || ('Page ' + pageId));
+      console.log(`[PAGE_SOURCE] ✅ Tự động tạo page source: ${sourceId} (Page ${pageId})`);
+    }
+
+    // 2. Bind thread → source if not already correct
+    if (threadId) {
+      const thread = database.prepare('SELECT source_id FROM threads WHERE id = ?').get(String(threadId));
+      if (thread && thread.source_id !== sourceId) {
+        database.prepare('UPDATE threads SET source_id = ? WHERE id = ?').run(sourceId, String(threadId));
+        console.log(`[PAGE_SOURCE] 🔗 Thread ${threadId} gán sang source ${sourceId} (Page ${pageId})`);
+      }
+    }
+
+    return this.getSourceById(sourceId, database);
+  }
 }
 
 module.exports = InboxSourceService;

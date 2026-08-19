@@ -38,6 +38,7 @@ export default function ChatHeader({
   onResumeAi,
   onOpenSearch,
   onShowLeadPanel,
+  onStartCall,
   showBackButton = false,
   onGoBack
 }) {
@@ -110,10 +111,10 @@ export default function ChatHeader({
       </div>
 
       <div className="flex items-center gap-1 shrink-0 ml-3">
-        <HeaderIconButton title="Gọi điện">
+        <HeaderIconButton title="Gọi điện thoại Messenger" onClick={() => onStartCall?.('audio')}>
           <Phone size={19} strokeWidth={1.9} />
         </HeaderIconButton>
-        <HeaderIconButton title="Video">
+        <HeaderIconButton title="Gọi video Messenger" onClick={() => onStartCall?.('video')}>
           <Video size={19} strokeWidth={1.9} />
         </HeaderIconButton>
         <HeaderIconButton title="Tìm trong hội thoại" onClick={onOpenSearch} className="text-[var(--color-text-secondary)] hover:text-[var(--color-accent)]">
