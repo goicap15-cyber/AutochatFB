@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { isInvalidContactName } = require('../utils/textFilter');
 let defaultDb;
 function getDefaultDb() {
   if (!defaultDb) defaultDb = require('../database/db');
@@ -38,35 +39,39 @@ class ConversationRepository {
     const { id, account_id, thread_url, contact_name, last_message, is_unread, source_id } = threadData;
     const external_thread_id = String(threadData.external_thread_id || threadData.thread_id || id);
     const preferredId = String(id || external_thread_id);
+    const cleanIncomingName = isInvalidContactName(contact_name) ? null : contact_name.trim();
 
     let existing = null;
     if (source_id && external_thread_id) {
       existing = database.prepare(`
-        SELECT id FROM threads
+        SELECT id, contact_name FROM threads
         WHERE source_id = ? AND COALESCE(external_thread_id, id) = ?
       `).get(source_id, external_thread_id);
     }
     if (!existing && account_id && external_thread_id) {
       existing = database.prepare(`
-        SELECT id FROM threads
+        SELECT id, contact_name FROM threads
         WHERE account_id = ? AND COALESCE(external_thread_id, id) = ?
       `).get(account_id, external_thread_id);
     }
     if (!existing) {
-      existing = database.prepare('SELECT id FROM threads WHERE id = ?').get(preferredId);
+      existing = database.prepare('SELECT id, contact_name FROM threads WHERE id = ?').get(preferredId);
     }
 
     if (existing) {
+      const existingIsInvalid = isInvalidContactName(existing.contact_name);
+      let targetName = existing.contact_name;
+      if (cleanIncomingName && cleanIncomingName !== 'Khách hàng') {
+        targetName = cleanIncomingName;
+      } else if (existingIsInvalid || !existing.contact_name) {
+        targetName = cleanIncomingName || 'Khách hàng';
+      }
+
       database.prepare(`
         UPDATE threads
         SET external_thread_id = COALESCE(external_thread_id, ?),
             source_id = COALESCE(?, source_id),
-            contact_name = CASE
-              WHEN ? IS NULL THEN contact_name
-              WHEN ? != 'Khách hàng' THEN ?
-              WHEN contact_name IS NULL THEN ?
-              ELSE contact_name
-            END,
+            contact_name = ?,
             thread_url = COALESCE(?, thread_url),
             last_message = COALESCE(?, last_message),
             is_unread = COALESCE(?, is_unread)
@@ -74,7 +79,7 @@ class ConversationRepository {
       `).run(
           external_thread_id, 
           source_id || null, 
-          contact_name, contact_name, contact_name, contact_name, 
+          targetName,
           thread_url, 
           last_message, 
           is_unread === undefined ? null : (is_unread ? 1 : 0), 
@@ -86,7 +91,7 @@ class ConversationRepository {
     database.prepare(`
       INSERT INTO threads (id, external_thread_id, account_id, source_id, thread_url, contact_name, last_message, is_unread)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(preferredId, external_thread_id, account_id, source_id || null, thread_url, contact_name, last_message, is_unread === undefined ? 1 : (is_unread ? 1 : 0));
+    `).run(preferredId, external_thread_id, account_id, source_id || null, thread_url, cleanIncomingName || 'Khách hàng', last_message, is_unread === undefined ? 1 : (is_unread ? 1 : 0));
     return this.getThread(preferredId, database);
   }
 
@@ -212,7 +217,7 @@ class ConversationRepository {
   // is_outgoing when it disagrees with what's stored - but only once that
   // disagreement is confirmed twice (see shouldCommitDirectionFlip). Never
   // inserts a second row and never throws on repeated identical re-scans.
-  static reconcileExistingMessage(stableMessageId, { source, isOutgoing, directionStatus, direction_status, directionConfidence, direction_confidence, tsMs, tsSource, createdAt } = {}, database = getDefaultDb()) {
+  static reconcileExistingMessage(stableMessageId, { source, isOutgoing, directionStatus, direction_status, directionConfidence, direction_confidence, tsMs, tsSource, createdAt, content = null } = {}, database = getDefaultDb()) {
     const existingMsg = database.prepare('SELECT timestamp_source, is_outgoing, direction_status FROM messages WHERE fb_message_id = ?').get(stableMessageId);
     if (!existingMsg) return { updated: false, reason: 'not_found' };
 

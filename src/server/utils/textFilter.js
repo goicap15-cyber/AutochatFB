@@ -90,7 +90,44 @@ function cleanMessageText(rawText) {
   return text;
 }
 
+const INVALID_CONTACT_NAME_PATTERNS = [
+  /^(?:Tất cả tin nhắn|Tất cả|All messages|All)$/i,
+  /^(?:Tin nhắn trực tiếp|Direct messages)$/i,
+  /^(?:Hộp thư đến|Hộp thư|Inbox)$/i,
+  /^(?:Chưa đọc|Unread)$/i,
+  /^(?:Đã xong|Done)$/i,
+  /^(?:Gắn dấu sao|Đã gắn dấu sao|Starred)$/i,
+  /^(?:Spam|Thư rác)$/i,
+  /^(?:Bình luận.*|Comments.*)$/i,
+  /^(?:Thông báo|Notifications)$/i,
+  /^(?:Đang hoạt động.*|Hoạt động(?:\s+\d+.*)?|Đã hoạt động.*|Active now|Active recently|Active \d+.*|Online|Offline)$/i,
+  /^(?:Đang|Loading|Đang tải)[.…]*$/i,
+  /^(?:Nhấn Enter để gửi|Press Enter to send)$/i,
+  /^(?:Tin nhắn và cuộc gọi.*|bảo mật.*)$/i,
+  /^(?:Facebook|Messenger|Meta)$/i
+];
+
+function isInvalidContactName(name) {
+  if (!name || typeof name !== 'string') return true;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length < 2) return true;
+  for (const pat of INVALID_CONTACT_NAME_PATTERNS) {
+    if (pat.test(trimmed)) return true;
+  }
+  return false;
+}
+
+function cleanContactName(rawName, fallback = 'Khách hàng') {
+  if (!rawName || typeof rawName !== 'string') return fallback;
+  const trimmed = rawName.trim();
+  if (isInvalidContactName(trimmed)) return fallback;
+  return trimmed;
+}
+
 module.exports = {
   isSystemOrMetadataText,
-  cleanMessageText
+  cleanMessageText,
+  isInvalidContactName,
+  cleanContactName
 };
+

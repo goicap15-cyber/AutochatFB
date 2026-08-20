@@ -15,7 +15,8 @@
     "tabs",
     "storage",
     "scripting",
-    "debugger"
+    "debugger",
+    "alarms"
   ],
   "host_permissions": [
     "https://*.facebook.com/*",

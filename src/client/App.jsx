@@ -965,7 +965,7 @@ export default function App() {
             <MessageList
               messages={activeMessages}
               activeThread={selectedThread}
-              onSyncThread={() => socket?.emit('REQUEST_SYNC_THREADS', { account_id: selectedThread?.account_id })}
+              onSyncThread={() => requestThreadNavigation(selectedThread)}
               onRetryMessage={handleRetryMessage}
             />
             <MessageComposer
@@ -999,7 +999,7 @@ export default function App() {
 
       {/* Modals */}
       {activeModal === 'search' && <SearchOverlay onClose={() => setActiveModal(null)} onSelectThread={(tid) => { setActiveThreadId(tid); setActiveModal(null); }} />}
-      {activeModal === 'accounts' && <AccountManagerModal onClose={() => { setActiveModal(null); loadAccounts(); loadInboxSources(); }} onSourcesChanged={() => { loadInboxSources(); loadThreads(); }} />}
+      {activeModal === 'accounts' && <AccountManagerModal socket={socket} onClose={() => { setActiveModal(null); loadAccounts(); loadInboxSources(); }} onSourcesChanged={() => { loadInboxSources(); loadThreads(); }} />}
       {activeModal === 'autoReply' && <AutoReplyModal onClose={() => setActiveModal(null)} />}
       {activeModal === 'campaigns' && (
         <CampaignCreateModal

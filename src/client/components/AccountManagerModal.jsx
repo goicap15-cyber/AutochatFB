@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useContext } from 'react';
 import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle } from 'lucide-react';
 
-export default function AccountManagerModal({ onClose, onSourcesChanged }) {
+export default function AccountManagerModal({ onClose, onSourcesChanged, socket }) {
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [startingId, setStartingId] = useState(null);
@@ -12,8 +12,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
   const [pageOwnerAccountId, setPageOwnerAccountId] = useState('');
   const [pageConnectError, setPageConnectError] = useState('');
   const [pageConnectLoading, setPageConnectLoading] = useState(false);
-
-  const [initialAccountCount, setInitialAccountCount] = useState(null);
+  const [initialAccountIds, setInitialAccountIds] = useState(null);
 
   const loadInboxSources = async () => {
     try {
@@ -30,11 +29,10 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
       const res = await fetch('/api/accounts');
       const data = await res.json();
       setAccounts(data);
+      return data;
     } catch {
-      setAccounts([
-        { id: '100088912345678', name: 'FB Sales 01', status: 'CHECKPOINT', broadcast_daily_count: 12 },
-        { id: '100099876543210', name: 'FB CSKH 02', status: 'ACTIVE', broadcast_daily_count: 45 }
-      ]);
+      setAccounts([]);
+      return [];
     } finally {
       setLoading(false);
     }
@@ -47,14 +45,24 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
     return () => clearInterval(interval);
   }, []);
 
+  // Lắng nghe ACCOUNT_STATUS_CHANGED từ socket để biết ngay khi tài khoản mới được đăng ký
   useEffect(() => {
-    if (addingSession && accounts.length > 0) {
-      if (initialAccountCount !== null && accounts.length > initialAccountCount) {
+    if (!socket) return;
+    const handleAccountStatus = (data) => {
+      if (addingSession && initialAccountIds && !initialAccountIds.has(data.account_id)) {
+        // Tài khoản mới đã được backend xác nhận
         setAddingSession(false);
         setPendingKey(null);
+        setInitialAccountIds(null);
+        loadAccounts();
+        onSourcesChanged?.();
+      } else {
+        loadAccounts();
       }
-    }
-  }, [accounts, addingSession, initialAccountCount]);
+    };
+    socket.on('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
+    return () => socket.off('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
+  }, [socket, addingSession, initialAccountIds, onSourcesChanged]);
 
   const handleStartChrome = async (accountId) => {
     setStartingId(accountId);
@@ -69,7 +77,9 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
   };
 
   const handleAddNewAccount = async () => {
-    setInitialAccountCount(accounts.length);
+    const currentAccounts = await loadAccounts();
+    const currentIds = new Set(currentAccounts.map((a) => a.id));
+    setInitialAccountIds(currentIds);
     setAddingSession(true);
     try {
       const res = await fetch('/api/accounts/new-session', { method: 'POST' });
@@ -78,10 +88,12 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
         setPendingKey(data.pending_key);
       } else {
         setAddingSession(false);
+        setInitialAccountIds(null);
       }
     } catch (e) {
       console.error(e);
       setAddingSession(false);
+      setInitialAccountIds(null);
     }
   };
 
@@ -123,7 +135,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800">
           <div className="flex items-center gap-2">
             <ShieldAlert size={18} className="text-slate-300" />
-            <h3 className="text-xs font-semibold text-slate-100 uppercase tracking-wider">Quản lý Tài khoản Facebook & Checkpoint</h3>
+            <h3 className="text-xs font-semibold text-slate-100 uppercase tracking-wider">Quản lý Tài khoản Facebook &amp; Checkpoint</h3>
           </div>
           <button onClick={onClose} className="text-slate-500 hover:text-slate-300 p-1">
             <X size={16} />
@@ -168,7 +180,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
               </div>
               <button
                 type="button"
-                onClick={() => { setAddingSession(false); setPendingKey(null); }}
+                onClick={() => { setAddingSession(false); setPendingKey(null); setInitialAccountIds(null); }}
                 className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-medium shrink-0 border border-slate-700/60 transition-colors"
               >
                 Hủy
@@ -176,7 +188,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
             </div>
           )}
 
-
+          {/* Kết nối Page Messenger */}
           <div className="border-t border-slate-800 pt-4 space-y-3">
             <div>
               <h4 className="text-xs font-semibold text-slate-100 uppercase tracking-wider">Kết nối Page Messenger</h4>
@@ -222,57 +234,24 @@ export default function AccountManagerModal({ onClose, onSourcesChanged }) {
             </div>
           </div>
 
+          {/* Danh sách tài khoản cá nhân */}
           {loading ? (
             <div className="py-8 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
               <RefreshCw size={14} className="animate-spin" /> Đang tải danh sách...
             </div>
           ) : accounts.length === 0 ? (
             <div className="py-8 text-center text-slate-500 text-xs">
-              Chưa có tài khoản Facebook kết nối. Bấm nút "+ Thêm tài khoản Facebook" để kết nối tài khoản đầu tiên.
+              Chưa có tài khoản Facebook kết nối. Bấm nút &quot;+ Thêm tài khoản Facebook&quot; để kết nối tài khoản đầu tiên.
             </div>
           ) : (
             <div className="space-y-2.5">
               {accounts.map((acc) => {
                 const isCheckpoint = acc.status === 'CHECKPOINT';
-
-                const handleConnectPage = async () => {
-    setPageConnectError('');
-    if (!pageToken.trim()) {
-      setPageConnectError('Thiếu Page access token');
-      return;
-    }
-    setPageConnectLoading(true);
-    try {
-      const res = await fetch('/api/inbox-sources/page', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ page_access_token: pageToken.trim(), owner_account_id: pageOwnerAccountId || null })
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Không kết nối được Page');
-      setPageToken('');
-      await loadInboxSources();
-      onSourcesChanged?.();
-    } catch (err) {
-      setPageConnectError(err.message);
-    } finally {
-      setPageConnectLoading(false);
-    }
-  };
-
-  const handleDisconnectSource = async (sourceId) => {
-    await fetch(`/api/inbox-sources/${sourceId}`, { method: 'DELETE' });
-    await loadInboxSources();
-    onSourcesChanged?.();
-  };
-
-  return (
+                return (
                   <div
                     key={acc.id}
                     className={`p-3.5 rounded-lg border flex items-center justify-between gap-3 ${
-                      isCheckpoint
-                        ? 'bg-slate-950 border-red-500/40'
-                        : 'bg-slate-950 border-slate-800'
+                      isCheckpoint ? 'bg-slate-950 border-red-500/40' : 'bg-slate-950 border-slate-800'
                     }`}
                   >
                     <div className="flex items-center gap-3">

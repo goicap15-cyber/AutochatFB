@@ -5,7 +5,16 @@
 
   // Bắt crm_pending_key từ URL nếu có và lưu vào chrome.storage.local
   const urlParams = new URLSearchParams(window.location.search);
-  const pendingKeyFromUrl = urlParams.get('crm_pending_key');
+  let pendingKeyFromUrl = urlParams.get('crm_pending_key');
+  if (!pendingKeyFromUrl) {
+    const nextParam = urlParams.get('next');
+    if (nextParam) {
+      try {
+        const nextUrl = new URL(nextParam, window.location.origin);
+        pendingKeyFromUrl = nextUrl.searchParams.get('crm_pending_key');
+      } catch (_) {}
+    }
+  }
   if (pendingKeyFromUrl) {
     try {
       if (chrome?.storage?.local) {
@@ -110,6 +119,15 @@
         }
       } catch (e) {}
     }
+    if (event.data && event.data.type === 'FB_TOKEN_DISCOVERED') {
+      if (event.data.fb_dtsg) {
+        capturedFbDtsg = event.data.fb_dtsg;
+        capturedUserId = capturedUserId || document.cookie.match(/c_user=(\d+)/)?.[1] || null;
+        if (capturedFbDtsg && capturedUserId) {
+          reportTokens(capturedFbDtsg, capturedUserId);
+        }
+      }
+    }
   });
 
   const processedKeys = new Set();
@@ -117,16 +135,16 @@
   const recentDomEmits = new Map();
 
   function reportTokens(fb_dtsg, user_id) {
-    if (!fb_dtsg || !user_id) return;
+    if (!user_id) return;
     try {
       if (chrome?.runtime?.id) {
         if (chrome?.storage?.local) {
           chrome.storage.local.get(['crm_pending_key'], (res) => {
             const pending_key = res?.crm_pending_key || pendingKeyFromUrl || null;
-            chrome.runtime.sendMessage({ type: 'FB_TOKENS_EXTRACTED', data: { fb_dtsg, user_id, pending_key } });
+            chrome.runtime.sendMessage({ type: 'FB_TOKENS_EXTRACTED', data: { fb_dtsg: fb_dtsg || '', user_id, pending_key } });
           });
         } else {
-          chrome.runtime.sendMessage({ type: 'FB_TOKENS_EXTRACTED', data: { fb_dtsg, user_id, pending_key: pendingKeyFromUrl || null } });
+          chrome.runtime.sendMessage({ type: 'FB_TOKENS_EXTRACTED', data: { fb_dtsg: fb_dtsg || '', user_id, pending_key: pendingKeyFromUrl || null } });
         }
       }
     } catch (e) { }
@@ -144,7 +162,7 @@
         if (uMatch) capturedUserId = uMatch[1];
       }
       if (!capturedFbDtsg) {
-        if (text.includes('DTSGInitialData') || text.includes('fb_dtsg') || text.includes('token')) {
+        if (text.includes('DTSGInitialData') || text.includes('DTSGInitData') || text.includes('fb_dtsg')) {
           const match = text.match(/"token":"([^"]+)"/) || text.match(/"fb_dtsg":"([^"]+)"/) || text.match(/"async_get_token":"([^"]+)"/);
           if (match) capturedFbDtsg = match[1];
         }
@@ -153,7 +171,7 @@
     const inputEl = document.querySelector('input[name="fb_dtsg"]');
     if (inputEl?.value) { capturedFbDtsg = inputEl.value; }
 
-    if (capturedFbDtsg && capturedUserId) {
+    if (capturedUserId) {
       reportTokens(capturedFbDtsg, capturedUserId);
     }
   }
@@ -669,16 +687,13 @@
       observerPaused = true;
       // Seed lần đầu với các node đang có sẵn
       seedBaseline(thread_id);
-      // Tiếp tục seed sau 2.5s để cover nốt lịch sử load chậm
+      // Tiếp tục seed sau 1.5s để cover nốt lịch sử load chậm
       setTimeout(() => {
         if (currentBaselineThreadId !== thread_id) return; // Tránh leak timeout sang thread khác nếu user chuyển quá nhanh
         seedBaseline(thread_id);
         observerPaused = false;
-      }, 2500);
-      return; // Bỏ qua toàn bộ mutations trong tick chuyển thread này (do chúng là lịch sử)
+      }, 1500);
     }
-
-    if (observerPaused) return;
 
     mutations.forEach(mutation => mutation.addedNodes.forEach(node => {
       if (node.nodeType !== 1) return;
@@ -690,9 +705,15 @@
       const parsedMessages = parseMessagesFromDOMNode(node, true);
       if (parsedMessages.length === 0) return;
 
+      // Nếu observer đang paused trong lúc load lịch sử, chỉ cho phép tin nhắn outgoing (vừa gửi) đi qua
+      const activeParsed = observerPaused
+        ? parsedMessages.filter(p => p.is_outgoing)
+        : parsedMessages;
+      if (activeParsed.length === 0) return;
+
       const contactAvatar = extractContactAvatarFromNode(node);
 
-      parsedMessages.forEach((parsed) => {
+      activeParsed.forEach((parsed) => {
         // Ưu tiên network: nếu tin nhắn này đã được bắt bởi network trong 2 giây qua, bỏ qua DOM observer
         const networkTime = recentNetworkEmits.get(`${thread_id}:${parsed.content}`);
         if (networkTime && Date.now() - networkTime < 2000) return;
@@ -921,6 +942,28 @@
   // ── Incoming Call Ringing Scanner ───────────────────────────────────────────
   // Detect the real Facebook controls; incoming-call overlays do not always keep
   // /messages/t/<id> in the active URL, so thread_id is optional for this event.
+  //
+  // Facebook's own call overlay shows the caller's name twice (once as a
+  // heading, once inside "<name> đang gọi cho bạn") plus a "Cuộc gọi đến"
+  // label - grabbing dialogRoot.textContent wholesale concatenates all of
+  // that with no separators ("Cuộc gọi đếnLê Văn KhangLê Văn Khang đang gọi
+  // cho bạn..."). This trims the known leading/trailing labels and collapses
+  // an exact-duplicate name back down to one copy.
+  function extractCallerNameFromDialogText(rawText) {
+    if (!rawText) return '';
+    let working = rawText
+      .replace(/^Cuộc gọi (?:thoại |video )?đến/i, '')
+      .trim();
+    const cutIdx = working.search(/đang gọi cho bạn|cuộc gọi (?:thoại|video) đến|incoming (?:audio|video) call/i);
+    if (cutIdx !== -1) working = working.slice(0, cutIdx).trim();
+    if (working.length > 0 && working.length % 2 === 0) {
+      const half = working.length / 2;
+      const firstHalf = working.slice(0, half);
+      if (firstHalf === working.slice(half)) working = firstHalf;
+    }
+    return working;
+  }
+
   var _lastRingingKey = null;
   setInterval(function() {
     try {
@@ -966,7 +1009,7 @@
               type: 'INCOMING_CALL_RINGING',
               data: {
                 thread_id: threadId || null,
-                caller_name: callerText.substring(0, 60) || 'Khách hàng',
+                caller_name: extractCallerNameFromDialogText(callerText).substring(0, 60) || 'Khách hàng',
                 timestamp: Date.now()
               }
             });

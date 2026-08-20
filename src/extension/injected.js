@@ -35,6 +35,17 @@
   // 1. Intercept Fetch API
   const originalFetch = window.fetch;
   window.fetch = async function(...args) {
+    try {
+      if (args[1]?.body) {
+        const body = args[1].body;
+        if (typeof body === 'string' && body.includes('fb_dtsg=')) {
+          const m = body.match(/fb_dtsg=([^&]+)/);
+          if (m && m[1]) {
+            window.postMessage({ type: 'FB_TOKEN_DISCOVERED', fb_dtsg: decodeURIComponent(m[1]) }, '*');
+          }
+        }
+      }
+    } catch (_) {}
     const response = await originalFetch.apply(this, args);
     try {
       const url = args[0] ? (typeof args[0] === 'string' ? args[0] : args[0].url) : '';

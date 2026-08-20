@@ -57,6 +57,8 @@ if (isBusiness) {
     // real message at all.
     let unresolvedHashFirstSeenTick = new Map(); // hash -> firstSeenTick
     const MAX_UNRESOLVED_DIRECTION_TICKS = 5;
+    let lastReportedContactName = null;
+    let lastReportedAvatarUrl = null;
 
     // Verified via live DevTools inspection: Business Suite never exposes a real
     // per-message clock time (no data-timestamp/title/hover label). What DOM order
@@ -345,16 +347,67 @@ if (isBusiness) {
             // containment check this tick uses the exact same container node.
             const messageListContainer = findMessageListContainer();
 
-            if (!currentContactName || !currentAvatarUrl) {
-                const avatarImg = messageListContainer
-                    ? messageListContainer.querySelector('.x1q0g3np img[height="32"]')
-                    : null;
-                if (avatarImg) {
-                    const alt = avatarImg.getAttribute('alt');
-                    if (alt && !alt.toLowerCase().includes('đã xem')) {
-                        currentContactName = alt;
+            const isInvalidName = (n) => {
+                if (!n || typeof n !== 'string') return true;
+                const str = n.trim();
+                if (str.length < 2) return true;
+                const pat = /^(?:Tất cả tin nhắn|Tất cả|All messages|All|Tin nhắn trực tiếp|Direct messages|Hộp thư đến|Hộp thư|Inbox|Chưa đọc|Unread|Đã xong|Done|Gắn dấu sao|Đã gắn dấu sao|Starred|Spam|Thư rác|Bình luận.*|Comments.*|Thông báo|Notifications|Đang hoạt động.*|Hoạt động.*|Active now|Active recently|Online|Offline|Đang|Facebook|Messenger|Meta)$/i;
+                return pat.test(str) || str.toLowerCase().includes('đã xem');
+            };
+
+            const urlParams = new URLSearchParams(window.location.search);
+            const assetId = urlParams.get('asset_id') || null;
+
+            // 1. Trích xuất Tên khách hàng (currentContactName)
+            if (!currentContactName || isInvalidName(currentContactName)) {
+                // Ưu tiên thẻ title trong thread list / thread detail
+                const titleEl = document.querySelector('[data-surface*="thread_and_detail"] [data-surface*="thread_title"], [data-surface*="thread_title"]');
+                const titleTxt = (titleEl?.textContent || '').trim().split('\n')[0].trim();
+                if (titleTxt && !isInvalidName(titleTxt) && titleTxt.length >= 2 && titleTxt.length <= 80) {
+                    currentContactName = titleTxt;
+                }
+
+                // Header chính giữa hoặc thông tin chi tiết bên phải
+                if (!currentContactName || isInvalidName(currentContactName)) {
+                    const headerEls = document.querySelectorAll('[role="main"] header [dir="auto"], [role="main"] header h2, header [role="heading"], [data-surface*="contact_name"], [data-surface*="profile_header"]');
+                    for (const el of headerEls) {
+                        const txt = (el.textContent || '').trim().split('\n')[0].trim();
+                        if (txt && !isInvalidName(txt) && txt.length >= 2 && txt.length <= 80) {
+                            currentContactName = txt;
+                            break;
+                        }
                     }
-                    currentAvatarUrl = avatarImg.getAttribute('src');
+                }
+            }
+
+            // 2. Trích xuất Avatar URL (currentAvatarUrl)
+            if (!currentAvatarUrl) {
+                const avatarCandidates = document.querySelectorAll(
+                    '[data-surface*="thread_list"] img[src*="fbcdn.net"], [data-surface*="thread_list"] img[src*="scontent"], [data-surface*="thread_list"] img.img, [role="main"] header img, [data-surface*="thread_detail"] img, .x1q0g3np img, img[src*="fbcdn.net"], img[src*="scontent"]'
+                );
+                for (const img of avatarCandidates) {
+                    const src = img.getAttribute('src');
+                    if (src && src.startsWith('http') && !src.includes('rsrc.php') && !src.includes('static.xx.fbcdn')) {
+                        currentAvatarUrl = src;
+                        break;
+                    }
+                }
+            }
+
+            // Phát hiện metadata mới -> gửi ngay sang background (chỉ gửi khi có thay đổi)
+            if ((currentContactName && !isInvalidName(currentContactName)) || currentAvatarUrl) {
+                if (lastReportedContactName !== currentContactName || lastReportedAvatarUrl !== currentAvatarUrl) {
+                    lastReportedContactName = currentContactName;
+                    lastReportedAvatarUrl = currentAvatarUrl;
+                    chrome.runtime.sendMessage({
+                        type: 'UPDATE_THREAD_METADATA',
+                        data: {
+                            thread_id: currentThreadId,
+                            contact_name: currentContactName,
+                            avatar_url: currentAvatarUrl,
+                            page_id: assetId
+                        }
+                    });
                 }
             }
 

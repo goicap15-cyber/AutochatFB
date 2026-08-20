@@ -23,6 +23,8 @@ const OutboundDomCorrelationService = require('./services/OutboundDomCorrelation
 const PhoneCaptureService = require('./services/PhoneCaptureService');
 const CampaignPhoneCaptureService = require('./services/CampaignPhoneCaptureService');
 const GlobalPhoneAutomationService = require('./services/GlobalPhoneAutomationService');
+const HistorySyncRetryPolicy = require('./services/HistorySyncRetryPolicy');
+const SidebarSyncCooldown = require('./services/SidebarSyncCooldown');
 const { resolveInternalThreadId } = require('./utils/threadIdResolver');
 const http = require('http');
 const WebSocket = require('ws');
@@ -38,7 +40,7 @@ const broadcastEngine = require('./services/BroadcastEngine');
 const aiMediator = require('./services/AIMediator');
 const { extractLeadInfo } = require('./utils/leadExtractor');
 const { downloadAvatar, saveAvatarFromBase64OrUrl, serveAvatar } = require('./utils/avatarManager');
-const { isSystemOrMetadataText, cleanMessageText } = require('./utils/textFilter');
+const { isSystemOrMetadataText, cleanMessageText, isInvalidContactName, cleanContactName } = require('./utils/textFilter');
 const { isKnownPageSystemNotice } = require('./utils/pageSystemNotice');
 const ConversationRepository = require('./repositories/ConversationRepository');
 const MessageQueueRepository = require('./repositories/MessageQueueRepository');
@@ -336,13 +338,21 @@ wss.on('connection', (ws, req) => {
           domReplaySuppressUntil.set(account_id, Date.now() + 8000);
           ws.accountId = account_id;
 
-          let profileDir = `data/profiles/${account_id}`;
+          // profileDir: use pending_key path (new account setup), or keep existing from DB,
+          // or fallback to data/profiles/{account_id}.
+          let profileDir = null;
           if (pending_key) {
+            // New account just logged in via pending Chrome session
             profileDir = `data/profiles/${pending_key}`;
             if (processManager.processes.has(pending_key)) {
               const procData = processManager.processes.get(pending_key);
               processManager.processes.set(account_id, procData);
             }
+          } else {
+            // Reconnect of an existing account - preserve whatever profile_dir is already in DB.
+            // Only fall back to the default path if account is truly new (not in DB yet).
+            const existingAcc = db.prepare('SELECT profile_dir FROM accounts WHERE id = ?').get(account_id);
+            profileDir = existingAcc?.profile_dir || `data/profiles/${account_id}`;
           }
 
           const accName = name || `FB Account (${account_id})`;
@@ -352,13 +362,20 @@ wss.on('connection', (ws, req) => {
             VALUES (?, ?, ?, 'ACTIVE')
             ON CONFLICT(id) DO UPDATE SET
               name = COALESCE(excluded.name, accounts.name),
-              profile_dir = COALESCE(excluded.profile_dir, accounts.profile_dir),
+              profile_dir = CASE
+                WHEN excluded.profile_dir LIKE '%/pending_%' THEN excluded.profile_dir
+                ELSE COALESCE(accounts.profile_dir, excluded.profile_dir)
+              END,
               status = 'ACTIVE',
               last_broadcast_date = DATE('now')
           `).run(account_id, accName, profileDir);
 
           console.log(`[WS] REGISTER_ACCOUNT thành công: account_id=${account_id}, profile_dir=${profileDir}`);
+          try {
+            InboxSourceService.createPersonalSource(account_id, accName, db);
+          } catch (_) {}
           io.emit('ACCOUNT_STATUS_CHANGED', { account_id, status: 'ACTIVE' });
+          io.emit('INBOX_SOURCE_ADDED', { id: 'src_personal_' + account_id, source_type: 'personal_messenger', display_name: accName });
           io.emit('EXTENSION_CONNECTION_CHANGED', { account_id, is_connected: true });
 
           // Gửi ACK về Extension xác nhận đăng ký thành công
@@ -369,13 +386,23 @@ wss.on('connection', (ws, req) => {
             }));
           }
 
-          // Trigger đồng bộ threads ngay sau khi extension đăng ký
-          setTimeout(() => {
-            if (ws.readyState === ws.OPEN) {
-              ws.send(JSON.stringify({ type: 'SYNC_THREADS', data: { account_id } }));
-              console.log(`[WS] Gửi SYNC_THREADS đến extension tài khoản: ${account_id}`);
-            }
-          }, 1500);
+          // Trigger đồng bộ threads ngay sau khi extension đăng ký - nhưng bỏ qua
+          // nếu vừa dispatch gần đây, vì REGISTER_ACCOUNT có thể lặp lại dồn dập
+          // do service worker của extension bị Chrome khởi động lại (spec 042).
+          // Phần rebind extensionConnections/ACK phía trên vẫn luôn chạy bình
+          // thường - chỉ việc quét lại sidebar là được cooldown.
+          const nowMs = Date.now();
+          if (SidebarSyncCooldown.isInCooldown(account_id, nowMs)) {
+            console.log(`[WS] Bỏ qua auto SYNC_THREADS sau REGISTER_ACCOUNT (còn cooldown ${SidebarSyncCooldown.remainingMs(account_id, nowMs)}ms): account=${account_id}`);
+          } else {
+            SidebarSyncCooldown.markDispatched(account_id, nowMs);
+            setTimeout(() => {
+              if (ws.readyState === ws.OPEN) {
+                ws.send(JSON.stringify({ type: 'SYNC_THREADS', data: { account_id } }));
+                console.log(`[WS] Gửi SYNC_THREADS đến extension tài khoản: ${account_id}`);
+              }
+            }, 1500);
+          }
           break;
         }
 
@@ -523,6 +550,49 @@ wss.on('connection', (ws, req) => {
           io.emit('INCOMING_CALL_ENDED', {
             account_id: m.account_id || ws.accountId || null,
             timestamp: m.timestamp || Date.now()
+          });
+          break;
+        }
+
+        case 'THREAD_METADATA_UPDATED': {
+          const { account_id, thread_id, contact_name, avatar_url, page_id } = msg.data || {};
+          const tidStr = String(thread_id || '');
+          if (!tidStr) break;
+
+          let updatedName = null;
+          let localAvatarPath = null;
+
+          if (contact_name && !isInvalidContactName(contact_name)) {
+            updatedName = contact_name.trim();
+            db.prepare('UPDATE threads SET contact_name = ? WHERE id = ?').run(updatedName, tidStr);
+            db.prepare(`
+              INSERT INTO contacts (thread_id, name)
+              VALUES (?, ?)
+              ON CONFLICT(thread_id) DO UPDATE SET
+                name = excluded.name
+            `).run(tidStr, updatedName);
+          }
+
+          if (avatar_url && avatar_url.startsWith('http')) {
+            try {
+              localAvatarPath = await saveAvatarFromBase64OrUrl(avatar_url, tidStr);
+              if (localAvatarPath) {
+                db.prepare(`
+                  INSERT INTO contacts (thread_id, name, avatar_url)
+                  VALUES (?, ?, ?)
+                  ON CONFLICT(thread_id) DO UPDATE SET
+                    avatar_url = excluded.avatar_url
+                `).run(tidStr, updatedName || 'Khách hàng', localAvatarPath);
+              }
+            } catch (e) {
+              console.warn('[WS] Avatar save failed:', e.message);
+            }
+          }
+
+          io.emit('CONTACT_UPDATED', {
+            thread_id: tidStr,
+            ...(updatedName ? { name: updatedName } : {}),
+            ...(localAvatarPath ? { avatar_url: localAvatarPath } : {})
           });
           break;
         }
@@ -915,27 +985,39 @@ wss.on('connection', (ws, req) => {
             // move the bubble without inserting a duplicate message.
           }
 
+          // Update contact name if provided and not yet properly set
+          if (m.contact_name && !isInvalidContactName(m.contact_name)) {
+            const cleanName = m.contact_name.trim();
+            const existing = db.prepare('SELECT contact_name FROM threads WHERE id = ?').get(m.thread_id);
+            if (!existing || isInvalidContactName(existing.contact_name) || (existing.contact_name || '').startsWith('Khách hàng')) {
+              db.prepare('UPDATE threads SET contact_name = ? WHERE id = ?').run(cleanName, m.thread_id);
+              db.prepare(`
+                INSERT INTO contacts (thread_id, name)
+                VALUES (?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET name = excluded.name
+              `).run(m.thread_id, cleanName);
+              io.emit('CONTACT_UPDATED', { thread_id: m.thread_id, name: cleanName });
+            }
+          }
+
           // Avatar backfill: apply regardless of whether this message is a brand-new
           // insert or a re-scan of an existing one, so a thread whose messages were
           // already stored before contact-avatar extraction existed still gets
-          // corrected. Skip entirely once a real (non-placeholder) avatar is already
-          // stored, so we don't re-download/re-write on every scan tick.
-          if (isConfirmedIncoming && wasNewMessage) {
-            const avatarData = m.avatar_base64 || m.avatar_url || m.contact_avatar || '';
-            if (avatarData) {
-              const existingContact = db.prepare('SELECT avatar_url FROM contacts WHERE thread_id = ?').get(m.thread_id);
-              if (!existingContact || !existingContact.avatar_url) {
-                try {
-                  const localAvatarPath = await saveAvatarFromBase64OrUrl(avatarData, m.thread_id);
-                  if (localAvatarPath) {
-                    const avatarResult = ConversationRepository.setContactAvatarIfMissing(m.thread_id, m.contact_name, localAvatarPath, db);
-                    if (avatarResult.updated) {
-                      io.emit('CONTACT_UPDATED', { thread_id: m.thread_id, avatar_url: localAvatarPath });
-                    }
+          // corrected.
+          const avatarData = m.avatar_base64 || m.avatar_url || m.contact_avatar || '';
+          if (avatarData) {
+            const existingContact = db.prepare('SELECT avatar_url FROM contacts WHERE thread_id = ?').get(m.thread_id);
+            if (!existingContact || !existingContact.avatar_url) {
+              try {
+                const localAvatarPath = await saveAvatarFromBase64OrUrl(avatarData, m.thread_id);
+                if (localAvatarPath) {
+                  const avatarResult = ConversationRepository.setContactAvatarIfMissing(m.thread_id, m.contact_name, localAvatarPath, db);
+                  if (avatarResult.updated) {
+                    io.emit('CONTACT_UPDATED', { thread_id: m.thread_id, avatar_url: localAvatarPath });
                   }
-                } catch (err) {
-                  console.warn('[WS] Avatar save failed:', err.message);
                 }
+              } catch (err) {
+                console.warn('[WS] Avatar save failed:', err.message);
               }
             }
           }
@@ -1076,18 +1158,13 @@ wss.on('connection', (ws, req) => {
             const txn = db.transaction((account_id, threads) => {
               for (const t of threads) {
                 const threadId = String(t.thread_id);
-                let name = t.name || t.contact_name || null;
-                
-                const PRESENCE_EXACT = /^(?:Đang|Đang hoạt động.*|Hoạt động(?:\s+\d+.*)?|Đã hoạt động.*|Active now|Active recently|Active \d+.*|Online|Offline)$/i;
-                if (name && PRESENCE_EXACT.test(name.trim())) {
+                let name = cleanContactName(t.name || t.contact_name, null);
+                if (!name || isInvalidContactName(name)) {
                   const existing = db.prepare('SELECT contact_name FROM threads WHERE id = ?').get(threadId);
                   let existingName = existing?.contact_name;
-                  if (existingName && PRESENCE_EXACT.test(existingName.trim())) existingName = null;
+                  if (isInvalidContactName(existingName)) existingName = null;
                   name = existingName || 'Khách hàng';
                 }
-                
-                // Double check để loại bỏ trường hợp 'Đang' tuyệt đối
-                if (name === 'Đang') name = 'Khách hàng';
                 let cleanLastMsg = cleanMessageText(t.last_message);
                 if (!cleanLastMsg || isSystemOrMetadataText(cleanLastMsg) || cleanLastMsg === 'Đang tải...') {
                   const dbMsgs = db.prepare(`
@@ -1184,24 +1261,54 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'THREAD_MESSAGES_SYNCED': {
-          const { account_id, thread_id, messages, reason, mode, checkpoint, fetched_count } = msg.data;
+          const { account_id, thread_id, messages, reason, mode, cursor, checkpoint, fetched_count } = msg.data;
           console.log(`[WS] THREAD_MESSAGES_SYNCED: thread=${thread_id} mode=${mode||'full'} count=${messages?.length || 0}${reason ? ` reason=${reason}` : ''}`);
 
           if (reason) {
-            // Never retry SYNC_THREAD_MESSAGES with a delayed timer. That message
-            // also performs tab navigation, so a retry for an older conversation
-            // can arrive after a newer click and pull Messenger back to the old
-            // user. A fresh user click is the only event allowed to navigate.
-            if (global.syncRetries) global.syncRetries[thread_id] = 0;
             const HistorySyncManager = require('./services/HistorySyncManager');
             HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
-            console.log(`[WS] Không retry điều hướng thread ${thread_id} (reason=${reason}); chờ click/yêu cầu mới.`);
+
+            // marker_mismatch/sidebar_mismatch/no_rows/no_main_container are DOM-timing
+            // flukes that usually clear up on their own; error_screen means Facebook
+            // itself is blocking the content, which is permanent and must not retry.
+            const TRANSIENT_REASONS = new Set(['marker_mismatch', 'sidebar_mismatch', 'no_rows', 'no_main_container']);
+            if (TRANSIENT_REASONS.has(reason)) {
+              const scheduled = HistorySyncRetryPolicy.scheduleRetry(account_id, thread_id, () => {
+                // A retry also performs tab navigation - if the operator has since
+                // clicked a different thread, HistorySyncRetryPolicy already cancels
+                // this before it fires, so reaching here means this thread is still
+                // the one being looked at.
+                const extWs = extensionConnections.get(account_id);
+                if (!extWs || extWs.readyState !== WebSocket.OPEN) {
+                  console.warn(`[HISTORY_SYNC_RETRY_SKIPPED] thread=${thread_id} reason=extension_not_ready`);
+                  return;
+                }
+                const threadRow = db.prepare('SELECT thread_url, contact_name FROM threads WHERE id = ?').get(thread_id);
+                const pageSource = ConversationRepository.getThreadSource(thread_id);
+                extWs.send(JSON.stringify({
+                  type: 'SYNC_THREAD_MESSAGES',
+                  data: {
+                    account_id,
+                    thread_id,
+                    thread_url: threadRow?.thread_url || null,
+                    page_id: pageSource?.pageId || null,
+                    mode,
+                    cursor,
+                    contact_name: threadRow?.contact_name || null
+                  }
+                }));
+                console.log(`[WS] Retry sync tin nhắn cho thread ${thread_id} (account ${account_id}) mode=${mode}`);
+              });
+              if (!scheduled) {
+                console.log(`[WS] Không retry điều hướng thread ${thread_id} (reason=${reason}, đã hết lượt); chờ click/yêu cầu mới.`);
+              }
+            } else {
+              console.log(`[WS] Không retry điều hướng thread ${thread_id} (reason=${reason}, lỗi vĩnh viễn); chờ click/yêu cầu mới.`);
+            }
             return; // Không ghi đè hoặc emit UI
           }
 
-          if (global.syncRetries && global.syncRetries[thread_id]) {
-            global.syncRetries[thread_id] = 0;
-          }
+          HistorySyncRetryPolicy.cancelRetry(thread_id);
 
           const HistorySyncManager = require('./services/HistorySyncManager');
           
@@ -1231,7 +1338,9 @@ wss.on('connection', (ws, req) => {
             console.log(`[WS] Diagnostics thread=${thread_id}: fetched=${fetchedTotal} inserted=${persistence.insertedIds.length} updated=${persistence.updatedIds.length} skipped=${skippedTotal}`);
 
             if (checkpoint) {
-              HistorySyncManager.updateSyncStatus(thread_id, 'SYNCED', checkpoint);
+              const resolvedStatus = HistorySyncManager.resolveStatusFromCheckpoint(checkpoint);
+              HistorySyncManager.updateSyncStatus(thread_id, resolvedStatus, checkpoint);
+              console.log(`[WS] History sync status thread=${thread_id}: ${resolvedStatus} (stop_reason=${checkpoint.stop_reason || 'n/a'})`);
             }
 
             const latest = validMessages[validMessages.length - 1];
@@ -1254,7 +1363,9 @@ wss.on('connection', (ws, req) => {
           } else {
              // Empty messages list but no error means we might have reached the end or just no new messages
              if (checkpoint) {
-               HistorySyncManager.updateSyncStatus(thread_id, 'SYNCED', checkpoint);
+               const resolvedStatus = HistorySyncManager.resolveStatusFromCheckpoint(checkpoint);
+               HistorySyncManager.updateSyncStatus(thread_id, resolvedStatus, checkpoint);
+               console.log(`[WS] History sync status thread=${thread_id}: ${resolvedStatus} (stop_reason=${checkpoint.stop_reason || 'n/a'})`);
              }
           }
           break;
@@ -1476,6 +1587,12 @@ io.on('connection', (socket) => {
     }
     if (!targetAccId || !thread_id) return;
 
+    // A manual/navigation request for this thread is fresh intent - it supersedes
+    // any pending auto-retry for this thread, and if the operator just moved away
+    // from a different thread of this account, cancel that thread's pending retry
+    // too (a retry firing later would navigate Messenger back to the stale thread).
+    HistorySyncRetryPolicy.noteManualRequest(targetAccId, thread_id);
+
     const extWs = extensionConnections.get(targetAccId);
     if (extWs && extWs.readyState === WebSocket.OPEN) {
       const HistorySyncManager = require('./services/HistorySyncManager');
@@ -1483,8 +1600,12 @@ io.on('connection', (socket) => {
       let mode = 'incremental';
       if (!syncState || !syncState.sync_cursor) {
         mode = 'initial';
+      } else if (syncState.sync_status === 'PARTIAL' || syncState.sync_status === 'FAILED') {
+        // Thread đã có cursor nhưng chưa thực sự lấy đủ lịch sử (hoặc lần trước
+        // lỗi) - 1 vòng incremental gần như vô dụng ở đây, cần đào sâu hơn.
+        mode = 'deep_backfill';
       }
-      
+
       const pageSource = ConversationRepository.getThreadSource(thread_id);
       const targetPageId = page_id || pageSource?.pageId || null;
       let contactName = contact_name;
@@ -1931,6 +2052,17 @@ app.put('/api/contacts/:thread_id', (req, res) => {
   res.json({ success: true, contact });
 });
 
+// Inbox Sources — Personal and Page connected sources
+app.get('/api/inbox-sources', (req, res) => {
+  try {
+    const sources = InboxSourceService.getAllSources(db);
+    res.json(sources);
+  } catch (error) {
+    console.error('[InboxSource] Fetch failed:', error);
+    res.status(500).json({ error: error.message || 'Không thể lấy danh sách nguồn hội thoại' });
+  }
+});
+
 // Lead Statuses — staff-created, reusable, color-coded (feature 022)
 app.get('/api/lead-statuses', (req, res) => {
   res.json(db.prepare('SELECT id, name, color FROM lead_statuses ORDER BY id ASC').all());
@@ -2372,6 +2504,35 @@ function startServer() {
     console.log(`[Server] http://localhost:${PORT}`);
     console.log(`[Server] WebSocket ws://localhost:${PORT}`);
   });
+
+  // Dọn dẹp các tên rác hệ thống (ví dụ: "Tất cả tin nhắn", "Hộp thư đến") đã lưu vào CSDL trước đây
+  try {
+    const dirtySystemNames = [
+      'Tất cả tin nhắn', 'Tất cả', 'All messages', 'All',
+      'Tin nhắn trực tiếp', 'Direct messages',
+      'Hộp thư đến', 'Hộp thư', 'Inbox',
+      'Chưa đọc', 'Unread', 'Đã xong', 'Done',
+      'Gắn dấu sao', 'Đã gắn dấu sao', 'Starred',
+      'Spam', 'Thư rác', 'Đang', 'Facebook', 'Messenger', 'Meta'
+    ];
+    const placeholders = dirtySystemNames.map(() => '?').join(',');
+    db.prepare(`
+      UPDATE threads 
+      SET contact_name = 'Khách hàng' 
+      WHERE contact_name IN (${placeholders}) 
+         OR contact_name LIKE 'Đang hoạt động%' 
+         OR contact_name LIKE 'Hoạt động%'
+    `).run(...dirtySystemNames);
+    db.prepare(`
+      UPDATE contacts 
+      SET name = 'Khách hàng' 
+      WHERE name IN (${placeholders}) 
+         OR name LIKE 'Đang hoạt động%' 
+         OR name LIKE 'Hoạt động%'
+    `).run(...dirtySystemNames);
+  } catch (cleanErr) {
+    console.warn('[DB] Lỗi dọn dẹp tên hệ thống:', cleanErr.message);
+  }
 
   // Drains message_queue (Page-thread sends routed there by sendViaExtension,
   // feature 015) and dispatches SEND_QUEUED_MESSAGE to the right extension

@@ -47,6 +47,12 @@ export default function MessageList({ messages = [], activeThread, onSyncThread,
           </div>
         ) : (
           <div className="py-2 space-y-4">
+            {activeThread?.sync_status === 'PARTIAL' && (
+              <div className="flex items-center justify-center gap-2 text-xs text-[var(--color-text-muted)] bg-[var(--color-bg-panel)] border border-[var(--color-border)] rounded-full px-3 py-1.5 mx-auto w-fit">
+                <RefreshCw size={12} strokeWidth={1.75} className="animate-spin" />
+                <span>Đang tải thêm lịch sử cũ hơn…</span>
+              </div>
+            )}
             {messages.map((msg, index) => {
               const dateLabel = formatDate(msg.timestamp_ms || msg.created_at || msg.time);
               const showDateDivider = dateLabel !== lastDate;

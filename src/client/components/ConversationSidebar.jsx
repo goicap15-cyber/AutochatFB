@@ -119,6 +119,7 @@ export default function ConversationSidebar({
                 isOpen={isFilterPopoverOpen}
                 appliedFilters={appliedFilters}
                 inboxSources={inboxSources}
+                accounts={accounts}
                 leadStatuses={leadStatuses}
                 tagOptions={getAvailableTagOptions(threads)}
                 onApply={(nextFilters) => setAppliedFilters(nextFilters)}
