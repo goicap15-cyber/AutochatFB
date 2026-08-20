@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { MessageSquare, Search, Zap, Megaphone, Cpu, UserCheck, ShieldAlert, ChevronLeft, ChevronRight, Sun, Moon, Phone } from 'lucide-react';
+import { MessageSquare, Search, Zap, Megaphone, Cpu, UserCheck, ShieldAlert, ChevronLeft, ChevronRight, Sun, Moon, Phone, Key, CreditCard } from 'lucide-react';
 import { SIDEBAR_CLOSE_DELAY_MS, shouldKeepSidebarExpanded } from '../utils/appSidebarPresentation.js';
 
 const ICON_SIZE = 18;
@@ -24,6 +24,8 @@ export default function AppSidebar({ activeView, onSelectView, onOpenModal, them
     { id: 'campaigns', label: 'Chiến dịch', icon: Megaphone, isModal: true },
     { id: 'aiConfig', label: 'Cài đặt AI', icon: Cpu, isModal: true },
     { id: 'phoneAutomation', label: 'Tự động số điện thoại', icon: Phone, isModal: true },
+    { id: 'license', label: 'Bản quyền Key', icon: Key, isModal: true },
+    { id: 'payment', label: 'Mua License', icon: CreditCard, isModal: true },
     { id: 'accounts', label: 'Quản lý', icon: UserCheck, isModal: true }
   ];
 

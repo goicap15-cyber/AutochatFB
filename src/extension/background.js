@@ -2129,9 +2129,21 @@ async function ensureTabOnThread(tab, targetThreadId, requestedThreadUrl, pageId
 }
 
 // ── Đồng bộ lịch sử tin nhắn của 1 hội thoại cụ thể ────────────────────────
-async function handleSyncThreadMessages({ account_id, thread_id, thread_url, page_id = null, mode = 'initial', cursor = null, contact_name = null }) {
+async function handleSyncThreadMessages({ account_id, thread_id, thread_url, page_id = null, mode = 'initial', cursor = null, contact_name = null, reason = null, allow_navigation = false }) {
   console.log(`[FB Engine] 🔄 Sync lịch sử tin nhắn cho thread: ${thread_id} (${contact_name || 'unknown'}, account=${account_id || user_id}) mode=${mode}`);
   if (!thread_id) return;
+  if (allow_navigation !== true || reason !== 'crm_navigation') {
+    console.warn(`[FB Engine] Chặn history navigation không do click CRM: thread=${thread_id} reason=${reason || 'unknown'}`);
+    sendToBackend('THREAD_MESSAGES_SYNCED', {
+      account_id: account_id || user_id,
+      thread_id,
+      messages: [],
+      reason: 'navigation_not_authorized',
+      mode,
+      cursor
+    });
+    return;
+  }
 
   const targetAcc = account_id || user_id;
   const navigationToken = page_id ? null : beginPersonalNavigation(targetAcc);
@@ -2286,9 +2298,20 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
               break;
             }
             const currentCount = rowsForBoundary.length;
-            const scrollContainer = container.querySelector('div[aria-label*="Messages"], div[aria-label*="Đoạn chat"]') || container;
+            const firstVisibleRow = rowsForBoundary[0] || null;
+            const explicitLog = container.querySelector('[role="log"], div[aria-label*="Messages"], div[aria-label*="Đoạn chat"], div[aria-label*="Tin nhắn trong cuộc trò chuyện"]');
+            let scrollContainer = explicitLog || container;
+            let scrollProbe = scrollContainer;
+            while (scrollProbe && scrollProbe !== document.body) {
+              if (scrollProbe.scrollHeight > scrollProbe.clientHeight + 8) {
+                scrollContainer = scrollProbe;
+                break;
+              }
+              scrollProbe = scrollProbe.parentElement;
+            }
             const currentScrollHeight = scrollContainer ? scrollContainer.scrollHeight : 0;
             const currentScrollTop = scrollContainer ? scrollContainer.scrollTop : 0;
+            const anchorTop = firstVisibleRow?.getBoundingClientRect().top || 0;
             const spinnerVisible = !!container.querySelector('svg[aria-label="Loading"], div[role="progressbar"]');
 
             console.log(`[FB LazyLoad] Vòng ${i + 1}/${maxRounds} - Rows: ${currentCount} | ScrollHeight: ${currentScrollHeight} | ScrollTop: ${currentScrollTop}${spinnerVisible ? ' | spinner' : ''}`);
@@ -2315,9 +2338,22 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
               await new Promise(r => setTimeout(r, 1000));
             } else {
               if (scrollContainer) {
+                const beforeHeight = scrollContainer.scrollHeight;
                 scrollContainer.scrollTop = 0;
+                scrollContainer.dispatchEvent(new Event('scroll', { bubbles: true }));
+                await new Promise(r => setTimeout(r, 1100));
+                // Facebook prepends rows and may recycle off-screen nodes. Keep
+                // the former first row anchored so repeated rounds continue
+                // walking backwards instead of jumping to an arbitrary point.
+                if (firstVisibleRow?.isConnected) {
+                  const delta = firstVisibleRow.getBoundingClientRect().top - anchorTop;
+                  if (Math.abs(delta) > 1) scrollContainer.scrollTop += delta;
+                } else if (scrollContainer.scrollHeight > beforeHeight) {
+                  scrollContainer.scrollTop = scrollContainer.scrollHeight - beforeHeight;
+                }
+              } else {
+                await new Promise(r => setTimeout(r, 1100));
               }
-              await new Promise(r => setTimeout(r, 1000));
             }
           }
           if (!stopReason) stopReason = 'max_rounds_hit';
@@ -2347,6 +2383,24 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
           /^Messenger$/i,
           /^Meta$/i,
           /^Trang chủ$/i,
+          /^(?:Trang cá nhân|View profile)$/i,
+          /^(?:Tắt thông báo|Mute notifications)$/i,
+          /^(?:Tìm kiếm|Search)$/i,
+          /^(?:Thông tin về đoạn chat|Conversation information|Chat info|Chi tiết cuộc trò chuyện)$/i,
+          /^(?:Tùy chỉnh đoạn chat|Customize chat)$/i,
+          /^(?:File phương tiện,? file và liên kết|Media,? files and links)$/i,
+          /^(?:Quyền riêng tư và hỗ trợ|Privacy and support|Privacy & support)$/i,
+          /^(?:Chủ đề|Theme)$/i,
+          /^(?:Biểu tượng cảm xúc|Emoji)$/i,
+          /^(?:Biệt danh|Nicknames)$/i,
+          /^(?:Tạo nhóm|Create group)$/i,
+          /^(?:Thành viên|Members)$/i,
+          /^(?:Tên người dùng|Username)$/i,
+          /^(?:Gỡ|Remove|Unsend)$/i,
+          /^(?:Trả lời|Reply)$/i,
+          /^(?:Chuyển tiếp|Forward)$/i,
+          /^(?:Ghim|Pin)$/i,
+          /^(?:Sao chép|Copy)$/i,
           /^Khôi phục ngay$/i,
           /^Thiếu lịch sử chat/i,
           /^Bạn đã tạo nhóm này/i,
@@ -2464,15 +2518,16 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
         const occurrencesMap = {};
         const seenBubblesInPass = new Set();
 
-        // ── Composer/UI exclusion (tuyệt đối không lấy text từ vùng soạn tin/header/nav) ──
-        const COMPOSER_EXCLUDE = 'form, [contenteditable="true"], [role="textbox"], [aria-label="Aa"], [aria-label="Tin nhắn"], [aria-label*="composer"], [aria-label*="Soạn"], [role="contentinfo"], header, nav';
+        // ── Composer/UI exclusion (tuyệt đối không lấy text từ vùng soạn tin/header/nav/sidebar) ──
+        const COMPOSER_EXCLUDE = 'form, [contenteditable="true"], [role="textbox"], [aria-label="Aa"], [aria-label="Tin nhắn"], [aria-label*="composer"], [aria-label*="Soạn"], [role="contentinfo"], header, nav, [role="complementary"], [aria-label*="Thông tin về đoạn chat"], [aria-label*="Conversation information"], [aria-label*="Chi tiết cuộc trò chuyện"]';
 
         // ── Chiến lược: Chỉ lấy tin từ message row đã xác minh ──
         // Facebook đã chuyển message container từ role="row" sang role="article"
         // (xác nhận qua live DOM inspection 2026-08-19, giống fix đã có ở
         // content.js:401-407 cho luồng real-time) - phải nhận cả hai để không
         // bỏ sót toàn bộ lịch sử của thread dùng cấu trúc mới.
-        const allRows = Array.from(mainContainer.querySelectorAll('div[role="row"], div[role="article"]'));
+        const messageLog = mainContainer.querySelector('[role="log"], [data-scope="messages_table"]') || mainContainer;
+        const allRows = Array.from(messageLog.querySelectorAll('div[role="row"], div[role="article"]'));
 
         let dom_order = 0;
         let lastFallbackTime = Date.now();
@@ -2528,15 +2583,19 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
             const rawBubbleText = (leafBubble.textContent || '').trim();
             if (!rawBubbleText) { bubble_idx++; continue; }
 
+            const bubbleLabelEl = leafBubble.closest('[aria-label]');
+            const bubbleLabel = bubbleLabelEl ? (bubbleLabelEl.getAttribute('aria-label') || '') : '';
+            const currentLabel = bubbleLabel || effectiveLabel;
+
             let isOutgoing = false;
             let senderName = '';
             let directionMatched = false;
-            if (/do Bạn gửi|Tin nhắn do Bạn gửi lúc|Bạn đã gửi|sent by you|You sent|Message sent by you/i.test(effectiveLabel)) {
+            if (/do Bạn gửi|Tin nhắn do Bạn gửi lúc|Bạn đã gửi|sent by you|You sent|Message sent by you/i.test(currentLabel)) {
               isOutgoing = true;
               senderName = 'Bạn';
               directionMatched = true;
             } else {
-              const nameMatch = effectiveLabel.match(/Tin nhắn do ([^]+?) gửi lúc/i) || effectiveLabel.match(/Message sent by ([^]+?) at/i);
+              const nameMatch = currentLabel.match(/Tin nhắn do ([^]+?) gửi lúc/i) || currentLabel.match(/Message sent by ([^]+?) at/i);
               if (nameMatch) {
                 const rawSender = nameMatch[1].trim();
                 if (/^(?:Bạn|You)$/i.test(rawSender)) {
@@ -2548,19 +2607,14 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
                 }
                 directionMatched = true;
               } else {
-                // Cấu trúc role="article" mới: aria-label dạng "Lúc <giờ> <ngày>,
-                // <tên>: <nội dung>" không tự nói rõ chiều gửi như format cũ.
-                // Suy luận bằng loại trừ so với contactName (thread 1-1 chỉ có
-                // 2 phía) - không có contactName để so thì không đoán, bỏ qua
-                // tin nhắn này thay vì gán sai chiều một cách im lặng.
-                // Đoạn đầu phải greedy (không phải `.+?`) để nuốt hết phần ngày
-                // tháng có dấu phẩy bên trong ("29 Tháng 3, 2025,") rồi mới lùi
-                // về đúng dấu phẩy cuối trước tên - nếu để non-greedy sẽ dừng ở
-                // dấu phẩy đầu tiên và gộp nhầm "2025, " vào tên trích được.
-                const newLabelMatch = effectiveLabel.match(/^Lúc\s+.+,\s*(.+?):\s*/i);
+                const newLabelMatch = currentLabel.match(/^Lúc\s+.+,\s*(.+?):\s*/i);
                 if (newLabelMatch) {
                   const rawSender = newLabelMatch[1].trim();
-                  if (contactName && rawSender.toLowerCase() === String(contactName).trim().toLowerCase()) {
+                  if (/^(?:Bạn|You)$/i.test(rawSender)) {
+                    isOutgoing = true;
+                    senderName = 'Bạn';
+                    directionMatched = true;
+                  } else if (contactName && rawSender.toLowerCase() === String(contactName).trim().toLowerCase()) {
                     isOutgoing = false;
                     senderName = rawSender;
                     directionMatched = true;
@@ -2574,13 +2628,27 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
             }
 
             if (!directionMatched) {
-              console.log('[FB Engine] ⚠️ Bỏ qua tin nhắn không xác định được chiều gửi (aria-label lạ, thiếu contact_name để so khớp).');
-              bubble_idx++;
-              continue;
+              // Check if row contains contact's avatar (Facebook puts alt="<Contact Name>" on incoming message avatars)
+              const safeName = (contactName || '').trim();
+              const hasContactAvatar = safeName ? !!(
+                Array.from(row.querySelectorAll('img[alt], div[role="img"][aria-label], img[aria-label]')).some(el => {
+                  const alt = el.getAttribute('alt') || el.getAttribute('aria-label') || '';
+                  return alt.toLowerCase().includes(safeName.toLowerCase());
+                })
+              ) : false;
+
+              if (hasContactAvatar) {
+                isOutgoing = false;
+                senderName = contactName || 'Khách hàng';
+              } else {
+                isOutgoing = true;
+                senderName = 'Bạn';
+              }
             }
 
             const cleaned = cleanText(rawBubbleText);
             if (!cleaned || cleaned.length < 1 || cleaned.length > 1000 || isSystemText(cleaned)) { bubble_idx++; continue; }
+            if (contactName && cleaned.toLowerCase() === String(contactName).trim().toLowerCase()) { bubble_idx++; continue; }
 
             const nativeId = nativeIdEl?.getAttribute('data-message-id') || nativeIdEl?.getAttribute('data-id') || nativeIdEl?.getAttribute('id') || row.getAttribute('data-id') || null;
 
@@ -2590,11 +2658,12 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
             occurrencesMap[comboKey] = (occurrencesMap[comboKey] || 0) + 1;
             const occIndex = occurrencesMap[comboKey];
 
-            const identityKey = `${targetThreadId}|${dirKey}|${textHash}|${tsMs}`;
-            const deterministicId = nativeId || `fb_sync_${stringHash(identityKey)}_${occIndex}`;
+            const identityKey = `${targetThreadId}|${dirKey}|${textHash}`;
+            const deterministicId = nativeId || `dom_${targetThreadId}_hash_${textHash}_${occIndex - 1}`;
 
             if (!messages.some(m => m.fb_message_id === deterministicId)) {
-              // Create a microsecond offset based on dom_order to preserve sorting for identical timestamps
+              // Preserve Facebook DOM order for messages with the same minute.
+              // A bounded offset is deterministic within the canonical oldest→newest pass.
               const finalTsMs = tsMs + dom_order;
 
               messages.push({
@@ -2604,9 +2673,12 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
                 sender_name: senderName,
                 content: cleaned,
                 is_outgoing: isOutgoing ? 1 : 0,
+                sender_role: isOutgoing ? 'operator' : 'customer',
                 source: 'dom_history_sync',
                 timestamp_ms: finalTsMs,
                 timestamp_source: tsSource,
+                dom_order,
+                sequence_order: dom_order,
                 created_at: new Date(finalTsMs).toISOString()
               });
             }
@@ -2638,7 +2710,15 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
       return;
     }
 
-    const messagesArray = Array.isArray(parsedMessages) ? parsedMessages : [];
+    const messagesArray = Array.isArray(parsedMessages)
+      ? [...parsedMessages].sort((a, b) => {
+          const timeDiff = Number(a.timestamp_ms || 0) - Number(b.timestamp_ms || 0);
+          if (timeDiff !== 0) return timeDiff;
+          const domDiff = Number(a.dom_order || 0) - Number(b.dom_order || 0);
+          if (domDiff !== 0) return domDiff;
+          return String(a.fb_message_id || '').localeCompare(String(b.fb_message_id || ''));
+        })
+      : [];
     console.log(`[FB Engine] ✅ Synced ${messagesArray.length} new history messages for thread ${thread_id}; skipped=${parserSkipped}`);
 
     // Update cursor using timestamp extrema, not DOM array order.
@@ -2649,11 +2729,10 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
     newCursor.boundary_reached = !!(parsedResult && parsedResult.boundary_reached);
     newCursor.stop_reason = (parsedResult && parsedResult.stop_reason) || null;
     if (messagesArray.length > 0) {
-      const ordered = [...messagesArray].sort((a, b) => (a.timestamp_ms || 0) - (b.timestamp_ms || 0));
-      newCursor.oldest_timestamp_ms = ordered[0].timestamp_ms;
-      newCursor.oldest_message_id = ordered[0].fb_message_id;
-      newCursor.newest_timestamp_ms = ordered[ordered.length - 1].timestamp_ms;
-      newCursor.newest_message_id = ordered[ordered.length - 1].fb_message_id;
+      newCursor.oldest_timestamp_ms = messagesArray[0].timestamp_ms;
+      newCursor.oldest_message_id = messagesArray[0].fb_message_id;
+      newCursor.newest_timestamp_ms = messagesArray[messagesArray.length - 1].timestamp_ms;
+      newCursor.newest_message_id = messagesArray[messagesArray.length - 1].fb_message_id;
     }
 
     sendToBackend('THREAD_MESSAGES_SYNCED', {

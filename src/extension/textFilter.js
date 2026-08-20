@@ -22,6 +22,26 @@
     /^Chỉ những người tham gia/i,
     /^Bản quyền Meta/i,
 
+    // Right sidebar & header UI elements
+    /^(?:Trang cá nhân|View profile)$/i,
+    /^(?:Tắt thông báo|Mute notifications)$/i,
+    /^(?:Tìm kiếm|Search)$/i,
+    /^(?:Thông tin về đoạn chat|Conversation information|Chat info|Chi tiết cuộc trò chuyện)$/i,
+    /^(?:Tùy chỉnh đoạn chat|Customize chat)$/i,
+    /^(?:File phương tiện,? file và liên kết|Media,? files and links)$/i,
+    /^(?:Quyền riêng tư và hỗ trợ|Privacy and support|Privacy & support)$/i,
+    /^(?:Chủ đề|Theme)$/i,
+    /^(?:Biểu tượng cảm xúc|Emoji)$/i,
+    /^(?:Biệt danh|Nicknames)$/i,
+    /^(?:Tạo nhóm|Create group)$/i,
+    /^(?:Thành viên|Members)$/i,
+    /^(?:Tên người dùng|Username)$/i,
+    /^(?:Gỡ|Remove|Unsend)$/i,
+    /^(?:Trả lời|Reply)$/i,
+    /^(?:Chuyển tiếp|Forward)$/i,
+    /^(?:Ghim|Pin)$/i,
+    /^(?:Sao chép|Copy)$/i,
+
     // Status & Presence (exact standalone matches only)
     /^(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen)$/i,
   /^(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen)\s+\d+\s+(?:giây|phút|giờ|ngày|tuần|tháng|năm)\s+(?:trước|ago)$/i,

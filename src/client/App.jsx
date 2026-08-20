@@ -14,6 +14,9 @@ import CampaignDetail from './components/CampaignDetail.jsx';
 import AiConfigModal from './components/AiConfigModal.jsx';
 import PhoneAutomationSettingsModal from './components/PhoneAutomationSettingsModal.jsx';
 import IncomingCallModal from './components/IncomingCallModal.jsx';
+import PaymentModal from './components/PaymentModal.jsx';
+import LicenseManagerModal from './components/LicenseManagerModal.jsx';
+import LicenseLockScreen from './components/LicenseLockScreen.jsx';
 import { useSocket } from './hooks/useSocket.js';
 import { MessageSquare } from 'lucide-react';
 
@@ -82,6 +85,23 @@ export default function App() {
   const [activeCampaignId, setActiveCampaignId] = useState(null);
   const [campaignRefreshVersion, setCampaignRefreshVersion] = useState(0);
   const [incomingCallInfo, setIncomingCallInfo] = useState(null);
+  const [licenseStatus, setLicenseStatus] = useState(null);
+
+  const checkLicenseStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/license/status');
+      const json = await res.json();
+      if (json.success) {
+        setLicenseStatus(json.data);
+      }
+    } catch (e) {
+      console.warn('Failed to check license status:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    checkLicenseStatus();
+  }, [checkLicenseStatus]);
 
   const loadInboxSources = useCallback(async () => {
     try {
@@ -149,10 +169,12 @@ export default function App() {
     try {
       const res = await fetch('/api/accounts');
       const data = await res.json();
-      setAccounts(data);
-      setHasCheckpoint(data.some(a => a.status === 'CHECKPOINT'));
+      const accountList = Array.isArray(data) ? data : [];
+      setAccounts(accountList);
+      setHasCheckpoint(accountList.some(a => a.status === 'CHECKPOINT'));
     } catch (e) {
       console.warn('Failed to load accounts:', e);
+      setAccounts([]);
     }
   }, []);
 
@@ -160,12 +182,10 @@ export default function App() {
     try {
       const res = await fetch(`/api/threads?user_id=${SESSION_USER.id}&role=${SESSION_USER.role}&tab=${activeTab}`);
       const data = await res.json();
-      setThreads((data || []).map(t => ({ ...t, thread_key: t.thread_key || (t.account_id ? `${t.account_id}:${t.id}` : String(t.id)) })));
+      const threadList = Array.isArray(data) ? data : [];
+      setThreads(threadList.map(t => ({ ...t, thread_key: t.thread_key || (t.account_id ? `${t.account_id}:${t.id}` : String(t.id)) })));
     } catch {
-      setThreads([
-        { id: 't_1001', contact_name: 'Nguyễn Văn A', last_message: 'Dạ anh tư vấn giúp em báo giá phần mềm!', is_unread: true, status: 'UNPROCESSED' },
-        { id: 't_1002', contact_name: 'Trần Thị B', last_message: 'SĐT mình là 0912345678 nha anh', is_unread: false, status: 'ASSIGNED' }
-      ]);
+      setThreads([]);
     }
   }, [activeTab]);
 
@@ -314,11 +334,14 @@ export default function App() {
           updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
         }
         
+        // Database insertion order is the canonical chat sequence. Direction
+        // is stored separately in is_outgoing (0 = customer, 1 = operator),
+        // so timestamps are display metadata only and never move a bubble.
         updated.sort((a, b) => {
-          const tA = Number(a.timestamp_ms) || new Date(a.created_at || 0).getTime();
-          const tB = Number(b.timestamp_ms) || new Date(b.created_at || 0).getTime();
-          if (tA !== tB) return tA - tB;
-          return (a.id || 0) - (b.id || 0);
+          const sequenceA = Number(a.sequence_order ?? a.id);
+          const sequenceB = Number(b.sequence_order ?? b.id);
+          if (!Number.isFinite(sequenceA) || !Number.isFinite(sequenceB)) return 0;
+          return sequenceA - sequenceB || Number(a.id || 0) - Number(b.id || 0);
         });
 
         return { ...prev, [tidStr]: updated };
@@ -344,17 +367,9 @@ export default function App() {
       });
       loadThreadsRef.current();
 
-      // Auto-refetch latest messages from API so media URLs and attachments load instantly without F5
-      setTimeout(() => {
-        fetch(`/api/threads/${tidStr}/messages`)
-          .then(r => r.json())
-          .then(data => {
-            if (Array.isArray(data)) {
-              setMessages(prev => ({ ...prev, [tidStr]: data }));
-            }
-          })
-          .catch(() => {});
-      }, 500);
+      // Media URLs are already included in NEW_MESSAGE/THREAD_MESSAGES_UPDATED.
+      // Do not replace the live state with a delayed REST response: that response
+      // can race a later socket event and make a freshly-arrived message disappear.
     });
 
     socket.on('MESSAGE_SENT', ({ thread_id, client_message_id, fb_message_id }) => {
@@ -390,12 +405,6 @@ export default function App() {
       });
     });
 
-    socket.on('THREAD_MESSAGES_UPDATED', ({ thread_id, messages: newMsgs }) => {
-      const tidStr = String(thread_id);
-      if (Array.isArray(newMsgs)) {
-        setMessages(prev => ({ ...prev, [tidStr]: newMsgs }));
-      }
-    });
 
     socket.on('INCOMING_CALL_RINGING', (callData) => {
       console.log('[Socket.io] 🔔 INCOMING_CALL_RINGING:', callData);
@@ -474,15 +483,22 @@ export default function App() {
         const existing = prev[tidStr] || [];
         const mergedMap = new Map();
 
+        const messageKey = (message) => {
+          if (message.fb_message_id) return `fb_${message.fb_message_id}`;
+          if (message.client_message_id) return `client_${message.client_message_id}`;
+          if (message.id != null) return `id_${message.id}`;
+          return `fallback_${message.timestamp_ms || message.created_at || 0}_${message.is_outgoing ? 1 : 0}_${message.content || ''}`;
+        };
+
         // Nạp tin nhắn vừa sync
         (syncedMsgs || []).forEach(m => {
-          const key = m.fb_message_id || m.client_message_id || `id_${m.id}`;
+          const key = messageKey(m);
           mergedMap.set(key, { ...m, thread_key: m.thread_key || thread_key, account_id: m.account_id || account_id, status: 'sent' });
         });
 
         // Giữ lại các tin nhắn pending/failed/realtime chưa có trong bản sync
         existing.forEach(m => {
-          const key = m.fb_message_id || m.client_message_id || `id_${m.id}`;
+          const key = messageKey(m);
           if (!mergedMap.has(key)) {
             mergedMap.set(key, m);
           } else if (m.status === 'sending' || m.status === 'failed') {
@@ -492,10 +508,10 @@ export default function App() {
 
         const mergedArray = Array.from(mergedMap.values());
         mergedArray.sort((a, b) => {
-          const tA = Number(a.timestamp_ms) || new Date(a.created_at || 0).getTime();
-          const tB = Number(b.timestamp_ms) || new Date(b.created_at || 0).getTime();
-          if (tA !== tB) return tA - tB;
-          return (a.id || 0) - (b.id || 0);
+          const sequenceA = Number(a.sequence_order ?? a.id);
+          const sequenceB = Number(b.sequence_order ?? b.id);
+          if (!Number.isFinite(sequenceA) || !Number.isFinite(sequenceB)) return 0;
+          return sequenceA - sequenceB || Number(a.id || 0) - Number(b.id || 0);
         });
 
         return {
@@ -1022,6 +1038,20 @@ export default function App() {
       )}
       {activeModal === 'aiConfig' && <AiConfigModal onClose={() => setActiveModal(null)} />}
       {activeModal === 'phoneAutomation' && <PhoneAutomationSettingsModal leadStatuses={leadStatuses} onClose={() => setActiveModal(null)} />}
+      {activeModal === 'payment' && (
+        <PaymentModal
+          isOpen={true}
+          onClose={() => setActiveModal(null)}
+          onActivated={checkLicenseStatus}
+        />
+      )}
+      {activeModal === 'license' && (
+        <LicenseManagerModal
+          isOpen={true}
+          onClose={() => setActiveModal(null)}
+          onOpenPayment={() => setActiveModal('payment')}
+        />
+      )}
 
       {/* Real-time Incoming Call Overlay */}
       <IncomingCallModal
@@ -1035,6 +1065,15 @@ export default function App() {
           }
         }}
       />
+
+      {/* FULL LOCK OVERLAY IF NOT LICENSED */}
+      {licenseStatus && !licenseStatus.isLicensed && activeModal !== 'payment' && (
+        <LicenseLockScreen
+          status={licenseStatus}
+          onActivated={() => checkLicenseStatus()}
+          onOpenPayment={() => setActiveModal('payment')}
+        />
+      )}
     </div>
   );
 }

@@ -409,7 +409,7 @@
     if (!node || node.nodeType !== 1) return [];
 
     // ── Composer/UI exclusion tuyệt đối ──
-    const COMPOSER_EXCLUDE = 'form, [contenteditable="true"], [role="textbox"], [aria-label="Aa"], [aria-label="Tin nhắn"], [aria-label*="composer"], [aria-label*="Soạn"], [role="contentinfo"], header, nav';
+    const COMPOSER_EXCLUDE = 'form, [contenteditable="true"], [role="textbox"], [aria-label="Aa"], [aria-label="Tin nhắn"], [aria-label*="composer"], [aria-label*="Soạn"], [role="contentinfo"], header, nav, [role="complementary"], [aria-label*="Thông tin về đoạn chat"], [aria-label*="Conversation information"], [aria-label*="Chi tiết cuộc trò chuyện"]';
 
     // Đảm bảo node nằm trong vùng chat trung tâm main, không nằm trong composer/header/nav
     const inMain = node.closest?.('div[role="main"]');
@@ -555,8 +555,17 @@
           sender_name = rawSender;
         }
       } else {
-        is_outgoing = false;
-        sender_name = '';
+        const urlMatch = location.href.match(/\/messages\/(?:e2ee\/)?t\/([^\/?#]+)/);
+        const contactNameEl = document.querySelector('header h1, header h2, [role="main"] h1, [role="main"] h2, span[aria-level="1"]');
+        const contactNameStr = contactNameEl ? contactNameEl.textContent.trim() : '';
+        const hasContactAvatar = contactNameStr ? !!(
+          Array.from(messageRow.querySelectorAll('img[alt], div[role="img"][aria-label], img[aria-label]')).some(el => {
+            const alt = el.getAttribute('alt') || el.getAttribute('aria-label') || '';
+            return alt.toLowerCase().includes(contactNameStr.toLowerCase());
+          })
+        ) : false;
+        is_outgoing = !hasContactAvatar;
+        sender_name = is_outgoing ? 'Bạn' : contactNameStr;
       }
     }
 
@@ -648,17 +657,17 @@
   let observerPaused = false;
 
   function makeDomMessageId(thread_id, parsed) {
+    if (parsed.native_id) return String(parsed.native_id);
     let textHash = 0;
     const strToHash = `${thread_id}|${parsed.is_outgoing}|${parsed.sender_name}|${parsed.content}|${parsed.effective_label}`;
     for (let i = 0; i < strToHash.length; i++) {
       textHash = Math.imul(31, textHash) + strToHash.charCodeAt(i) | 0;
     }
-    const stableId = parsed.native_id || `hash_${Math.abs(textHash)}`;
-    return `dom_${thread_id}_${stableId}_${parsed.bubble_idx}`;
+    return `dom_${thread_id}_hash_${Math.abs(textHash)}_${parsed.bubble_idx}`;
   }
 
   function seedBaseline(thread_id) {
-    const existingRows = document.querySelectorAll('div[role="row"], div[data-scope="messages_table"] div[dir="auto"]');
+    const existingRows = document.querySelectorAll('div[role="row"], div[role="article"], div[data-scope="messages_table"] div[dir="auto"]');
     existingRows.forEach(row => {
       const parsedMessages = parseMessagesFromDOMNode(row);
       parsedMessages.forEach(p => {
@@ -705,10 +714,13 @@
       const parsedMessages = parseMessagesFromDOMNode(node, true);
       if (parsedMessages.length === 0) return;
 
-      // Nếu observer đang paused trong lúc load lịch sử, chỉ cho phép tin nhắn outgoing (vừa gửi) đi qua
-      const activeParsed = observerPaused
-        ? parsedMessages.filter(p => p.is_outgoing)
-        : parsedMessages;
+      // Baseline rows were already added to lastObservedMessages before the
+      // observer was unpaused. Do not suppress incoming bubbles here: the first
+      // customer reply often arrives while Messenger is still hydrating after
+      // our outgoing bubble, and suppressing all incoming rows in that window
+      // made the customer have to send a second message. Stable DOM/native IDs
+      // below remain the replay guard for old history.
+      const activeParsed = parsedMessages;
       if (activeParsed.length === 0) return;
 
       const contactAvatar = extractContactAvatarFromNode(node);
@@ -771,6 +783,7 @@
                 sender_name: parsed.sender_name,
                 content: parsed.content,
                 is_outgoing: parsed.is_outgoing,
+                sender_role: parsed.is_outgoing ? 'operator' : 'customer',
                 fb_message_id: fbMessageId,
                 media_type: parsed.media_type || 'text',
                 media_url: parsed.media_url || null,

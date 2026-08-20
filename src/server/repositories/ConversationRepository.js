@@ -153,21 +153,23 @@ class ConversationRepository {
     return database.prepare(`
       SELECT * FROM messages
       WHERE thread_id = ?
-      ORDER BY timestamp_ms DESC, created_at DESC, id DESC
+      ORDER BY COALESCE(sequence_order, id) DESC, id DESC
       LIMIT ? OFFSET ?
     `).all(threadId, limit, offset).reverse();
   }
 
   static saveMessagesTransaction(threadId, messages = [], database = getDefaultDb()) {
     const insertMsg = database.prepare(`
-      INSERT INTO messages (thread_id, fb_message_id, sender_id, content, timestamp_ms, timestamp_source, is_outgoing, direction_status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO messages (thread_id, fb_message_id, sender_id, content, timestamp_ms, timestamp_source, is_outgoing, sender_role, sequence_order, direction_status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(fb_message_id) DO UPDATE SET
         content = CASE WHEN excluded.content IS NOT NULL AND excluded.content <> '' THEN excluded.content ELSE messages.content END,
-        timestamp_ms = CASE WHEN excluded.timestamp_ms > messages.timestamp_ms THEN excluded.timestamp_ms ELSE messages.timestamp_ms END,
-        timestamp_source = CASE WHEN excluded.timestamp_source <> 'fallback' THEN excluded.timestamp_source ELSE messages.timestamp_source END,
-        created_at = CASE WHEN excluded.timestamp_ms > 0 THEN excluded.created_at ELSE messages.created_at END,
+        timestamp_ms = excluded.timestamp_ms,
+        timestamp_source = excluded.timestamp_source,
+        created_at = excluded.created_at,
         is_outgoing = CASE WHEN excluded.direction_status = 'confirmed' THEN excluded.is_outgoing ELSE messages.is_outgoing END,
+        sender_role = CASE WHEN excluded.direction_status = 'confirmed' THEN excluded.sender_role ELSE messages.sender_role END,
+        sequence_order = CASE WHEN excluded.sequence_order IS NOT NULL THEN excluded.sequence_order ELSE messages.sequence_order END,
         direction_status = CASE WHEN excluded.direction_status = 'confirmed' THEN 'confirmed' ELSE messages.direction_status END
     `);
     const rank = { facebook_payload: 6, facebook_label: 5, dom_order: 5, facebook_dom: 4, realtime_fallback: 3, sync: 3, fallback: 2, unknown: 1 };
@@ -179,25 +181,53 @@ class ConversationRepository {
           ? 'pending'
           : 'confirmed';
         const senderId = msg.sender_id || msg.sender || (isOutgoing ? String(msg.account_id || 'SYSTEM') : 'CONTACT');
+        const senderRole = isOutgoing ? 'operator' : 'customer';
+        const observedSequence = Number.isFinite(Number(msg.sequence_order ?? msg.dom_order))
+          ? Number(msg.sequence_order ?? msg.dom_order)
+          : null;
         const stableId = msg.fb_message_id || msg.messageId || msg.client_message_id || ConversationRepository.fingerprint(threadId, msg);
-        const timestampMs = msg.timestamp_ms || msg.timestamp || 0;
-        const timestampSource = msg.timestamp_source || 'sync';
+        const observedTimestampMs = Number(msg.timestamp_ms || msg.timestamp || 0);
+        const observedTimestampSource = msg.timestamp_source || 'sync';
         const content = msg.content ?? msg.text ?? msg.cleaned ?? null;
-        const createdAt = msg.created_at || (timestampMs > 0 ? new Date(timestampMs).toISOString() : new Date().toISOString());
-        const existing = database.prepare('SELECT content, timestamp_ms, timestamp_source, is_outgoing, direction_status FROM messages WHERE fb_message_id = ?').get(stableId);
+        const observedCreatedAt = msg.created_at || (observedTimestampMs > 0 ? new Date(observedTimestampMs).toISOString() : new Date().toISOString());
+        const existing = database.prepare('SELECT content, timestamp_ms, timestamp_source, created_at, is_outgoing, sender_role, sequence_order, direction_status FROM messages WHERE fb_message_id = ?').get(stableId);
+        let timestampMs = observedTimestampMs;
+        let timestampSource = observedTimestampSource;
+        let createdAt = observedCreatedAt;
         if (existing) {
+          const oldRank = rank[existing.timestamp_source] || 1;
+          const newRank = rank[observedTimestampSource] || 1;
+          // History sync adds a deterministic millisecond DOM offset to
+          // Facebook's minute-only label.  Older rows may already have the
+          // same `facebook_label` provenance but not that offset, so requiring
+          // a strictly better source would leave their incorrect order frozen
+          // forever.  Only let the canonical history pass correct an
+          // equal-rank timestamp; realtime/fallback replays must not move it.
+          const isCanonicalHistoryCorrection = msg.source === 'dom_history_sync'
+            && observedTimestampSource === existing.timestamp_source
+            && observedTimestampMs !== Number(existing.timestamp_ms || 0);
+          const shouldUpgradeTimestamp = observedTimestampMs > 0
+            && (newRank > oldRank || isCanonicalHistoryCorrection);
+          if (!shouldUpgradeTimestamp) {
+            timestampMs = existing.timestamp_ms || 0;
+            timestampSource = existing.timestamp_source || 'unknown';
+            createdAt = existing.created_at;
+          }
           const directionChanged = directionStatus === 'confirmed'
             && (existing.direction_status !== 'confirmed' || existing.is_outgoing !== isOutgoing);
-          const changed = existing.content !== content
-            || timestampMs > (existing.timestamp_ms || 0)
-            || (rank[timestampSource] || 1) > (rank[existing.timestamp_source] || 1)
-            || directionChanged;
+          const timestampChanged = shouldUpgradeTimestamp && (
+            timestampMs !== (existing.timestamp_ms || 0) || timestampSource !== existing.timestamp_source
+          );
+          const sequenceChanged = observedSequence !== null
+            && observedSequence !== Number(existing.sequence_order);
+          const roleChanged = existing.sender_role !== senderRole;
+          const changed = existing.content !== content || timestampChanged || directionChanged || sequenceChanged || roleChanged;
           if (!changed) { result.skippedCount += 1; continue; }
-          insertMsg.run(threadId, stableId, senderId, content, timestampMs, timestampSource, isOutgoing, directionStatus, createdAt);
+          insertMsg.run(threadId, stableId, senderId, content, timestampMs, timestampSource, isOutgoing, senderRole, observedSequence, directionStatus, createdAt);
           result.updatedIds.push(stableId);
           continue;
         }
-        insertMsg.run(threadId, stableId, senderId, content, timestampMs, timestampSource, isOutgoing, directionStatus, createdAt);
+        insertMsg.run(threadId, stableId, senderId, content, timestampMs, timestampSource, isOutgoing, senderRole, observedSequence, directionStatus, createdAt);
         result.insertedIds.push(stableId);
       }
       return result;

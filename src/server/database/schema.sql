@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS messages (
     media_mime_type TEXT,
     media_size INTEGER CHECK(media_size IS NULL OR media_size >= 0),
     is_outgoing BOOLEAN NOT NULL DEFAULT 0,
+    sender_role TEXT NOT NULL DEFAULT 'customer' CHECK(sender_role IN ('customer', 'operator')),
+    sequence_order INTEGER,
     direction_status TEXT NOT NULL DEFAULT 'confirmed' CHECK(direction_status IN ('confirmed', 'pending')),
     is_unsent BOOLEAN NOT NULL DEFAULT 0,
     delivery_status TEXT CHECK(delivery_status IN ('pending', 'sent', 'failed')) DEFAULT 'sent',

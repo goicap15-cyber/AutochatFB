@@ -76,31 +76,31 @@ const migrations = [
     version: 1,
     name: 'add_client_message_id',
     up: (db) => {
-      try { db.exec("ALTER TABLE messages ADD COLUMN client_message_id TEXT;"); } catch(e) {}
+      try { db.exec("ALTER TABLE messages ADD COLUMN client_message_id TEXT;"); } catch (e) { }
     }
   },
   {
     version: 2,
     name: 'add_thread_url',
     up: (db) => {
-      try { db.exec("ALTER TABLE threads ADD COLUMN thread_url TEXT;"); } catch(e) {}
+      try { db.exec("ALTER TABLE threads ADD COLUMN thread_url TEXT;"); } catch (e) { }
     }
   },
   {
     version: 3,
     name: 'add_timestamp_ms',
     up: (db) => {
-      try { db.exec("ALTER TABLE messages ADD COLUMN timestamp_ms INTEGER DEFAULT 0;"); } catch(e) {}
-      try { db.exec("ALTER TABLE messages ADD COLUMN timestamp_source TEXT DEFAULT 'unknown';"); } catch(e) {}
+      try { db.exec("ALTER TABLE messages ADD COLUMN timestamp_ms INTEGER DEFAULT 0;"); } catch (e) { }
+      try { db.exec("ALTER TABLE messages ADD COLUMN timestamp_source TEXT DEFAULT 'unknown';"); } catch (e) { }
     }
   },
   {
     version: 4,
     name: 'add_sync_fields_threads',
     up: (db) => {
-      try { db.exec("ALTER TABLE threads ADD COLUMN sync_status TEXT DEFAULT 'LOCAL';"); } catch(e) {}
-      try { db.exec("ALTER TABLE threads ADD COLUMN sync_cursor TEXT;"); } catch(e) {}
-      try { db.exec("ALTER TABLE threads ADD COLUMN sync_error TEXT;"); } catch(e) {}
+      try { db.exec("ALTER TABLE threads ADD COLUMN sync_status TEXT DEFAULT 'LOCAL';"); } catch (e) { }
+      try { db.exec("ALTER TABLE threads ADD COLUMN sync_cursor TEXT;"); } catch (e) { }
+      try { db.exec("ALTER TABLE threads ADD COLUMN sync_error TEXT;"); } catch (e) { }
     }
   },
   {
@@ -161,8 +161,8 @@ const migrations = [
     version: 8,
     name: 'add_outbound_delivery_state',
     up: (db) => {
-      try { db.exec("ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'sent';"); } catch (e) {}
-      try { db.exec("ALTER TABLE messages ADD COLUMN delivery_error TEXT;"); } catch (e) {}
+      try { db.exec("ALTER TABLE messages ADD COLUMN delivery_status TEXT DEFAULT 'sent';"); } catch (e) { }
+      try { db.exec("ALTER TABLE messages ADD COLUMN delivery_error TEXT;"); } catch (e) { }
       db.exec("UPDATE messages SET delivery_status = CASE WHEN fb_message_id LIKE 'pending_%' THEN 'pending' ELSE 'sent' END WHERE delivery_status IS NULL;");
     }
   },
@@ -170,7 +170,7 @@ const migrations = [
     version: 9,
     name: 'add_external_thread_id',
     up: (db) => {
-      try { db.exec("ALTER TABLE threads ADD COLUMN external_thread_id TEXT;"); } catch (e) {}
+      try { db.exec("ALTER TABLE threads ADD COLUMN external_thread_id TEXT;"); } catch (e) { }
       db.exec("UPDATE threads SET external_thread_id = id WHERE external_thread_id IS NULL OR external_thread_id = '';");
       db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_account_external ON threads(account_id, external_thread_id);");
     }
@@ -196,7 +196,7 @@ const migrations = [
         )
       `);
       // Add source_id to threads
-      try { db.exec("ALTER TABLE threads ADD COLUMN source_id TEXT;"); } catch (e) {}
+      try { db.exec("ALTER TABLE threads ADD COLUMN source_id TEXT;"); } catch (e) { }
       // Auto-create personal_messenger sources for existing accounts
       const accounts = db.prepare('SELECT id, name FROM accounts').all();
       const insertSource = db.prepare(`
@@ -243,7 +243,7 @@ const migrations = [
           UNIQUE(source_type, external_id)
         )
       `);
-      try { db.exec("ALTER TABLE threads ADD COLUMN source_id TEXT;"); } catch (e) {}
+      try { db.exec("ALTER TABLE threads ADD COLUMN source_id TEXT;"); } catch (e) { }
       const accounts = db.prepare('SELECT id, name FROM accounts').all();
       const insertSource = db.prepare(`
         INSERT OR IGNORE INTO inbox_sources (id, source_type, owner_account_id, external_id, display_name, status)
@@ -279,7 +279,7 @@ const migrations = [
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `);
-      try { db.exec("ALTER TABLE contacts ADD COLUMN status_id INTEGER REFERENCES lead_statuses(id);"); } catch (e) {}
+      try { db.exec("ALTER TABLE contacts ADD COLUMN status_id INTEGER REFERENCES lead_statuses(id);"); } catch (e) { }
       const seedStatuses = db.prepare('SELECT COUNT(*) AS count FROM lead_statuses').get().count;
       if (seedStatuses === 0) {
         const insert = db.prepare('INSERT INTO lead_statuses (name, color) VALUES (?, ?)');
@@ -303,7 +303,7 @@ const migrations = [
     name: "add_bulk_campaigns",
     up: (db) => {
       for (const [name, type] of [["campaign_id", "TEXT"], ["campaign_recipient_id", "TEXT"], ["campaign_attempt_id", "TEXT"], ["idempotency_key", "TEXT"]]) {
-        try { db.exec("ALTER TABLE message_queue ADD COLUMN " + name + " " + type + ";"); } catch (e) {}
+        try { db.exec("ALTER TABLE message_queue ADD COLUMN " + name + " " + type + ";"); } catch (e) { }
       }
       db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_message_queue_idempotency ON message_queue(idempotency_key) WHERE idempotency_key IS NOT NULL;");
       db.exec(fs.readFileSync(path.join(__dirname, "campaignSchema.sql"), "utf8"));
@@ -315,7 +315,7 @@ const migrations = [
     name: 'complete_bulk_campaigns',
     up: (db) => {
       const addColumn = (table, name, type) => {
-        try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type};`); } catch (error) {}
+        try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type};`); } catch (error) { }
       };
       addColumn('contacts', 'campaign_opt_out', 'BOOLEAN NOT NULL DEFAULT 0');
       addColumn('campaigns', 'send_cap', 'INTEGER NOT NULL DEFAULT 50');
@@ -343,7 +343,7 @@ const migrations = [
     name: 'add_crm_rich_messaging',
     up: (db) => {
       const addColumn = (table, name, type) => {
-        try { db.exec('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + type + ';'); } catch (error) {}
+        try { db.exec('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + type + ';'); } catch (error) { }
       };
       addColumn('messages', 'attachment_id', 'TEXT REFERENCES outbound_attachments(id)');
       addColumn('messages', 'latest_attempt_id', 'TEXT REFERENCES outbound_attempts(id)');
@@ -369,7 +369,7 @@ const migrations = [
     version: 17,
     name: 'add_contact_custom_fields',
     up: (db) => {
-      try { db.exec("ALTER TABLE contacts ADD COLUMN custom_fields TEXT DEFAULT '[]';"); } catch (e) {}
+      try { db.exec("ALTER TABLE contacts ADD COLUMN custom_fields TEXT DEFAULT '[]';"); } catch (e) { }
       console.log('[DB] Migration v17: Added contacts.custom_fields.');
     }
   },
@@ -377,7 +377,7 @@ const migrations = [
     version: 18,
     name: 'add_contact_address',
     up: (db) => {
-      try { db.exec('ALTER TABLE contacts ADD COLUMN address TEXT;'); } catch (e) {}
+      try { db.exec('ALTER TABLE contacts ADD COLUMN address TEXT;'); } catch (e) { }
       console.log('[DB] Migration v18: Added contacts.address.');
     }
   },
@@ -385,7 +385,7 @@ const migrations = [
     version: 19,
     name: 'add_followup_archive',
     up: (db) => {
-      try { db.exec('ALTER TABLE threads ADD COLUMN archived_at DATETIME;'); } catch (e) {}
+      try { db.exec('ALTER TABLE threads ADD COLUMN archived_at DATETIME;'); } catch (e) { }
       db.exec("CREATE TABLE IF NOT EXISTS conversation_reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL UNIQUE, due_at DATETIME NOT NULL, note TEXT, status TEXT NOT NULL DEFAULT 'active', created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS idx_conversation_reminders_due ON conversation_reminders(status, due_at);");
       console.log('[DB] Migration v19: Added CRM follow-up reminders and archive state.');
     }
@@ -411,9 +411,9 @@ const migrations = [
       `);
       db.exec('CREATE INDEX IF NOT EXISTS idx_contact_phone_captures_thread ON contact_phone_captures(thread_id, message_timestamp_ms);');
 
-      try { db.exec('ALTER TABLE contacts ADD COLUMN phone_source TEXT;'); } catch (e) {}
-      try { db.exec('ALTER TABLE contacts ADD COLUMN phone_capture_id INTEGER REFERENCES contact_phone_captures(id);'); } catch (e) {}
-      try { db.exec('ALTER TABLE contacts ADD COLUMN phone_captured_at DATETIME;'); } catch (e) {}
+      try { db.exec('ALTER TABLE contacts ADD COLUMN phone_source TEXT;'); } catch (e) { }
+      try { db.exec('ALTER TABLE contacts ADD COLUMN phone_capture_id INTEGER REFERENCES contact_phone_captures(id);'); } catch (e) { }
+      try { db.exec('ALTER TABLE contacts ADD COLUMN phone_captured_at DATETIME;'); } catch (e) { }
 
       db.exec(`
         CREATE TABLE IF NOT EXISTS campaign_phone_capture_actions (
@@ -435,14 +435,14 @@ const migrations = [
         );
       `);
 
-      try { db.exec("ALTER TABLE campaigns ADD COLUMN phone_capture_policy TEXT NOT NULL DEFAULT 'continue';"); } catch (e) {}
-      try { db.exec('ALTER TABLE campaigns ADD COLUMN phone_capture_thank_you_text TEXT;'); } catch (e) {}
+      try { db.exec("ALTER TABLE campaigns ADD COLUMN phone_capture_policy TEXT NOT NULL DEFAULT 'continue';"); } catch (e) { }
+      try { db.exec('ALTER TABLE campaigns ADD COLUMN phone_capture_thank_you_text TEXT;'); } catch (e) { }
       // Deliberately no FK here (unlike contacts.phone_capture_id above) - a
       // campaign must be able to keep pointing at a since-deleted status
       // (FR-012) so a later capture can report phone_capture_status_unavailable,
       // instead of either losing that fact or having the status deletion
       // itself blocked by a dangling reference.
-      try { db.exec('ALTER TABLE campaigns ADD COLUMN phone_capture_status_id INTEGER;'); } catch (e) {}
+      try { db.exec('ALTER TABLE campaigns ADD COLUMN phone_capture_status_id INTEGER;'); } catch (e) { }
 
       // Legacy non-empty phone values predate provenance tracking - mark them
       // explicitly protected so PhoneCaptureService never treats a contact
@@ -571,9 +571,9 @@ const migrations = [
     version: 23,
     name: 'add_campaign_recipient_route_snapshot',
     up: (db) => {
-      try { db.exec("ALTER TABLE campaign_recipients ADD COLUMN source_type_snapshot TEXT;"); } catch(e) {}
-      try { db.exec("ALTER TABLE campaign_recipients ADD COLUMN source_external_id_snapshot TEXT;"); } catch(e) {}
-      try { db.exec("ALTER TABLE campaign_recipients ADD COLUMN source_display_name_snapshot TEXT;"); } catch(e) {}
+      try { db.exec("ALTER TABLE campaign_recipients ADD COLUMN source_type_snapshot TEXT;"); } catch (e) { }
+      try { db.exec("ALTER TABLE campaign_recipients ADD COLUMN source_external_id_snapshot TEXT;"); } catch (e) { }
+      try { db.exec("ALTER TABLE campaign_recipients ADD COLUMN source_display_name_snapshot TEXT;"); } catch (e) { }
       console.log('[DB] Migration v23: Added route snapshot columns to campaign_recipients table.');
     }
   },
@@ -593,7 +593,7 @@ const migrations = [
           FOREIGN KEY(campaign_message_id) REFERENCES campaign_messages(id) ON DELETE CASCADE
         );
       `);
-      try { db.exec("ALTER TABLE campaign_attachments ADD COLUMN manifest_id TEXT REFERENCES campaign_attachment_manifests(id) ON DELETE CASCADE;"); } catch(e) {}
+      try { db.exec("ALTER TABLE campaign_attachments ADD COLUMN manifest_id TEXT REFERENCES campaign_attachment_manifests(id) ON DELETE CASCADE;"); } catch (e) { }
       db.exec("CREATE INDEX IF NOT EXISTS idx_campaign_attachments_manifest ON campaign_attachments(manifest_id);");
       console.log('[DB] Migration v24: Added campaign_attachment_manifests table and campaign_attachments.manifest_id (spec 040).');
     }
@@ -602,8 +602,34 @@ const migrations = [
     version: 25,
     name: 'add_message_queue_manifest_id',
     up: (db) => {
-      try { db.exec("ALTER TABLE message_queue ADD COLUMN manifest_id TEXT;"); } catch(e) {}
+      try { db.exec("ALTER TABLE message_queue ADD COLUMN manifest_id TEXT;"); } catch (e) { }
       console.log('[DB] Migration v25: Added message_queue.manifest_id for manifest-aware dispatch (spec 040).');
+    }
+  },
+  {
+    version: 26,
+    name: 'add_message_sequence_and_sender_role',
+    up: (db) => {
+      try { db.exec("ALTER TABLE messages ADD COLUMN sender_role TEXT NOT NULL DEFAULT 'customer' CHECK(sender_role IN ('customer', 'operator'));"); } catch (e) { }
+      try { db.exec('ALTER TABLE messages ADD COLUMN sequence_order INTEGER;'); } catch (e) { }
+      db.exec(`
+        UPDATE messages
+        SET sequence_order = COALESCE(sequence_order, id),
+            sender_role = CASE WHEN is_outgoing = 1 THEN 'operator' ELSE 'customer' END;
+        CREATE TRIGGER IF NOT EXISTS messages_sequence_after_insert AFTER INSERT ON messages BEGIN
+          UPDATE messages
+          SET sequence_order = COALESCE(new.sequence_order, new.id),
+              sender_role = CASE WHEN new.is_outgoing = 1 THEN 'operator' ELSE 'customer' END
+          WHERE id = new.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS messages_role_after_direction_update AFTER UPDATE OF is_outgoing ON messages BEGIN
+          UPDATE messages
+          SET sender_role = CASE WHEN new.is_outgoing = 1 THEN 'operator' ELSE 'customer' END
+          WHERE id = new.id;
+        END;
+        CREATE INDEX IF NOT EXISTS idx_messages_thread_sequence ON messages(thread_id, sequence_order, id);
+      `);
+      console.log('[DB] Migration v26: Added durable message sequence and sender role.');
     }
   }
 ];
@@ -611,7 +637,7 @@ const migrations = [
 function runMigrations() {
   const getVersion = db.prepare('SELECT MAX(version) as version FROM migrations').get();
   let currentVersion = getVersion.version || 0;
-  
+
   const pending = migrations.filter(m => m.version > currentVersion);
   if (pending.length > 0) {
     const beforeCounts = {
@@ -619,7 +645,7 @@ function runMigrations() {
       messages: db.prepare('SELECT COUNT(*) AS count FROM messages').get().count
     };
     console.log(`[DB] Found ${pending.length} pending migrations.`);
-    
+
     const insertMigration = db.prepare('INSERT INTO migrations (version, name) VALUES (?, ?)');
     const migrate = db.transaction((pendingMigrations) => {
       for (const m of pendingMigrations) {
@@ -632,7 +658,7 @@ function runMigrations() {
     try {
       migrate(pending);
       console.log('[DB] Migrations applied successfully.');
-      
+
       // Integrity check
       const integrity = db.pragma('integrity_check', { simple: true });
       if (integrity !== 'ok') {
