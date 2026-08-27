@@ -16,8 +16,14 @@ if (!fs.existsSync(MEDIA_DIR)) {
 }
 
 const DB_PATH = path.join(DATA_DIR, 'database.db');
-const dbExistedBeforeOpen = fs.existsSync(DB_PATH) && fs.statSync(DB_PATH).size > 0;
-const db = new Database(DB_PATH);
+let dbOpts = {};
+if (process.resourcesPath) {
+  const unpackedBinding = path.join(process.resourcesPath, 'app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node');
+  if (fs.existsSync(unpackedBinding)) {
+    dbOpts.nativeBinding = unpackedBinding;
+  }
+}
+const db = new Database(DB_PATH, dbOpts);
 
 // Bật WAL Mode & Synchronous Normal cho hiệu năng tối đa
 db.pragma('journal_mode = WAL');

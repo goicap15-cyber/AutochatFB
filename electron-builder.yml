@@ -7,6 +7,10 @@ directories:
   buildResources: build
   output: release
 
+asar: true
+asarUnpack:
+  - "**/*.node"
+
 # ─── Files to bundle ───────────────────────────────────────────────────
 files:
   - dist/server/**/*
@@ -20,7 +24,7 @@ files:
   - "!**/*.map"
   - "!**/*.md"
   - "!scripts/**/*"
-  - "!*.log"
+  - "!node_modules/better-sqlite3/prebuilds/**"
   # Spec 046 (installer size): build/dev-only packages that are never
   # require()'d at runtime - electron-builder's own devDependency pruning is
   # bypassed by the explicit node_modules/**/* glob above, so these need an
