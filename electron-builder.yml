@@ -49,7 +49,6 @@ win:
   target:
     - target: nsis
       arch: [x64]
-  icon: build/icon.ico
   # Spec 046: bin/chrome-win/ is fetched locally via
   # `npm run fetch-chrome:win` (never committed - see .gitignore) before
   # running electron-builder. Scoped to win: specifically (not the shared
@@ -63,13 +62,9 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
-  installerIcon: build/icon.ico
-  uninstallerIcon: build/icon.ico
-  installerHeaderIcon: build/icon.ico
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: FB Messenger CRM
-  include: build/installer.nsh   # optional custom NSIS script
 
 # ─── Linux AppImage (dev testing) ──────────────────────────────────────
 linux:

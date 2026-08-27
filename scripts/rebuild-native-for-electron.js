@@ -53,19 +53,24 @@ function prepare() {
   }
 
   if (fs.existsSync(BUILD_DIR)) {
-    fs.rmSync(BUILD_DIR, { recursive: true });
+    try {
+      fs.rmSync(BUILD_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 500 });
+    } catch (e) {
+      console.warn('[rebuild-native] Warning removing build dir:', e.message);
+    }
   }
 
   const electronVersion = getElectronVersion();
   console.log(`[rebuild-native] Building better-sqlite3 from source for Electron ${electronVersion} (this is the real fix, not electron-builder's default rebuild step)...`);
-  execFileSync('npx', [
+  const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  execFileSync(npxCmd, [
     '--yes', 'node-gyp', 'rebuild',
     `--target=${electronVersion}`,
     `--arch=${process.arch}`,
     '--dist-url=https://electronjs.org/headers',
     '--force_build=1',
     `--directory=${MODULE_DIR}`
-  ], { stdio: 'inherit', cwd: path.join(__dirname, '..') });
+  ], { stdio: 'inherit', cwd: path.join(__dirname, '..'), shell: true });
 
   const producedNode = path.join(BUILD_DIR, 'Release', 'better_sqlite3.node');
   if (!fs.existsSync(producedNode)) {
