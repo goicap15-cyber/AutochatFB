@@ -54,41 +54,37 @@ async function dispatchTrustedText(tabId, text) {
 const WS_URLS = ['ws://127.0.0.1:5050/extension', 'ws://localhost:5050/extension'];
 let currentWsIndex = 0;
 
-function connectWebSocket() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    return;
-  }
-
-  const targetWsUrl = WS_URLS[currentWsIndex % WS_URLS.length];
-  console.log('[FB Engine] Đang kết nối WebSocket Backend:', targetWsUrl);
-
-  try {
-    ws = new WebSocket(targetWsUrl);
-  } catch (e) {
-    console.error('[FB Engine] Không thể tạo WebSocket:', e.message);
-    currentWsIndex++;
-    scheduleReconnect();
-    return;
-  }
-
+// Was previously declared INSIDE connectWebSocket() - since that function
+// runs again on every reconnect, each reconnect registered a brand new
+// chrome.cookies.onChanged listener and a brand new setInterval on top of
+// whichever ones were already running, so the number of live 2-second
+// timers (each capable of firing REGISTER_ACCOUNT) only ever grew. Moved out
+// here so this is set up exactly once for the service worker's lifetime.
+// Also: the REGISTER_ACCOUNT send below was unconditional on every 2-second
+// tick regardless of whether the user actually changed - together with the
+// duplicate-timer bug this is what flooded the server with REGISTER_ACCOUNT
+// (and everything it broadcasts) roughly once a second.
 async function checkFacebookCookiesAndRegister() {
   try {
     if (!chrome?.cookies) return;
     const cookie = await chrome.cookies.get({ url: 'https://www.facebook.com', name: 'c_user' });
     if (cookie && cookie.value) {
       const newUserId = String(cookie.value).trim();
-      if (newUserId && /^\d+$/.test(newUserId)) {
+      if (newUserId && newUserId !== '0' && /^\d+$/.test(newUserId)) {
+        const hadUser = Boolean(user_id);
         const userChanged = newUserId !== user_id;
         user_id = newUserId;
         if (!pending_key && chrome?.storage?.local) {
           const stored = await chrome.storage.local.get(['crm_pending_key']);
           pending_key = stored?.crm_pending_key || null;
         }
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          console.log('[FB Engine] 📤 Gửi REGISTER_ACCOUNT (từ cookie check):', { account_id: user_id, pending_key });
-          sendToBackend('REGISTER_ACCOUNT', { account_id: user_id, fb_dtsg: fb_dtsg || '', pending_key });
-        } else {
-          connectWebSocket();
+        if (!hadUser || userChanged || pending_key) {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            console.log('[FB Engine] 📤 Gửi REGISTER_ACCOUNT (từ cookie check):', { account_id: user_id, pending_key });
+            sendToBackend('REGISTER_ACCOUNT', { account_id: user_id, fb_dtsg: fb_dtsg || '', pending_key });
+          } else {
+            connectWebSocket();
+          }
         }
       }
     }
@@ -107,6 +103,23 @@ if (chrome?.cookies?.onChanged) {
 }
 
 setInterval(checkFacebookCookiesAndRegister, 2000);
+
+function connectWebSocket() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  const targetWsUrl = WS_URLS[currentWsIndex % WS_URLS.length];
+  console.log('[FB Engine] Đang kết nối WebSocket Backend:', targetWsUrl);
+
+  try {
+    ws = new WebSocket(targetWsUrl);
+  } catch (e) {
+    console.error('[FB Engine] Không thể tạo WebSocket:', e.message);
+    currentWsIndex++;
+    scheduleReconnect();
+    return;
+  }
 
   ws.onopen = () => {
     console.log('[FB Engine] ✅ WebSocket Backend đã kết nối thành công.');
@@ -185,6 +198,45 @@ setInterval(checkFacebookCookiesAndRegister, 2000);
   };
 }
 
+// Facebook can issue c_user/xs (the actual login-session cookies) as
+// session-only (no expirationDate) for browsers it scores as automated -
+// Chrome deletes session cookies on every full browser close, which is why a
+// Chrome Portable profile that logged in successfully still shows a login
+// screen on the next launch even though non-session cookies like datr/fr
+// (confirmed via direct inspection of the Cookies sqlite db) survive fine.
+// The "cookies" permission lets the extension read the cookie right after a
+// real login and rewrite it locally with a long expirationDate - Chrome then
+// treats it as persistent for future launches regardless of how Facebook
+// originally flagged it, since this is a local browser-side rewrite, not
+// something Facebook needs to agree to.
+const FB_SESSION_COOKIE_NAMES = ['c_user', 'xs'];
+const FB_COOKIE_URL = 'https://www.facebook.com/';
+
+async function persistFacebookSessionCookies() {
+  if (!chrome?.cookies) return;
+  for (const name of FB_SESSION_COOKIE_NAMES) {
+    try {
+      const cookie = await chrome.cookies.get({ url: FB_COOKIE_URL, name });
+      if (!cookie || !cookie.session) continue; // missing, or already persistent - nothing to do
+      const oneYearFromNowSeconds = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 365;
+      await chrome.cookies.set({
+        url: FB_COOKIE_URL,
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path,
+        secure: cookie.secure,
+        httpOnly: cookie.httpOnly,
+        sameSite: cookie.sameSite,
+        expirationDate: oneYearFromNowSeconds
+      });
+      console.log(`[FB Engine] 🍪 Đã ép cookie "${name}" từ session-only thành bền (sống sót qua restart).`);
+    } catch (err) {
+      console.warn(`[FB Engine] Không thể ép cookie "${name}" thành bền:`, err.message);
+    }
+  }
+}
+
 function scheduleReconnect() {
   clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
@@ -218,11 +270,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (incomingPendingKey && !pending_key) pending_key = incomingPendingKey;
 
     const hadUser = Boolean(user_id && fb_dtsg);
-    const userChanged = newUserId !== user_id || newDtsg !== fb_dtsg;
+    // fb_dtsg is Facebook's own CSRF token - it rotates on its own every few
+    // seconds regardless of the logged-in user, and the server never even
+    // reads fb_dtsg out of REGISTER_ACCOUNT's payload (only account_id/
+    // pending_key). Treating a dtsg rotation as "user changed" re-sent
+    // REGISTER_ACCOUNT (and every broadcast it triggers) roughly once a
+    // second for as long as the tab stayed open - this is what was flooding
+    // the CRM tab with requests and making it unusable. Still store the
+    // fresh fb_dtsg locally below; only user_id identity changes warrant a
+    // re-registration over the network.
+    const userChanged = newUserId !== user_id;
     fb_dtsg = newDtsg;
     user_id = newUserId;
 
     console.log('[FB Engine] ✅ Đã lấy tokens cho user:', user_id, '| pending_key:', pending_key);
+    persistFacebookSessionCookies().catch(() => {});
     if (ws && ws.readyState === WebSocket.OPEN) {
       if (!hadUser || userChanged || incomingPendingKey) {
         console.log('[FB Engine] 📤 Gửi REGISTER_ACCOUNT từ onMessage:', { account_id: user_id, pending_key });
@@ -2402,10 +2464,17 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
           /^(?:Ghim|Pin)$/i,
           /^(?:Sao chép|Copy)$/i,
           /^Khôi phục ngay$/i,
+          /^Khôi phục tin nhắn$/i,
+          /^Restore now$/i,
+          /^Restore messages$/i,
+          /^Personal chats are secured with end-to-end encryption/i,
           /^Thiếu lịch sử chat/i,
+          /^Thiếu tin nhắn\.?$/i,
+          /^Không khôi phục được tin nhắn\.?$/i,
           /^Bạn đã tạo nhóm này/i,
           /^Chỉ những người tham gia/i,
           /^Bản quyền Meta/i,
+          /^Thêm tin nhắn được cá nhân h(?:óa|oá)\.?$/i,
           /^(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen)$/i,
 /^(?:Đã gửi|Đã nhận|Đã xem|Sent|Delivered|Seen)\s+\d+\s+(?:giây|phút|giờ|ngày|tuần|tháng|năm)\s+(?:trước|ago)$/i,
           /^(?:Đang hoạt động.*|Hoạt động(?:\s+\d+.*)?|Đã hoạt động.*|Active now|Active recently|Active \d+.*|Online|Offline)$/i,
@@ -2414,7 +2483,10 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
           /^(?:Tin nhắn do|Message sent by) .+?(?:gửi lúc|at) .+?:\s*.*$/i,
           /^Nhấn Enter để gửi$/i,
           /^\d{1,2}:\d{2}(?:\s*(?:T[2-7]|CN|AM|PM))?$/i,
-          /^(?:T[2-7]|CN)$/i
+          /^(?:T[2-7]|CN)$/i,
+          /^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i,
+          /^\d{1,2}\s+Tháng\s+\d{1,2}(?:,?\s*\d{4})?$/i,
+          /^(?:Thứ (?:Hai|Ba|Tư|Năm|Sáu|Bảy)|Chủ Nhật|Hôm nay|Hôm qua|Today|Yesterday)$/i
         ];
 
         function isSystemText(txt) {

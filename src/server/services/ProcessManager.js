@@ -1,19 +1,138 @@
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { resolveChromePath } = require('../../../chrome-bundling/resolveChromePath');
+const { resolveExtensionPath, resolveBinRoot } = require('../utils/appResourceRoot');
+const { APP_DATA_ROOT } = require('../utils/appDataRoot');
+
+// Ẩn cửa sổ Chrome khỏi màn hình và taskbar Windows bằng Win32 API
+function hideFromTaskbar(pid, delayMs = 2500) {
+  if (process.platform !== 'win32') return;
+  const psScript = `
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class WinHelper {
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int n, int v);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+}
+'@ -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds ${delayMs}
+
+$targetPids = @()
+if (${pid || 0}) {
+  $targetPids += ${pid}
+  $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = ${pid}" -ErrorAction SilentlyContinue
+  if ($children) { foreach ($c in $children) { $targetPids += $c.ProcessId } }
+}
+
+$crmProcs = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*profiles*' -and $_.CommandLine -notlike '*pending_*' }
+if ($crmProcs) { foreach ($c in $crmProcs) { $targetPids += $c.ProcessId } }
+
+$allChrome = Get-Process -Name 'chrome' -ErrorAction SilentlyContinue
+foreach ($p in $allChrome) {
+  if ($targetPids.Count -eq 0 -or $targetPids -contains $p.Id) {
+    if ($p.MainWindowHandle -ne 0) {
+      $hwnd = $p.MainWindowHandle
+      $ex = [WinHelper]::GetWindowLong($hwnd, -20)
+      $ex = ($ex -band -bnot 0x00040000) -bor 0x00000080
+      [WinHelper]::SetWindowLong($hwnd, -20, $ex) | Out-Null
+      [WinHelper]::ShowWindow($hwnd, 0) | Out-Null
+    }
+  }
+}
+`;
+  const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+  exec(`powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ${encoded}`, (err) => {
+    if (err) console.error('[ProcessManager] Lỗi ẩn Chrome khỏi màn hình/taskbar:', err.message);
+  });
+}
+
+// Tự động cấp quyền (Micro, Camera, Popups, Notifications) cho Facebook trong Chrome Profile Preferences
+function ensureProfilePermissions(profileDir) {
+  try {
+    const defaultDir = path.join(profileDir, 'Default');
+    if (!fs.existsSync(defaultDir)) {
+      fs.mkdirSync(defaultDir, { recursive: true });
+    }
+    const prefPath = path.join(defaultDir, 'Preferences');
+    let prefs = {};
+    if (fs.existsSync(prefPath)) {
+      try {
+        prefs = JSON.parse(fs.readFileSync(prefPath, 'utf8'));
+      } catch (e) {
+        prefs = {};
+      }
+    }
+
+    if (!prefs.profile) prefs.profile = {};
+    if (!prefs.profile.content_settings) prefs.profile.content_settings = {};
+
+    // 1. Chuyển mặc định Default behavior thành Allow (1) cho tất cả các trang
+    if (!prefs.profile.content_settings.default_content_setting_values) {
+      prefs.profile.content_settings.default_content_setting_values = {};
+    }
+    prefs.profile.content_settings.default_content_setting_values.popups = 1; // 1 = Allow popups
+    prefs.profile.content_settings.default_content_setting_values.media_stream_mic = 1; // 1 = Allow mic
+    prefs.profile.content_settings.default_content_setting_values.media_stream_camera = 1; // 1 = Allow camera
+    prefs.profile.content_settings.default_content_setting_values.notifications = 1; // 1 = Allow notifications
+
+    // 2. Kích hoạt Developer Mode cho Extensions
+    if (!prefs.extensions) prefs.extensions = {};
+    if (!prefs.extensions.ui) prefs.extensions.ui = {};
+    prefs.extensions.ui.developer_mode = true;
+
+    // 3. Thêm danh sách ngoại lệ Allow riêng cho Facebook & Messenger
+    if (!prefs.profile.content_settings.exceptions) prefs.profile.content_settings.exceptions = {};
+
+    const origins = [
+      'https://www.facebook.com:443,*',
+      'https://facebook.com:443,*',
+      'https://*.facebook.com:443,*',
+      'https://www.messenger.com:443,*',
+      'https://messenger.com:443,*',
+      'https://*.messenger.com:443,*'
+    ];
+
+    const settingTypes = ['popups', 'media_stream_mic', 'media_stream_camera', 'notifications', 'automatic_downloads'];
+
+    settingTypes.forEach((type) => {
+      if (!prefs.profile.content_settings.exceptions[type]) {
+        prefs.profile.content_settings.exceptions[type] = {};
+      }
+      origins.forEach((origin) => {
+        prefs.profile.content_settings.exceptions[type][origin] = { setting: 1 };
+      });
+    });
+
+    fs.writeFileSync(prefPath, JSON.stringify(prefs, null, 2), 'utf8');
+    console.log(`[ProcessManager] Đã tự động cấu hình Tiện ích (Extension) & Quyền cho Facebook trong profile ${profileDir}`);
+  } catch (err) {
+    console.error('[ProcessManager] Lỗi tự động ghi quyền Preferences Chrome:', err.message);
+  }
+}
 
 class ProcessManager {
   constructor() {
     this.processes = new Map(); // Key: account_id -> { process, profileDir }
-    this.extensionPath = path.join(__dirname, '../../extension');
-    this.binChromePath = path.join(__dirname, '../../../bin/chrome-win/chrome.exe');
+    this.extensionPath = resolveExtensionPath();
+    this.binChromePath = path.join(resolveBinRoot(), 'bin', 'chrome-win', 'chrome.exe');
   }
 
   // Khởi chạy Chrome Portable ngầm cho tài khoản FB
   startAccountProcess(accountId, customProfileDir = null) {
     if (this.processes.has(accountId)) {
-      console.log(`[ProcessManager] Tài khoản ${accountId} đã đang chạy.`);
-      return true;
+      const existing = this.processes.get(accountId);
+      const isAlive = existing.process && !existing.process.killed && existing.pid &&
+        (() => { try { process.kill(existing.pid, 0); return true; } catch { return false; } })();
+      if (isAlive) {
+        console.log(`[ProcessManager] Tài khoản ${accountId} đã đang chạy (PID ${existing.pid}).`);
+        return true;
+      } else {
+        console.log(`[ProcessManager] Phát hiện entry cũ của ${accountId} đã chết (PID ${existing.pid}). Xóa để khởi động lại.`);
+        this.processes.delete(accountId);
+      }
     }
 
     let profileDir = customProfileDir;
@@ -30,27 +149,33 @@ class ProcessManager {
     }
 
     if (!profileDir) {
-      profileDir = path.join(__dirname, `../../../data/profiles/${accountId}`);
+      profileDir = path.join(APP_DATA_ROOT, `profiles/${accountId}`);
     }
 
     if (!fs.existsSync(profileDir)) {
       fs.mkdirSync(profileDir, { recursive: true });
     }
+    ensureProfilePermissions(profileDir);
 
-    // Nếu không có Chrome Portable local bin, fallback về chrome hệ thống
-    const chromeExecutable = fs.existsSync(this.binChromePath) ? this.binChromePath : 'google-chrome';
+    const chromeExecutable = resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+    const absExtPath = path.resolve(this.extensionPath).replace(/\\/g, '/');
+    const absProfileDir = path.resolve(profileDir).replace(/\\/g, '/');
 
     const args = [
-      `--user-data-dir=${profileDir}`,
-      `--load-extension=${this.extensionPath}`,
-      '--disable-gpu',
-      '--disable-software-rasterizer',
+      `--user-data-dir=${absProfileDir}`,
+      `--load-extension=${absExtPath}`,
+      `--disable-extensions-except=${absExtPath}`,
       '--no-first-run',
       '--no-default-browser-check',
+      '--use-fake-ui-for-media-stream',
+      '--disable-popup-blocking',
+      '--autoplay-policy=no-user-gesture-required',
+      '--no-sandbox',
+      '--remote-debugging-port=0',
       'https://www.facebook.com/messages'
     ];
 
-    console.log(`[ProcessManager] Khởi chạy Chrome Portable cho account ${accountId} (Profile: ${profileDir})...`);
+    console.log(`[ProcessManager] Khởi chạy Chrome Portable cho account ${accountId} (Profile: ${absProfileDir})...`);
     try {
       const child = spawn(chromeExecutable, args, {
         detached: true,
@@ -59,14 +184,33 @@ class ProcessManager {
 
       child.unref();
 
+      child.on('error', (err) => {
+        console.error(`[ProcessManager] Lỗi tiến trình Chrome account ${accountId}:`, err.message);
+        if (this.processes.get(accountId)?.pid === child.pid) {
+          this.processes.delete(accountId);
+        }
+      });
+
+      child.on('exit', (code) => {
+        const entry = this.processes.get(accountId);
+        if (entry && entry.pid === child.pid) {
+          console.log(`[ProcessManager] Chrome [PID ${child.pid}] cho account ${accountId} đã tắt (code=${code}). Xóa khỏi danh sách.`);
+          this.processes.delete(accountId);
+        }
+      });
+
       this.processes.set(accountId, {
         process: child,
-        profileDir,
+        profileDir: absProfileDir,
         pid: child.pid,
         status: 'RUNNING'
       });
 
-      console.log(`[ProcessManager] Chrome Portable [PID ${child.pid}] khởi chạy thành công.`);
+      // Tự động ẩn cửa sổ Chrome ngầm khỏi màn hình PC & Taskbar sau khi bật
+      hideFromTaskbar(child.pid, 2000);
+      hideFromTaskbar(child.pid, 5000);
+
+      console.log(`[ProcessManager] Chrome Portable [PID ${child.pid}] khởi chạy thành công và đã tự động chạy ngầm.`);
       return true;
     } catch (err) {
       console.error(`[ProcessManager] Lỗi khởi chạy Chrome cho ${accountId}:`, err.message);
@@ -81,20 +225,28 @@ class ProcessManager {
       return true;
     }
 
-    const profileDir = path.join(__dirname, `../../../data/profiles/${pendingKey}`);
+    const profileDir = path.join(APP_DATA_ROOT, `profiles/${pendingKey}`);
     if (!fs.existsSync(profileDir)) {
       fs.mkdirSync(profileDir, { recursive: true });
     }
+    ensureProfilePermissions(profileDir);
 
-    const chromeExecutable = fs.existsSync(this.binChromePath) ? this.binChromePath : 'google-chrome';
+    const chromeExecutable = resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+    const absExtPath = path.resolve(this.extensionPath).replace(/\\/g, '/');
+    const absProfileDir = path.resolve(profileDir).replace(/\\/g, '/');
 
     const args = [
-      `--user-data-dir=${profileDir}`,
-      `--load-extension=${this.extensionPath}`,
-      '--disable-gpu',
-      '--disable-software-rasterizer',
+      `--user-data-dir=${absProfileDir}`,
+      `--load-extension=${absExtPath}`,
+      `--disable-extensions-except=${absExtPath}`,
       '--no-first-run',
       '--no-default-browser-check',
+      '--use-fake-ui-for-media-stream',
+      '--disable-popup-blocking',
+      '--autoplay-policy=no-user-gesture-required',
+      '--no-sandbox',
+      '--remote-debugging-port=0',
+      '--enable-background-networking',
       `https://www.facebook.com/messages?crm_pending_key=${pendingKey}`
     ];
 
@@ -107,6 +259,21 @@ class ProcessManager {
 
       child.unref();
 
+      child.on('error', (err) => {
+        console.error(`[ProcessManager] Lỗi tiến trình Chrome phiên pending ${pendingKey}:`, err.message);
+        if (this.processes.get(pendingKey)?.pid === child.pid) {
+          this.processes.delete(pendingKey);
+        }
+      });
+
+      child.on('exit', (code) => {
+        const entry = this.processes.get(pendingKey);
+        if (entry && entry.pid === child.pid) {
+          console.log(`[ProcessManager] Chrome pending [PID ${child.pid}] cho ${pendingKey} đã đóng (code=${code}).`);
+          this.processes.delete(pendingKey);
+        }
+      });
+
       this.processes.set(pendingKey, {
         process: child,
         profileDir,
@@ -114,7 +281,7 @@ class ProcessManager {
         status: 'RUNNING'
       });
 
-      console.log(`[ProcessManager] Chrome pending session [PID ${child.pid}] khởi chạy thành công.`);
+      console.log(`[ProcessManager] Chrome pending session [PID ${child.pid}] khởi chạy thành công (cửa sổ mở để người dùng đăng nhập).`);
       return true;
     } catch (err) {
       console.error(`[ProcessManager] Lỗi khởi chạy Chrome cho phiên ${pendingKey}:`, err.message);
@@ -122,30 +289,35 @@ class ProcessManager {
     }
   }
 
-  // Bật sáng cửa sổ Chrome GUI khi gặp Checkpoint / OTP 2FA / Session Expired
-  unhideWindow(accountId) {
-    console.log(`[ProcessManager] CẢNH BÁO: Bật sáng cửa sổ Chrome cho account ${accountId} để xử lý Checkpoint/2FA!`);
+  // Tự động ẩn cửa sổ Chrome ngầm khỏi Taskbar khi vừa hoàn tất đăng ký
+  hideAccountProcess(accountId) {
     const procInfo = this.processes.get(accountId);
-    if (!procInfo) {
-      console.warn(`[ProcessManager] Không tìm thấy tiến trình cho account ${accountId}`);
-      return false;
+    if (procInfo && procInfo.pid) {
+      hideFromTaskbar(procInfo.pid, 500);
+      hideFromTaskbar(procInfo.pid, 2500);
+      console.log(`[ProcessManager] Tự động ẩn Chrome của account ${accountId} khỏi Taskbar.`);
+      return true;
     }
+    return false;
+  }
 
-    // Gọi lệnh PowerShell trên Windows để đưa cửa sổ Chrome có PID tương ứng lên Foreground
+  // Bật sáng cửa sổ Chrome GUI khi gặp Checkpoint / OTP 2FA / Session Expired / Cuộc gọi
+  unhideWindow(accountId) {
+    console.log(`[ProcessManager] Bật sáng cửa sổ Chrome cho account ${accountId}!`);
+    const procInfo = this.processes.get(accountId);
+    const pid = procInfo?.pid;
+
     if (process.platform === 'win32') {
-      const psCommand = `
-        $app = Get-Process -Id ${procInfo.pid} -ErrorAction SilentlyContinue;
-        if ($app) {
-          $sig = '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);';
-          $type = Add-Type -MemberDefinition $sig -Name "Win32SetForegroundWindow" -Namespace Win32Utils -PassThru;
-          $type::SetForegroundWindow($app.MainWindowHandle);
-        }
-      `;
-      exec(`powershell -Command "${psCommand.replace(/\n/g, ' ')}"`, (err) => {
+      const psScript = pid
+        ? `$app = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($app -and $app.MainWindowHandle -ne 0) { try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Win32Helper { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int m); }' } catch {}; [Win32Helper]::ShowWindowAsync($app.MainWindowHandle, 9); [Win32Helper]::SetForegroundWindow($app.MainWindowHandle); }`
+        : `$apps = Get-Process -Name 'chrome' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }; if ($apps) { try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Win32Helper { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int m); }' } catch {}; foreach ($a in $apps) { [Win32Helper]::ShowWindowAsync($a.MainWindowHandle, 9); [Win32Helper]::SetForegroundWindow($a.MainWindowHandle); } }`;
+
+      const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+      exec(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, (err) => {
         if (err) console.error('[ProcessManager] Lỗi đưa cửa sổ Chrome lên foreground:', err.message);
       });
     } else {
-      console.log(`[ProcessManager] (Linux/macOS) Vui lòng kiểm tra cửa sổ Chrome PID ${procInfo.pid}`);
+      console.log(`[ProcessManager] (Linux/macOS) Vui lòng kiểm tra cửa sổ Chrome PID ${pid || 'unknown'}`);
     }
     return true;
   }

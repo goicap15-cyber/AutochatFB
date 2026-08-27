@@ -33,6 +33,10 @@
 - Test: `tests/unit/conversationFilters.test.js` thêm 2 test (sanitize bỏ account đã xoá, match đúng theo account_id). `npm run test:persistence`: 341/341 PASS, không regression. `vite build` PASS. `graphify update .` đã chạy.
 - Chưa verify bằng mắt trên UI thật (cần bạn tự mở popup lọc để xác nhận hiển thị đúng).
 
+### Cập nhật UX (2026-08-20, theo phản hồi thêm từ người dùng)
+
+Ban đầu tất cả nút (Cá nhân/Fanpage + từng account + từng page) hiện phẳng cùng lúc, gây rối mắt. Đổi thành dạng dropdown: nút "Cá nhân"/"Fanpage" giờ chỉ là nút mở/đóng (kèm số đếm điều kiện đang chọn trong nhóm đó và mũi tên xoay), bấm vào mới hiện danh sách con tương ứng (tài khoản cá nhân hoặc Fanpage), có sẵn tuỳ chọn "Tất cả tài khoản cá nhân"/"Tất cả Fanpage" ở đầu mỗi danh sách để giữ nguyên hành vi lọc gộp cũ. Chỉ 1 dropdown mở tại 1 thời điểm. Không đổi logic `sourceKeys`/`sanitizeFilters`/`matchesConversationFilters` — chỉ đổi cách trình bày, nên không cần thêm test logic mới (341/341 test cũ vẫn pass, `vite build` PASS, `graphify update .` đã chạy).
+
 ## Success Criteria
 
 - **SC-001**: Với N tài khoản cá nhân đã kết nối, popup lọc hiện đúng N nút riêng biệt, mỗi nút lọc đúng hội thoại của tài khoản đó.

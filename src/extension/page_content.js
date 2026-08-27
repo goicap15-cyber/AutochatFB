@@ -70,6 +70,10 @@ if (isBusiness) {
     // remounts and scroll-back reveals of older history.
     const ORDER_GAP_MS = 1000;
     const MAX_KNOWN_TIMESTAMPS = 3000;
+    // Spec 047: how far behind Date.now() a forward-extrapolated timestamp is
+    // allowed to drift before it's treated as an untrustworthy stale anchor
+    // (see assignOrderedTimestamps below) rather than a real recent time.
+    const STALE_ANCHOR_MS = 5 * 60 * 1000;
     let knownMessageTimestamps = new Map(); // fbMessageId -> assigned timestamp_ms
 
     // Fallback only for the rare message with no data-message-id at all (see
@@ -291,6 +295,20 @@ if (isBusiness) {
                 if (assigned >= nextKnownTs) assigned = nextKnownTs - 1;
             } else if (lastKnownTs !== null) {
                 assigned = lastKnownTs + ORDER_GAP_MS * (i - lastKnownIdx);
+                // Spec 047: lastKnownTs can be a stale anchor left over from
+                // hours ago (e.g. reopening a thread after a long gap, or the
+                // async backend re-seed on thread switch racing this scan) -
+                // extrapolating forward from it unbounded stamps a message
+                // captured NOW with a synthetic timestamp hours in the past,
+                // scrambling display order against messages from the
+                // intervening time that DID get a fresh anchor. Live evidence
+                // (2026-08-19): a message captured at 09:33 was assigned
+                // 04:41 this way. There's no nextKnownTs bounding this from
+                // above, so nothing else will catch the drift - re-anchor to
+                // now instead, same as the no-anchors-at-all fallback below.
+                if (Date.now() - assigned > STALE_ANCHOR_MS) {
+                    assigned = Date.now() - ORDER_GAP_MS * (orderedIds.length - i);
+                }
             } else if (nextKnownTs !== null) {
                 assigned = nextKnownTs - ORDER_GAP_MS * (nextKnownIdx - i);
             } else {
@@ -737,6 +755,39 @@ if (isBusiness) {
             // guaranteed to exclude this panel.
             const switcherPanelTexts = ['tài sản doanh nghiệp', 'tài khoản của bạn', 'trang quản lý tài sản doanh nghiệp'];
             if (switcherPanelTexts.some(t => lowerText.includes(t))) return;
+
+            // "Thêm tin nhắn được cá nhân hóa." ("Add a personalized message.")
+            // is Facebook's own suggested-reply CTA rendered under a shared
+            // post/marketplace-listing attachment card, not a message - live
+            // report (2026-08-20) showed it repeating as its own fake row with
+            // a real timestamp each scan tick. Checked unconditionally, same
+            // reasoning as switcherPanelTexts above: it's wrapped in the same
+            // dir="auto" structure real bubbles use, so isInsideMessageBubble
+            // does not reliably exclude it. Matches both the standard "hóa"
+            // spelling (confirmed live) and the "hoá" variant defensively.
+            if (/thêm tin nhắn được cá nhân h(?:óa|oá)/i.test(text)) return;
+
+            // Date-separator header Business Suite renders between message
+            // groups - either a short "20 Tháng 4" (day + month, no time/year)
+            // or the full "13:52 6 Tháng 8, 2026" form. Live report
+            // (2026-08-20) confirmed the short form leaking in as its own fake
+            // row, appearing once per group boundary it's re-detected at.
+            // page_content.js has never called the shared FbCrmTextFilter (it
+            // isn't even loaded alongside this content script in manifest.json
+            // - a separate gap from the one that let this leak through), so
+            // this needs its own check here rather than relying on that filter.
+            // Checked unconditionally for the same reason as the CTA text
+            // above: the separator is wrapped in the same dir="auto" structure
+            // real bubbles use.
+            if (/^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i.test(text) ||
+                /^\d{1,2}\s+Tháng\s+\d{1,2}(?:,?\s*\d{4})?$/i.test(text)) return;
+
+            // Short day-of-week / relative-day separator, same family as the
+            // date separator above (e.g. "Thứ Ba", "Hôm nay") - live evidence
+            // (2026-08-20) found these leaking in as fake messages with a
+            // stale synthetic timestamp (spec 047), same mechanism as "20
+            // Tháng 4".
+            if (/^(?:Thứ (?:Hai|Ba|Tư|Năm|Sáu|Bảy)|Chủ Nhật|Hôm nay|Hôm qua|Today|Yesterday)$/i.test(text)) return;
         }
 
         // Unknown direction remains eligible for later scans. Once geometry is

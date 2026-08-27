@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ShieldAlert, Key, CreditCard, RefreshCw, CheckCircle2 } from 'lucide-react';
 
-export default function LicenseLockScreen({ status, onActivated, onOpenPayment }) {
+export default function LicenseLockScreen({ status, onOpenPayment }) {
   const [inputKey, setInputKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -24,9 +24,15 @@ export default function LicenseLockScreen({ status, onActivated, onOpenPayment }
       const jsonLocal = await resLocal.json();
 
       if (resLocal.ok && jsonLocal.success) {
-        setSuccessMsg('Kích hoạt bản quyền thành công! Đang mở ứng dụng...');
+        setSuccessMsg('Kích hoạt bản quyền thành công! Đang tải lại ứng dụng...');
+        // Reload the whole page instead of just flipping licenseStatus: the
+        // account/thread/inbox-source/lead-status fetches only ever run once
+        // on mount, before activation - they all failed with 402 back then
+        // and never got a reason to re-fetch afterward, so the UI stayed
+        // empty even after the lock screen itself correctly went away. A
+        // full reload re-runs every one of those fetches from scratch.
         setTimeout(() => {
-          if (onActivated) onActivated();
+          window.location.reload();
         }, 600);
       } else {
         setError(jsonLocal.message || jsonLocal.error || 'Kích hoạt Key không thành công.');

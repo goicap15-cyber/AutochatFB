@@ -13,6 +13,7 @@ try {
 
 const express = require('express');
 const crypto = require('crypto');
+const { APP_DATA_ROOT } = require('./utils/appDataRoot');
 const OutboundAttachmentRepository = require('./repositories/OutboundAttachmentRepository');
 const OutboundAttemptRepository = require('./repositories/OutboundAttemptRepository');
 const OutboundAttachmentService = require('./services/OutboundAttachmentService');
@@ -42,6 +43,7 @@ const { extractLeadInfo } = require('./utils/leadExtractor');
 const { downloadAvatar, saveAvatarFromBase64OrUrl, serveAvatar } = require('./utils/avatarManager');
 const { isSystemOrMetadataText, cleanMessageText, isInvalidContactName, cleanContactName } = require('./utils/textFilter');
 const { isKnownPageSystemNotice } = require('./utils/pageSystemNotice');
+const { parsePageIdFromInput } = require('./utils/pageIdParser');
 const ConversationRepository = require('./repositories/ConversationRepository');
 const MessageQueueRepository = require('./repositories/MessageQueueRepository');
 const queueWorker = require('./services/QueueWorker');
@@ -190,8 +192,8 @@ app.use(express.static(clientDistPath, {
     }
   } 
 }));
-app.use('/data/media', express.static(path.join(__dirname, '../../data/media')));
-app.use('/data/exports', express.static(path.join(__dirname, '../../data/exports')));
+app.use('/data/media', express.static(path.join(APP_DATA_ROOT, 'media')));
+app.use('/data/exports', express.static(path.join(APP_DATA_ROOT, 'exports')));
 
 const server = http.createServer(app);
 const io = new SocketIOServer(server, { cors: { origin: '*' } });
@@ -453,6 +455,14 @@ wss.on('connection', (ws, req) => {
       switch (msg.type) {
         case 'REGISTER_ACCOUNT': {
           const { account_id, name, pending_key } = msg.data;
+          // Facebook sets c_user=0 as a placeholder while a page is mid-login;
+          // extension-side already guards this (content.js sanitizeUserId), but
+          // reject it here too so a stale/unpatched extension can never create
+          // a bogus "FB Account (0)" row.
+          if (!account_id || String(account_id).trim() === '0') {
+            console.warn(`[WS] Bỏ qua REGISTER_ACCOUNT với account_id không hợp lệ: ${JSON.stringify(account_id)}`);
+            break;
+          }
           extensionConnections.set(account_id, ws);
           InboxSyncScheduler.registerAccount(account_id);
           domReplaySuppressUntil.set(account_id, Date.now() + 8000);
@@ -615,7 +625,7 @@ wss.on('connection', (ws, req) => {
           // reachable during live debugging. Remove once T020 is closed.
           try {
             fs.appendFileSync(
-              path.join(__dirname, '../../data/composer-debug.log'),
+              path.join(APP_DATA_ROOT, 'composer-debug.log'),
               JSON.stringify({ at: new Date().toISOString(), source: 'CONTENT_DEBUG', ...msg.data }) + '\n'
             );
           } catch (error) {
@@ -632,7 +642,7 @@ wss.on('connection', (ws, req) => {
           // T020 is confirmed fixed by a live send.
           try {
             fs.appendFileSync(
-              path.join(__dirname, '../../data/composer-debug.log'),
+              path.join(APP_DATA_ROOT, 'composer-debug.log'),
               JSON.stringify({ at: new Date().toISOString(), ...msg.data }) + '\n'
             );
           } catch (error) {
@@ -2098,7 +2108,7 @@ app.delete(
 
 // Serve campaign-attachment images for in-chat preview (local_media_path stores absolute path,
 // but the browser can only fetch via HTTP - use a thin proxy route to pipe the file contents).
-const CAMPAIGN_ATTACHMENTS_DIR = path.join(__dirname, '../../data/campaign-attachments');
+const CAMPAIGN_ATTACHMENTS_DIR = path.join(APP_DATA_ROOT, 'campaign-attachments');
 app.get('/api/campaign-attachments/:filename', requireLocalCrmRequest, (req, res) => {
   try {
     const filename = path.basename(req.params.filename); // strip any traversal
@@ -2190,6 +2200,35 @@ app.get('/api/inbox-sources', (req, res) => {
   } catch (error) {
     console.error('[InboxSource] Fetch failed:', error);
     res.status(500).json({ error: error.message || 'Không thể lấy danh sách nguồn hội thoại' });
+  }
+});
+
+// Manual "Kết nối Page" flow (AccountManagerModal) — this only ever accepted a
+// raw Page ID or a profile.php?id= link (per the UI's own placeholder text;
+// no Graph API token is actually needed since the extension does DOM
+// automation, not the Graph API), but no route ever backed the POST the
+// frontend sends here — every submit 404'd and Express's default handler
+// returned an HTML page, which broke on the client's res.json() with
+// "Unexpected token '<' ... is not valid JSON". Reuses ensurePageSource(),
+// the same idempotent upsert the automatic page_dom_observer path already
+// uses, so a manually-added Page behaves identically to an auto-detected one.
+app.post('/api/inbox-sources/page', (req, res) => {
+  try {
+    const raw = String(req.body?.page_access_token || '').trim();
+    const ownerAccountId = req.body?.owner_account_id || null;
+    if (!raw) return res.status(400).json({ error: 'Thiếu Link Page hoặc ID Page' });
+
+    const pageId = parsePageIdFromInput(raw);
+    if (!pageId) {
+      return res.status(400).json({ error: 'Không nhận diện được ID Page. Dùng ID số hoặc link dạng facebook.com/profile.php?id=...' });
+    }
+
+    const source = InboxSourceService.ensurePageSource({ pageId, accountId: ownerAccountId, pageName: null }, db);
+    io.emit('INBOX_SOURCE_ADDED', { id: source.id, source_type: 'page_messenger', display_name: source.display_name });
+    res.json(source);
+  } catch (error) {
+    console.error('[InboxSource] Kết nối Page thủ công thất bại:', error);
+    res.status(500).json({ error: error.message || 'Không thể kết nối Page' });
   }
 });
 

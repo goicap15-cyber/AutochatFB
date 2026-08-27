@@ -3,8 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const { ensureMessageDirectionStatus } = require('./messageDirectionMigration');
+const { APP_DATA_ROOT } = require('../utils/appDataRoot');
 
-const DATA_DIR = path.join(__dirname, '../../../data');
+const DATA_DIR = APP_DATA_ROOT;
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }

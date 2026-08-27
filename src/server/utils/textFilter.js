@@ -17,10 +17,17 @@ const SYSTEM_PATTERNS = [
   /^Meta$/i,
   /^Trang chủ$/i,
   /^Khôi phục ngay$/i,
+  /^Khôi phục tin nhắn$/i,
+  /^Restore now$/i,
+  /^Restore messages$/i,
+  /^Personal chats are secured with end-to-end encryption/i,
   /^Thiếu lịch sử chat/i,
+  /^Thiếu tin nhắn\.?$/i,
+  /^Không khôi phục được tin nhắn\.?$/i,
   /^Bạn đã tạo nhóm này/i,
   /^Chỉ những người tham gia/i,
   /^Bản quyền Meta/i,
+  /^Thêm tin nhắn được cá nhân h(?:óa|oá)\.?$/i,
 
   // Right sidebar & header UI elements
   /^(?:Trang cá nhân|View profile)$/i,
@@ -63,7 +70,12 @@ const SYSTEM_PATTERNS = [
   // message every tick forever (its direction never resolves, so the
   // dedup Set never remembers it) - one missing pattern here becomes an
   // unbounded stream of duplicate rows, not just one.
-  /^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i
+  /^\d{1,2}:\d{2}\s+\d{1,2}\s+Tháng\s+\d{1,2},?\s+\d{4}$/i,
+  // Short date-only separator, no time/year (e.g. "20 Tháng 4") - live
+  // report (2026-08-20) found this leaking in as its own fake message row.
+  /^\d{1,2}\s+Tháng\s+\d{1,2}(?:,?\s*\d{4})?$/i,
+  // Short day-of-week / relative-day separator, same family (spec 047).
+  /^(?:Thứ (?:Hai|Ba|Tư|Năm|Sáu|Bảy)|Chủ Nhật|Hôm nay|Hôm qua|Today|Yesterday)$/i
 ];
 
 function isSystemOrMetadataText(text) {

@@ -1070,7 +1070,6 @@ export default function App() {
       {licenseStatus && !licenseStatus.isLicensed && activeModal !== 'payment' && (
         <LicenseLockScreen
           status={licenseStatus}
-          onActivated={() => checkLicenseStatus()}
           onOpenPayment={() => setActiveModal('payment')}
         />
       )}

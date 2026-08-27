@@ -1,7 +1,18 @@
 // AutoChatbot FB Engine - Content Script (Unified with Avatar Extraction)
 (function () {
+  // Facebook sets c_user=0 as a placeholder while a page is mid-login/logged
+  // out - a naive \d+ regex treats "0" as a real user id, which registered a
+  // bogus "FB Account (0)" the moment an existing profile's session cookie
+  // had expired and Facebook was showing a login screen (no actual login
+  // action needed to trigger it).
+  function sanitizeUserId(rawId) {
+    if (!rawId) return null;
+    const id = String(rawId).trim();
+    return (!id || id === '0') ? null : id;
+  }
+
   let capturedFbDtsg = null;
-  let capturedUserId = document.cookie.match(/c_user=(\d+)/)?.[1] || null;
+  let capturedUserId = sanitizeUserId(document.cookie.match(/c_user=(\d+)/)?.[1]);
 
   // Bắt crm_pending_key từ URL nếu có và lưu vào chrome.storage.local
   const urlParams = new URLSearchParams(window.location.search);
@@ -88,7 +99,7 @@
       const netMsg = event.data.data;
       if (!netMsg || !netMsg.thread_id || !netMsg.content) return;
       
-      capturedUserId = capturedUserId || document.cookie.match(/c_user=(\d+)/)?.[1] || null;
+      capturedUserId = capturedUserId || sanitizeUserId(document.cookie.match(/c_user=(\d+)/)?.[1]);
       let sender_id = netMsg.sender_id || (netMsg.is_outgoing ? capturedUserId : null);
       let is_outgoing = netMsg.is_outgoing || false;
       
@@ -122,7 +133,7 @@
     if (event.data && event.data.type === 'FB_TOKEN_DISCOVERED') {
       if (event.data.fb_dtsg) {
         capturedFbDtsg = event.data.fb_dtsg;
-        capturedUserId = capturedUserId || document.cookie.match(/c_user=(\d+)/)?.[1] || null;
+        capturedUserId = capturedUserId || sanitizeUserId(document.cookie.match(/c_user=(\d+)/)?.[1]);
         if (capturedFbDtsg && capturedUserId) {
           reportTokens(capturedFbDtsg, capturedUserId);
         }
@@ -152,14 +163,14 @@
 
   function extractFbTokensFromDOM() {
     if (!capturedUserId) {
-      capturedUserId = document.cookie.match(/c_user=(\d+)/)?.[1] || null;
+      capturedUserId = sanitizeUserId(document.cookie.match(/c_user=(\d+)/)?.[1]);
     }
     const scripts = document.querySelectorAll('script');
     for (const script of scripts) {
       const text = script.textContent || '';
       if (!capturedUserId) {
         const uMatch = text.match(/"USER_ID":"(\d+)"/) || text.match(/"actorID":"(\d+)"/) || text.match(/"ACCOUNT_ID":"(\d+)"/);
-        if (uMatch) capturedUserId = uMatch[1];
+        if (uMatch) capturedUserId = sanitizeUserId(uMatch[1]);
       }
       if (!capturedFbDtsg) {
         if (text.includes('DTSGInitialData') || text.includes('DTSGInitData') || text.includes('fb_dtsg')) {
@@ -357,7 +368,13 @@
   }
 
   // ── DOM Observer with Avatar Extraction ──────────────────────────────────────
-  let lastObservedMessages = new Set();
+  // Map<fbMessageId, lastForwardedIsOutgoing> rather than a plain Set: an id is
+  // now stable across direction-unstable re-scans of the same message (spec
+  // 045), so "already observed" alone can no longer gate resending - a re-scan
+  // that disagrees on direction must still reach the server (with the SAME id)
+  // so ConversationRepository.reconcileExistingMessage's hysteresis (spec 019)
+  // gets a chance to resolve it, instead of being silently dropped forever.
+  let lastObservedMessages = new Map();
 
   function extractThreadIdFromUrl() {
     const match = document.location.href.match(/\/messages\/(?:e2ee\/)?t\/(\d+)/) || 
@@ -422,7 +439,32 @@
     // hiển thị caption và <img> dưới dạng 2 node con riêng biệt của cùng 1
     // article; MutationObserver chỉ báo node vừa thêm (thường là node caption
     // nhỏ), nên phải leo lên article mới thấy được cả <img> anh em của nó.
-    const messageRow = node.closest?.('div[role="article"]') || node.closest?.('div[role="row"]') || node;
+    const directRowMatch = node.closest?.('div[role="article"]') || node.closest?.('div[role="row"]');
+    if (!directRowMatch) {
+      // node isn't itself scoped to a single row - check whether it's a bulk
+      // container holding MULTIPLE separate rows (e.g. Facebook mounting a
+      // whole thread's worth of content at once on a fresh/cold profile's
+      // initial load, or a large virtualization re-render) before falling
+      // back to treating the whole thing as one row below. Live evidence
+      // (2026-08-20, fresh Chrome-for-Testing profile): a page's intro card
+      // (follower count, category tag, "conversation details" link) and
+      // several unrelated real messages all got merged into ONE fake "row"
+      // this way, sharing the SAME arbitrary native_id and SAME arbitrary
+      // direction reading (whichever nested element the querySelector calls
+      // below happened to match first) - producing both garbage-as-message
+      // rows AND ghost duplicates of already-seen real messages with a
+      // flipped direction. Recursing per actual row gives each one its own
+      // correctly-scoped native_id/direction lookup instead.
+      const nestedRows = node.querySelectorAll('div[role="article"], div[role="row"]');
+      if (nestedRows.length > 1) {
+        let combined = [];
+        for (const row of nestedRows) {
+          combined = combined.concat(parseMessagesFromDOMNode(row, isRealtime));
+        }
+        return combined;
+      }
+    }
+    const messageRow = directRowMatch || node;
 
     // ── STALE DOM GUARD (Self-Tagging Marker) ──
     if (messageRow && messageRow.dataset) {
@@ -484,7 +526,12 @@
     const effectiveLabel = rowAriaLabel || (childMsgEl?.getAttribute?.('aria-label') || '');
 
     const hasMessageLabel = /Tin nhắn do .+ gửi lúc|Message sent by/i.test(effectiveLabel);
-    const nativeIdEl = messageRow.querySelector?.('[data-id], [id^="mid."]');
+    // [data-message-id] checked first: live DOM inspection (spec 043) found it's
+    // the reliable current-structure marker, set on the row at insertion time -
+    // unlike the aria-label above, which React hydrates a beat later. Checking
+    // it first means a message row already has a STABLE native_id on the very
+    // first (label-not-yet-hydrated) MutationObserver pass, not just the second.
+    const nativeIdEl = messageRow.querySelector?.('[data-message-id], [data-id], [id^="mid."]');
     const hasNativeId = !!nativeIdEl;
 
     if (!hasMessageLabel && !hasNativeId && !isPhotoMessage) return []; // Không phải message row
@@ -592,7 +639,7 @@
         sender_name: sender_name || (is_outgoing ? 'Bạn' : ''),
         content: caption,
         is_outgoing,
-        native_id: nativeIdEl?.getAttribute('data-id') || nativeIdEl?.getAttribute('id') || messageRow.getAttribute?.('data-id') || null,
+        native_id: nativeIdEl?.getAttribute('data-message-id') || nativeIdEl?.getAttribute('data-id') || nativeIdEl?.getAttribute('id') || messageRow.getAttribute?.('data-message-id') || messageRow.getAttribute?.('data-id') || null,
         effective_label: effectiveLabel,
         is_valid: true,
         bubble_idx: 0,
@@ -625,7 +672,7 @@
         sender_name: sender_name || (is_outgoing ? 'Bạn' : ''),
         content: cleanText,
         is_outgoing,
-        native_id: nativeIdEl?.getAttribute('data-id') || nativeIdEl?.getAttribute('id') || messageRow.getAttribute?.('data-id') || null,
+        native_id: nativeIdEl?.getAttribute('data-message-id') || nativeIdEl?.getAttribute('data-id') || nativeIdEl?.getAttribute('id') || messageRow.getAttribute?.('data-message-id') || messageRow.getAttribute?.('data-id') || null,
         effective_label: effectiveLabel,
         is_valid: true,
         bubble_idx
@@ -657,9 +704,22 @@
   let observerPaused = false;
 
   function makeDomMessageId(thread_id, parsed) {
+    // Real Facebook native id (data-message-id/data-id/mid.*) is always the
+    // most stable identifier when present - use it directly, no hashing.
     if (parsed.native_id) return String(parsed.native_id);
+    // Fallback hash for messages with no native id. is_outgoing/sender_name/
+    // effective_label are deliberately excluded: all three are derived from
+    // the message row's aria-label (see the sender/direction block above),
+    // which React can hydrate a beat after MutationObserver's first pass
+    // fires. Hashing them in meant a re-scan of the SAME physical message
+    // that read a different (still-settling) label produced a DIFFERENT id -
+    // so neither this dedup nor the server's UNIQUE(fb_message_id) ever saw
+    // it as the same message, and it landed as a ghost duplicate row with a
+    // flipped direction (spec 045). Only thread_id+content go into the hash
+    // now - content is read straight off the bubble text node, not the
+    // label, so it doesn't share this instability.
     let textHash = 0;
-    const strToHash = `${thread_id}|${parsed.is_outgoing}|${parsed.sender_name}|${parsed.content}|${parsed.effective_label}`;
+    const strToHash = `${thread_id}|${parsed.content}`;
     for (let i = 0; i < strToHash.length; i++) {
       textHash = Math.imul(31, textHash) + strToHash.charCodeAt(i) | 0;
     }
@@ -671,10 +731,10 @@
     existingRows.forEach(row => {
       const parsedMessages = parseMessagesFromDOMNode(row);
       parsedMessages.forEach(p => {
-        lastObservedMessages.add(makeDomMessageId(thread_id, p));
+        lastObservedMessages.set(makeDomMessageId(thread_id, p), p.is_outgoing);
       });
     });
-    while (lastObservedMessages.size > 2000) lastObservedMessages.delete(lastObservedMessages.values().next().value);
+    while (lastObservedMessages.size > 2000) lastObservedMessages.delete(lastObservedMessages.keys().next().value);
   }
 
   const chatObserver = new MutationObserver((mutations) => {
@@ -739,9 +799,14 @@
 
         const fbMessageId = makeDomMessageId(thread_id, parsed);
 
-        if (lastObservedMessages.has(fbMessageId)) return;
-        lastObservedMessages.add(fbMessageId);
-        if (lastObservedMessages.size > 2000) lastObservedMessages.delete(lastObservedMessages.values().next().value);
+        // Skip only if THIS exact reading (same id, same direction) was already
+        // forwarded - a re-scan that now disagrees on direction is deliberately
+        // let through (with the same fbMessageId) so the server's existing
+        // reconcile/hysteresis path (spec 019) can settle it, rather than a new
+        // duplicate row being created or the correction being silently dropped.
+        if (lastObservedMessages.get(fbMessageId) === parsed.is_outgoing) return;
+        lastObservedMessages.set(fbMessageId, parsed.is_outgoing);
+        if (lastObservedMessages.size > 2000) lastObservedMessages.delete(lastObservedMessages.keys().next().value);
 
         let tsMs = null;
         let tsSource = 'realtime_fallback';
