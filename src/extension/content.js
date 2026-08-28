@@ -917,7 +917,7 @@
     return Math.abs(hash).toString(36);
   }
 
-  setInterval(function() {
+  function scanCallLogsNow() {
     try {
       var threadId = extractThreadIdFromUrl();
       if (!threadId || !/^\d+$/.test(threadId)) return;
@@ -953,23 +953,17 @@
         } else if (lower.includes('đã nhỡ') || lower.includes('bỏ lỡ')) {
           isOutgoing = false;
         } else {
-          // For call bubbles, Facebook doesn't add aria-label like regular messages.
-          // Most reliable: outgoing call rows have NO contact avatar; incoming rows DO.
-          // Walk up max 15 levels to find the row container, then check for avatar img.
           var rowContainer = spanEl.parentElement;
           for (var d = 0; d < 15 && rowContainer; d++) {
-            // Stop at the article, [role="row"] or [role="listitem"] boundary
             var tag = rowContainer.tagName ? rowContainer.tagName.toLowerCase() : '';
             if (tag === 'article' || rowContainer.getAttribute('role') === 'row' || rowContainer.getAttribute('role') === 'listitem') break;
             rowContainer = rowContainer.parentElement;
           }
           if (rowContainer) {
-            // Check for avatar image of the contact inside the row (presence = incoming)
             var imgs = rowContainer.querySelectorAll('img[alt], img[aria-label]');
             var hasContactAvatar = false;
             for (var ii = 0; ii < imgs.length; ii++) {
               var altTxt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').trim();
-              // Contact avatar has a non-empty alt text; 'Bạn'/'You' avatars are outgoing
               if (altTxt && !/^(bạn|you)$/i.test(altTxt)) {
                 hasContactAvatar = true;
                 break;
@@ -978,14 +972,13 @@
             if (hasContactAvatar) {
               isOutgoing = false;
             } else {
-              // No contact avatar found — likely outgoing. Double-check with position.
               var containerEl2 = document.querySelector('div[role="main"]') || document.body;
               var cRect2 = containerEl2.getBoundingClientRect();
               var sRect2 = spanEl.getBoundingClientRect();
               if (cRect2.width > 0 && sRect2.width > 0) {
                 isOutgoing = (sRect2.left - cRect2.left) > (cRect2.width * 0.45);
               } else {
-                isOutgoing = true; // default to outgoing when no avatar and can't measure
+                isOutgoing = true;
               }
             }
           }
@@ -995,16 +988,12 @@
         var displayContent = txt;
         if (durationMatch && !txt.includes(durationMatch[1])) displayContent = txt + ' • ' + durationMatch[1];
 
-        // Stable identity: count occurrences among equivalent call rows, rather than
-        // using the global span position (which changes whenever a text message arrives).
         var signature = threadId + '|' + displayContent.toLowerCase().replace(/\s+/g, ' ').trim() + '|' + timeStr + '|' + (isOutgoing ? 'out' : 'in');
         var occurrence = (scanCounts.get(signature) || 0) + 1;
         scanCounts.set(signature, occurrence);
         scanCalls.push({ signature: signature, occurrence: occurrence, displayContent: displayContent, timeStr: timeStr, isOutgoing: isOutgoing });
       }
 
-      // First pass only records the calls already visible in Messenger. Without
-      // this baseline, reloading the extension would import all historical calls.
       if (!_callBaselineReady) {
         scanCounts.forEach(function(count, signature) { _callSeenCounts.set(signature, count); });
         _callBaselineReady = true;
@@ -1044,7 +1033,9 @@
         } catch(e) {}
       }
     } catch(e) {}
-  }, 800);
+  }
+
+  setInterval(scanCallLogsNow, 300);
 
   // ── Incoming Call Ringing Scanner ───────────────────────────────────────────
   // Detect the real Facebook controls; incoming-call overlays do not always keep
