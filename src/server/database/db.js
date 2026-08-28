@@ -16,6 +16,9 @@ if (!fs.existsSync(MEDIA_DIR)) {
 }
 
 const DB_PATH = path.join(DATA_DIR, 'database.db');
+// Capture this before opening SQLite because opening a missing database creates
+// the file immediately. Migration backups should only run for existing data.
+const dbExistedBeforeOpen = fs.existsSync(DB_PATH);
 let dbOpts = {};
 if (process.resourcesPath) {
   const unpackedBinding = path.join(process.resourcesPath, 'app.asar.unpacked/node_modules/better-sqlite3/build/Release/better_sqlite3.node');
