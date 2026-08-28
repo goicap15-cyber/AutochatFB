@@ -950,41 +950,42 @@
         var isOutgoing = false;
         if (lower.includes('của bạn') || lower.includes('bởi bạn') || lower.includes('do bạn')) {
           isOutgoing = true;
-        } else if (lower.includes('đã nhỡ')) {
+        } else if (lower.includes('đã nhỡ') || lower.includes('bỏ lỡ')) {
           isOutgoing = false;
         } else {
-          // Walk up the DOM to find the message row's aria-label (most reliable)
-          var ancestor = spanEl.parentElement;
-          var foundByLabel = false;
-          for (var depth = 0; depth < 12 && ancestor; depth++) {
-            var ariaLabel = ancestor.getAttribute('aria-label') || '';
-            if (/do Bạn gửi|Tin nhắn do Bạn gửi|Bạn đã gửi|sent by you|You sent/i.test(ariaLabel)) {
-              isOutgoing = true;
-              foundByLabel = true;
-              break;
-            }
-            if (/Tin nhắn do .+ gửi lúc|Message sent by .+ at/i.test(ariaLabel)) {
-              isOutgoing = false;
-              foundByLabel = true;
-              break;
-            }
-            ancestor = ancestor.parentElement;
+          // For call bubbles, Facebook doesn't add aria-label like regular messages.
+          // Most reliable: outgoing call rows have NO contact avatar; incoming rows DO.
+          // Walk up max 15 levels to find the row container, then check for avatar img.
+          var rowContainer = spanEl.parentElement;
+          for (var d = 0; d < 15 && rowContainer; d++) {
+            // Stop at the article, [role="row"] or [role="listitem"] boundary
+            var tag = rowContainer.tagName ? rowContainer.tagName.toLowerCase() : '';
+            if (tag === 'article' || rowContainer.getAttribute('role') === 'row' || rowContainer.getAttribute('role') === 'listitem') break;
+            rowContainer = rowContainer.parentElement;
           }
-          if (!foundByLabel) {
-            // Fallback: check flex alignment classes on the message row container
-            var rowEl = spanEl.closest('[role="row"]') || spanEl.closest('[role="listitem"]') || spanEl.parentElement;
-            var rowClass = rowEl ? (rowEl.className || '') : '';
-            if (/x1n2onr6|xdj266r|x14wch1z|x1euy4s8/.test(rowClass)) {
-              // These Messenger classes are known to indicate outgoing (right-aligned) rows
-              isOutgoing = true;
+          if (rowContainer) {
+            // Check for avatar image of the contact inside the row (presence = incoming)
+            var imgs = rowContainer.querySelectorAll('img[alt], img[aria-label]');
+            var hasContactAvatar = false;
+            for (var ii = 0; ii < imgs.length; ii++) {
+              var altTxt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').trim();
+              // Contact avatar has a non-empty alt text; 'Bạn'/'You' avatars are outgoing
+              if (altTxt && !/^(bạn|you)$/i.test(altTxt)) {
+                hasContactAvatar = true;
+                break;
+              }
+            }
+            if (hasContactAvatar) {
+              isOutgoing = false;
             } else {
-              // Last resort: pixel position (center = not reliable, use wider threshold)
-              var containerEl = document.querySelector('div[role="main"]') || document.body;
-              var cRect = containerEl.getBoundingClientRect();
-              var sRect = spanEl.getBoundingClientRect();
-              if (cRect.width > 0 && sRect.width > 0) {
-                var relativeLeft = sRect.left - cRect.left;
-                isOutgoing = relativeLeft > (cRect.width * 0.45);
+              // No contact avatar found — likely outgoing. Double-check with position.
+              var containerEl2 = document.querySelector('div[role="main"]') || document.body;
+              var cRect2 = containerEl2.getBoundingClientRect();
+              var sRect2 = spanEl.getBoundingClientRect();
+              if (cRect2.width > 0 && sRect2.width > 0) {
+                isOutgoing = (sRect2.left - cRect2.left) > (cRect2.width * 0.45);
+              } else {
+                isOutgoing = true; // default to outgoing when no avatar and can't measure
               }
             }
           }
@@ -1043,7 +1044,7 @@
         } catch(e) {}
       }
     } catch(e) {}
-  }, 2000);
+  }, 800);
 
   // ── Incoming Call Ringing Scanner ───────────────────────────────────────────
   // Detect the real Facebook controls; incoming-call overlays do not always keep
