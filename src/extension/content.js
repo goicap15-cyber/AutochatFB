@@ -953,12 +953,40 @@
         } else if (lower.includes('đã nhỡ')) {
           isOutgoing = false;
         } else {
-          var mainContainer = document.querySelector('div[role="main"]') || document.body;
-          var mainRect = mainContainer.getBoundingClientRect();
-          var spanRect = spanEl.getBoundingClientRect();
-          if (mainRect.width > 0 && spanRect.width > 0) {
-            var relativeLeft = spanRect.left - mainRect.left;
-            if (relativeLeft > (mainRect.width * 0.4)) isOutgoing = true;
+          // Walk up the DOM to find the message row's aria-label (most reliable)
+          var ancestor = spanEl.parentElement;
+          var foundByLabel = false;
+          for (var depth = 0; depth < 12 && ancestor; depth++) {
+            var ariaLabel = ancestor.getAttribute('aria-label') || '';
+            if (/do Bạn gửi|Tin nhắn do Bạn gửi|Bạn đã gửi|sent by you|You sent/i.test(ariaLabel)) {
+              isOutgoing = true;
+              foundByLabel = true;
+              break;
+            }
+            if (/Tin nhắn do .+ gửi lúc|Message sent by .+ at/i.test(ariaLabel)) {
+              isOutgoing = false;
+              foundByLabel = true;
+              break;
+            }
+            ancestor = ancestor.parentElement;
+          }
+          if (!foundByLabel) {
+            // Fallback: check flex alignment classes on the message row container
+            var rowEl = spanEl.closest('[role="row"]') || spanEl.closest('[role="listitem"]') || spanEl.parentElement;
+            var rowClass = rowEl ? (rowEl.className || '') : '';
+            if (/x1n2onr6|xdj266r|x14wch1z|x1euy4s8/.test(rowClass)) {
+              // These Messenger classes are known to indicate outgoing (right-aligned) rows
+              isOutgoing = true;
+            } else {
+              // Last resort: pixel position (center = not reliable, use wider threshold)
+              var containerEl = document.querySelector('div[role="main"]') || document.body;
+              var cRect = containerEl.getBoundingClientRect();
+              var sRect = spanEl.getBoundingClientRect();
+              if (cRect.width > 0 && sRect.width > 0) {
+                var relativeLeft = sRect.left - cRect.left;
+                isOutgoing = relativeLeft > (cRect.width * 0.45);
+              }
+            }
           }
         }
 
