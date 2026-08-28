@@ -1010,7 +1010,7 @@ export default function App() {
       {/* Column 3: Chat Area */}
       <div className="chat-area bg-[var(--color-bg-app)] flex flex-col h-full">
         {activeThreadId && selectedThread ? (
-          <div className="chat-thread flex flex-col h-full flex-1 min-h-0">
+          <div className="chat-thread flex flex-col h-full flex-1 min-h-0 relative">
             <ChatHeader
               activeThread={selectedThread}
               accounts={accounts}

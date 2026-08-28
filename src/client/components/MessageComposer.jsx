@@ -177,30 +177,36 @@ export default function MessageComposer({
 
   const attachmentKind = (file) => String(file?.type || '').toLowerCase().startsWith('image/') ? 'image' : 'file';
 
+  const composerRef = useRef(null);
+
   const isFileDragEvent = (event) => {
     if (!event.dataTransfer?.types) return false;
     const types = Array.from(event.dataTransfer.types);
     return types.some((t) => t.toLowerCase() === 'files' || t.toLowerCase().startsWith('image/'));
   };
 
-  const handleDragEnter = (event) => {
+  const handleDragEnter = useCallback((event) => {
     if (!isFileDragEvent(event)) return;
     event.preventDefault();
     dragDepthRef.current += 1;
     setDraggingAttachment(true);
-  };
-  const handleDragOver = (event) => {
+  }, []);
+
+  const handleDragOver = useCallback((event) => {
     if (!isFileDragEvent(event)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = attachment || disabled ? 'none' : 'copy';
-  };
-  const handleDragLeave = (event) => {
+  }, [attachment, disabled]);
+
+  const handleDragLeave = useCallback((event) => {
     if (!isFileDragEvent(event)) return;
     event.preventDefault();
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDraggingAttachment(false);
-  };
-  const handleDrop = (event) => {
+  }, []);
+
+  const handleDrop = useCallback((event) => {
+    if (!isFileDragEvent(event)) return;
     event.preventDefault();
     dragDepthRef.current = 0;
     setDraggingAttachment(false);
@@ -217,7 +223,24 @@ export default function MessageComposer({
       return;
     }
     selectAttachment(files[0], attachmentKind(files[0]));
-  };
+  }, [attachment, disabled, capabilities]);
+
+  useEffect(() => {
+    const target = composerRef.current?.closest('.chat-thread') || composerRef.current;
+    if (!target) return;
+
+    target.addEventListener('dragenter', handleDragEnter);
+    target.addEventListener('dragover', handleDragOver);
+    target.addEventListener('dragleave', handleDragLeave);
+    target.addEventListener('drop', handleDrop);
+
+    return () => {
+      target.removeEventListener('dragenter', handleDragEnter);
+      target.removeEventListener('dragover', handleDragOver);
+      target.removeEventListener('dragleave', handleDragLeave);
+      target.removeEventListener('drop', handleDrop);
+    };
+  }, [handleDragEnter, handleDragOver, handleDragLeave, handleDrop]);
 
   const hasText = inputText.trim().length > 0;
   const hasSendableContent = hasText || Boolean(attachment);
@@ -225,14 +248,11 @@ export default function MessageComposer({
 
   return (
     <div
+      ref={composerRef}
       className="chat-composer relative px-4 pt-2.5 pb-2.5 bg-[var(--color-bg-panel)] border-t border-[var(--color-border)] select-none shrink-0 w-full sticky bottom-0"
-      onDragEnter={handleDragEnter}
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
     >
       {draggingAttachment && (
-        <div className="absolute inset-1 z-20 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--color-accent)] bg-[var(--color-bg-panel)]/95 text-sm font-semibold text-[var(--color-accent)] pointer-events-none">
+        <div className="fixed inset-0 lg:absolute lg:inset-0 z-30 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--color-accent)] bg-[var(--color-bg-panel)]/95 text-sm font-semibold text-[var(--color-accent)] pointer-events-none">
           {attachment ? 'Gỡ file hiện tại trước khi thêm file mới' : 'Thả ảnh hoặc file vào đây'}
         </div>
       )}
