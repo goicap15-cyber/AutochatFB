@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useContext } from 'react';
-import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle, Trash2 } from 'lucide-react';
 
 export default function AccountManagerModal({ onClose, onSourcesChanged, socket }) {
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [startingId, setStartingId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+  const [accountActionError, setAccountActionError] = useState('');
   const [addingSession, setAddingSession] = useState(false);
   const [pendingKey, setPendingKey] = useState(null);
   const [inboxSources, setInboxSources] = useState([]);
@@ -60,8 +62,19 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
         loadAccounts();
       }
     };
+    const handleExtensionConnection = ({ account_id, is_connected }) => {
+      setAccounts((currentAccounts) => currentAccounts.map((account) => (
+        String(account.id) === String(account_id)
+          ? { ...account, is_extension_connected: is_connected === true }
+          : account
+      )));
+    };
     socket.on('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
-    return () => socket.off('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
+    socket.on('EXTENSION_CONNECTION_CHANGED', handleExtensionConnection);
+    return () => {
+      socket.off('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
+      socket.off('EXTENSION_CONNECTION_CHANGED', handleExtensionConnection);
+    };
   }, [socket, addingSession, initialAccountIds, onSourcesChanged]);
 
   const handleStartChrome = async (accountId) => {
@@ -77,6 +90,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
   };
 
   const handleAddNewAccount = async () => {
+    setAccountActionError('');
     const currentAccounts = await loadAccounts();
     const currentIds = new Set(currentAccounts.map((a) => a.id));
     setInitialAccountIds(currentIds);
@@ -84,16 +98,47 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
     try {
       const res = await fetch('/api/accounts/new-session', { method: 'POST' });
       const data = await res.json();
-      if (data.success) {
+      if (res.ok && data.success) {
         setPendingKey(data.pending_key);
       } else {
+        setAccountActionError(data.error || 'Không thể mở Chrome để thêm tài khoản Facebook');
         setAddingSession(false);
         setInitialAccountIds(null);
       }
     } catch (e) {
       console.error(e);
+      setAccountActionError(e.message || 'Không thể kết nối backend để thêm tài khoản');
       setAddingSession(false);
       setInitialAccountIds(null);
+    }
+  };
+
+  const handleDeleteAccount = async (account) => {
+    const accountName = account.name || account.id;
+    const confirmed = window.confirm(
+      `Xóa tài khoản "${accountName}" khỏi CRM?\n\n` +
+      'Hội thoại, tin nhắn và cấu hình riêng của tài khoản này sẽ bị xóa. ' +
+      'Thư mục Chrome profile vẫn được giữ trên máy.'
+    );
+    if (!confirmed) return;
+
+    setAccountActionError('');
+    setDeletingId(account.id);
+    try {
+      const res = await fetch(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'DELETE' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Không thể xóa tài khoản');
+      }
+      setAccounts((currentAccounts) => currentAccounts.filter(
+        (currentAccount) => String(currentAccount.id) !== String(account.id)
+      ));
+      await loadInboxSources();
+      onSourcesChanged?.();
+    } catch (error) {
+      setAccountActionError(error.message || 'Không thể xóa tài khoản');
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -235,6 +280,11 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
           </div>
 
           {/* Danh sách tài khoản cá nhân */}
+          {accountActionError && (
+            <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+              {accountActionError}
+            </div>
+          )}
           {loading ? (
             <div className="py-8 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
               <RefreshCw size={14} className="animate-spin" /> Đang tải danh sách...
@@ -247,6 +297,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
             <div className="space-y-2.5">
               {accounts.map((acc) => {
                 const isCheckpoint = acc.status === 'CHECKPOINT';
+                const isConnected = acc.is_extension_connected === true;
                 return (
                   <div
                     key={acc.id}
@@ -264,29 +315,48 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
                           <span className="text-[10px] text-slate-500 font-mono">ID: {acc.id}</span>
                           <span
                             className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                              isCheckpoint
-                                ? 'bg-red-500/10 text-red-400 border border-red-500/20'
-                                : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                              isConnected
+                                ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                                : 'bg-slate-500/10 text-slate-400 border border-slate-500/20'
                             }`}
                           >
-                            {isCheckpoint ? 'Checkpoint / 2FA' : 'Hoạt động'}
+                            {isConnected ? 'Đã kết nối' : 'Chưa kết nối'}
                           </span>
+                          {isCheckpoint && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-red-500/10 text-red-400 border border-red-500/20">
+                              Checkpoint / 2FA
+                            </span>
+                          )}
                         </div>
                       </div>
                     </div>
 
-                    <button
-                      onClick={() => handleStartChrome(acc.id)}
-                      disabled={startingId === acc.id}
-                      className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors border shrink-0 ${
-                        isCheckpoint
-                          ? 'bg-red-600 hover:bg-red-500 text-white border-red-500'
-                          : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700/60'
-                      }`}
-                    >
-                      <ExternalLink size={13} />
-                      <span>{startingId === acc.id ? 'Đang mở...' : 'Mở Chrome'}</span>
-                    </button>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={() => handleStartChrome(acc.id)}
+                        disabled={startingId === acc.id || deletingId === acc.id}
+                        className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors border disabled:opacity-50 ${
+                          isCheckpoint
+                            ? 'bg-red-600 hover:bg-red-500 text-white border-red-500'
+                            : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700/60'
+                        }`}
+                      >
+                        <ExternalLink size={13} />
+                        <span>{startingId === acc.id ? 'Đang mở...' : 'Mở Chrome'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteAccount(acc)}
+                        disabled={deletingId === acc.id || startingId === acc.id}
+                        aria-label={`Xóa tài khoản ${acc.name || acc.id}`}
+                        title="Xóa tài khoản khỏi CRM"
+                        className="p-1.5 rounded-md text-red-400 bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 transition-colors disabled:opacity-50"
+                      >
+                        {deletingId === acc.id
+                          ? <RefreshCw size={13} className="animate-spin" />
+                          : <Trash2 size={13} />}
+                      </button>
+                    </div>
                   </div>
                 );
               })}

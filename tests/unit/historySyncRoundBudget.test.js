@@ -9,9 +9,9 @@ vm.runInContext(fs.readFileSync('src/extension/historySyncRoundBudget.js', 'utf8
 const { getMaxRounds, decideStopReason } = context.FbCrmHistorySyncRoundBudget;
 
 test('round-budget matches the modes actually sent by the server', () => {
-  assert.equal(getMaxRounds('initial'), 8);
+  assert.equal(getMaxRounds('initial'), 12);
   assert.equal(getMaxRounds('incremental'), 1);
-  assert.equal(getMaxRounds('deep_backfill'), 12);
+  assert.equal(getMaxRounds('deep_backfill'), 20);
 });
 
 test('unknown mode falls back to a safe default instead of silently under-crawling', () => {

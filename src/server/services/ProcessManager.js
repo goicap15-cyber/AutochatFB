@@ -1,4 +1,4 @@
-const { spawn, exec } = require('child_process');
+const { spawn, exec, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const { resolveChromePath } = require('../../../chrome-bundling/resolveChromePath');
@@ -76,7 +76,7 @@ function ensureProfilePermissions(profileDir) {
     prefs.profile.content_settings.default_content_setting_values.popups = 1; // 1 = Allow popups
     prefs.profile.content_settings.default_content_setting_values.media_stream_mic = 1; // 1 = Allow mic
     prefs.profile.content_settings.default_content_setting_values.media_stream_camera = 1; // 1 = Allow camera
-    prefs.profile.content_settings.default_content_setting_values.notifications = 1; // 1 = Allow notifications
+    prefs.profile.content_settings.default_content_setting_values.notifications = 2; // CRM owns notifications
 
     // 2. Kích hoạt Developer Mode cho Extensions
     if (!prefs.extensions) prefs.extensions = {};
@@ -102,7 +102,7 @@ function ensureProfilePermissions(profileDir) {
         prefs.profile.content_settings.exceptions[type] = {};
       }
       origins.forEach((origin) => {
-        prefs.profile.content_settings.exceptions[type][origin] = { setting: 1 };
+        prefs.profile.content_settings.exceptions[type][origin] = { setting: type === 'notifications' ? 2 : 1 };
       });
     });
 
@@ -169,6 +169,7 @@ class ProcessManager {
       '--no-default-browser-check',
       '--use-fake-ui-for-media-stream',
       '--disable-popup-blocking',
+      '--disable-notifications',
       '--autoplay-policy=no-user-gesture-required',
       '--no-sandbox',
       '--remote-debugging-port=0',
@@ -243,11 +244,12 @@ class ProcessManager {
       '--no-default-browser-check',
       '--use-fake-ui-for-media-stream',
       '--disable-popup-blocking',
+      '--disable-notifications',
       '--autoplay-policy=no-user-gesture-required',
       '--no-sandbox',
       '--remote-debugging-port=0',
       '--enable-background-networking',
-      `https://www.facebook.com/messages?crm_pending_key=${pendingKey}`
+      `https://www.facebook.com/messages/?crm_pending_key=${encodeURIComponent(pendingKey)}`
     ];
 
     console.log(`[ProcessManager] Khởi chạy Chrome mới cho phiên thêm account [${pendingKey}]...`);
@@ -325,23 +327,104 @@ class ProcessManager {
   // Dừng tiến trình Chrome Portable
   stopAccountProcess(accountId) {
     const procInfo = this.processes.get(accountId);
-    if (procInfo && procInfo.process) {
-      try {
-        procInfo.process.kill();
-        this.processes.delete(accountId);
-        console.log(`[ProcessManager] Đã dừng tiến trình Chrome account ${accountId}`);
-        return true;
-      } catch (err) {
-        console.error(`[ProcessManager] Lỗi dừng tiến trình ${accountId}:`, err.message);
-      }
+    if (!procInfo?.pid) return false;
+
+    for (const [key, entry] of this.processes) {
+      if (entry?.pid === procInfo.pid) this.processes.delete(key);
     }
-    return false;
+    try {
+      if (process.platform === 'win32') {
+        const result = spawnSync('taskkill.exe', ['/PID', String(procInfo.pid), '/T', '/F'], {
+          windowsHide: true,
+          encoding: 'utf8'
+        });
+        if (result.error) throw result.error;
+        if (result.status !== 0 && result.status !== 128) {
+          throw new Error(String(result.stderr || result.stdout || `taskkill exit ${result.status}`).trim());
+        }
+      } else {
+        try { process.kill(-procInfo.pid, 'SIGTERM'); }
+        catch (_) { procInfo.process?.kill('SIGTERM'); }
+      }
+      console.log(`[ProcessManager] Đã dừng toàn bộ Chrome process tree account ${accountId} (PID ${procInfo.pid}).`);
+      return true;
+    } catch (err) {
+      console.error(`[ProcessManager] Lỗi dừng process tree ${accountId}:`, err.message);
+      return false;
+    }
   }
 
   getStatus(accountId) {
     const procInfo = this.processes.get(accountId);
     return procInfo ? procInfo.status : 'STOPPED';
   }
+
+  stopAllAccountProcesses() {
+    const accountIds = [...new Set(this.processes.keys())];
+    let stopped = 0;
+    for (const accountId of accountIds) {
+      if (this.stopAccountProcess(accountId)) stopped += 1;
+    }
+    console.log(`[ProcessManager] Stopped ${stopped}/${accountIds.length} managed Chrome process trees.`);
+    return stopped;
+  }
+
+  stopOrphanedManagedChromeProfiles(allowedProfileDirs = []) {
+    if (process.platform !== 'win32') return 0;
+    const profilesRoot = path.resolve(APP_DATA_ROOT, 'profiles');
+    const allowed = allowedProfileDirs
+      .filter(Boolean)
+      .map((profileDir) => path.resolve(profileDir));
+    const escapePs = (value) => String(value).replace(/'/g, "''");
+    const allowedLiteral = allowed.map((profileDir) => `'${escapePs(profileDir)}'`).join(',');
+    const chromeExecutable = resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+    const psScript = `
+$profilesRoot = [IO.Path]::GetFullPath('${escapePs(profilesRoot)}').TrimEnd('\\') + '\\'
+$managedChrome = [IO.Path]::GetFullPath('${escapePs(chromeExecutable)}')
+$allowed = @(${allowedLiteral}) | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\\') }
+$roots = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue | Where-Object {
+  $_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath) -eq $managedChrome -and $_.CommandLine -match '--user-data-dir='
+}
+foreach ($proc in $roots) {
+  $match = [regex]::Match($proc.CommandLine, '--user-data-dir=(?:"([^"]+)"|([^ ]+))')
+  if (-not $match.Success) { continue }
+  $rawProfile = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+  $profile = [IO.Path]::GetFullPath($rawProfile).TrimEnd('\\')
+  $insideManagedRoot = ($profile + '\\').StartsWith($profilesRoot, [StringComparison]::OrdinalIgnoreCase)
+  $isAllowed = $allowed | Where-Object { $_.Equals($profile, [StringComparison]::OrdinalIgnoreCase) }
+  if ($insideManagedRoot -and -not $isAllowed) {
+    & taskkill.exe /PID $proc.ProcessId /T /F | Out-Null
+    Write-Output $proc.ProcessId
+  }
+}`;
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+    const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], {
+      windowsHide: true,
+      encoding: 'utf8',
+      timeout: 20000
+    });
+    const stopped = String(result.stdout || '').split(/\r?\n/).filter((line) => /^\d+$/.test(line.trim())).length;
+    if (result.error) console.warn('[ProcessManager] Could not clean orphaned managed Chrome profiles:', result.error.message);
+    if (stopped) console.log(`[ProcessManager] Stopped ${stopped} orphaned managed Chrome profile(s).`);
+    return stopped;
+  }
+
+  promotePendingProcess(pendingKey, accountId) {
+    const pending = this.processes.get(pendingKey);
+    if (!pending) return false;
+
+    const existing = this.processes.get(accountId);
+    if (existing?.pid && existing.pid !== pending.pid) {
+      this.stopAccountProcess(accountId);
+    }
+
+    for (const [key, entry] of this.processes) {
+      if (entry?.pid === pending.pid) this.processes.delete(key);
+    }
+    this.processes.set(accountId, pending);
+    return true;
+  }
 }
 
 module.exports = new ProcessManager();
+module.exports.ProcessManager = ProcessManager;

@@ -3,6 +3,8 @@ const path = require('path');
 const fs = require('fs');
 
 let mainWindow = null;
+let backendRuntime = null;
+let cleanupStarted = false;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -38,10 +40,10 @@ app.whenReady().then(() => {
 
     if (fs.existsSync(distServer)) {
       console.log('[Electron] Loading compiled server from dist/server/index.js');
-      require(distServer);
+      backendRuntime = require(distServer);
     } else if (fs.existsSync(srcServer)) {
       console.log('[Electron] Loading server from src/server/index.js');
-      require(srcServer);
+      backendRuntime = require(srcServer);
     }
   } catch (err) {
     console.error('[Electron] Error starting backend server:', err.message);
@@ -57,5 +59,15 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  if (cleanupStarted) return;
+  cleanupStarted = true;
+  try {
+    backendRuntime?.stopManagedProcesses?.();
+  } catch (err) {
+    console.error('[Electron] Error stopping managed Chrome processes:', err.message);
   }
 });

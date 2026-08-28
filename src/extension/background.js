@@ -1,10 +1,30 @@
 // AutoChatbot FB Engine - Service Worker Background Script
-importScripts('tabCreationCoordinator.js', 'queueEnvelopeValidation.js');
+importScripts('tabCreationCoordinator.js', 'queueEnvelopeValidation.js', 'callTabDeduplicator.js', 'messengerTabDeduplicator.js');
 const tabCreationCoordinator = self.FbCrmTabCreationCoordinator.createTabCreationCoordinator();
+
+async function blockFacebookNativeNotifications() {
+  if (!chrome?.contentSettings?.notifications) return;
+  const patterns = [
+    'https://[*.]facebook.com/*',
+    'https://[*.]messenger.com/*'
+  ];
+  for (const primaryPattern of patterns) {
+    try {
+      await chrome.contentSettings.notifications.set({
+        primaryPattern,
+        setting: 'block',
+        scope: 'regular'
+      });
+    } catch (_) {}
+  }
+}
+
+blockFacebookNativeNotifications();
 let ws = null;
 let fb_dtsg = null;
 const TRUSTED_SEND_ADAPTER_VERSION = "trusted-send-v1";
 let user_id = null;
+let lastMessengerTabDedupAt = 0;
 let pending_key = null;
 let reconnectTimer = null;
 let reconnectDelay = 3000;
@@ -74,6 +94,7 @@ async function checkFacebookCookiesAndRegister() {
         const hadUser = Boolean(user_id);
         const userChanged = newUserId !== user_id;
         user_id = newUserId;
+        enforceSingleMessengerTabThrottled(user_id).catch(() => {});
         if (!pending_key && chrome?.storage?.local) {
           const stored = await chrome.storage.local.get(['crm_pending_key']);
           pending_key = stored?.crm_pending_key || null;
@@ -298,7 +319,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Forward tin nhắn Facebook đến backend CRM
   if (message.type === 'NEW_MESSAGE_FROM_FB') {
-    const msgData = message.data;
+    let msgData = message.data;
+    const messageThreadKey = String(msgData?.thread_id || '').split(':').pop();
+    const recentOutgoingCallAt = recentOutgoingCallThreads.get(messageThreadKey) || 0;
+    const isCallLog = /cuộc gọi|gọi thoại|gọi video|missed call|voice call|video call/i.test(String(msgData?.content || ''));
+    if (isCallLog && Date.now() - recentOutgoingCallAt < 5 * 60 * 1000) {
+      msgData = { ...msgData, is_outgoing: true, sender_id: user_id, sender_name: 'Bạn' };
+    }
     console.log('[FB Engine] 📨 NEW_MESSAGE_FROM_FB từ content:', JSON.stringify(msgData).substring(0, 300));
     console.log('[FB Engine] 🔍 user_id hiện tại:', user_id);
     // Đính kèm account_id cho backend biết tài khoản nào nhận tin
@@ -476,6 +503,118 @@ function isBusinessSuiteUrl(url) {
   }
 }
 
+async function dismissMessengerRecoveryBlocker(tabId) {
+  // A fresh Facebook profile may cover the composer with the encrypted-chat
+  // recovery confirmation. The composer and file input remain in the DOM,
+  // which previously made every readiness check pass even though no send
+  // interaction could reach them.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const labels = ['Kh\u00f4ng kh\u00f4i ph\u1ee5c tin nh\u1eafn', 'Continue without restoring', 'Continue without restore'];
+        const candidates = [...document.querySelectorAll('button, [role="button"]')];
+        const matching = candidates.filter((el) => {
+          const label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+          const rect = el.getBoundingClientRect();
+          return labels.includes(label) && rect.width > 0 && rect.height > 0;
+        });
+        const button = matching.find((el) => {
+          const rect = el.getBoundingClientRect();
+          const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+          return top === el || el.contains(top);
+        }) || matching.at(-1);
+        if (!button) return null;
+        const rect = button.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, label: (button.getAttribute('aria-label') || button.textContent || '').trim() };
+      }
+    }).catch(() => null);
+    const point = result?.[0]?.result;
+    if (!point) return true;
+
+    const target = { tabId };
+    await chrome.debugger.attach(target, '1.3');
+    try {
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mousePressed', x: point.x, y: point.y, button: 'left', clickCount: 1
+      });
+      await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mouseReleased', x: point.x, y: point.y, button: 'left', clickCount: 1
+      });
+    } finally {
+      try { await chrome.debugger.detach(target); } catch (error) {}
+    }
+    await delay(500);
+  }
+
+  const stillBlocked = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => (document.body.innerText || '').includes('Ti\u1ebfp t\u1ee5c m\u00e0 kh\u00f4ng kh\u00f4i ph\u1ee5c?')
+  }).then((rows) => Boolean(rows?.[0]?.result)).catch(() => false);
+  if (stillBlocked) {
+    // Facebook occasionally renders an enabled visual clone beside a
+    // disabled accessibility clone, but ignores both trusted and DOM clicks
+    // while its recovery request is stale. Remove only recovery dialogs from
+    // this automation tab so the already-mounted composer can receive the
+    // trusted file/Enter events. This does not alter messages or credentials.
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const recoveryPattern = /kh\u00f4i ph\u1ee5c|restore (?:chat|message)/i;
+        [...document.querySelectorAll('[role="dialog"]')]
+          .filter((dialog) => recoveryPattern.test(dialog.innerText || dialog.getAttribute('aria-label') || ''))
+          .forEach((dialog) => dialog.remove());
+      }
+    });
+    await delay(250);
+  }
+  const composerAvailable = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
+      .some((el) => {
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      })
+  }).then((rows) => Boolean(rows?.[0]?.result)).catch(() => false);
+  if (!composerAvailable) {
+    const error = new Error('Messenger recovery dialog is blocking the composer');
+    error.code = 'MESSENGER_RECOVERY_DIALOG_BLOCKED';
+    throw error;
+  }
+  return true;
+}
+
+async function enforceSingleMessengerTab(accountId, preferredTabId = null) {
+  const tabs = await chrome.tabs.query({});
+  const messageTabs = tabs.filter((candidate) =>
+    MessengerTabDeduplicator.isMessagesUrl(candidate.url || candidate.pendingUrl)
+  );
+  const ownedTabs = [];
+  for (const candidate of messageTabs) {
+    try {
+      const result = await chrome.scripting.executeScript({
+        target: { tabId: candidate.id },
+        func: () => document.cookie.match(/c_user=(\d+)/)?.[1] || null
+      });
+      if (String(result?.[0]?.result || '') === String(accountId || '')) ownedTabs.push(candidate);
+    } catch (_) {}
+  }
+
+  const plan = MessengerTabDeduplicator.planMessengerTabs(ownedTabs, preferredTabId);
+  for (const duplicateTabId of plan.duplicateTabIds) {
+    try { await chrome.tabs.remove(duplicateTabId); } catch (_) {}
+  }
+  return plan.keeper;
+}
+
+async function enforceSingleMessengerTabThrottled(accountId, preferredTabId = null, force = false) {
+  if (!accountId) return null;
+  const now = Date.now();
+  if (!force && now - lastMessengerTabDedupAt < 5000) return null;
+  lastMessengerTabDedupAt = now;
+  return enforceSingleMessengerTab(accountId, preferredTabId);
+}
+
 // ── Tab-creation cooldown (personal <-> Page shared-identity conflict) ────
 // Facebook ties "which surface /messages resolves to" to a single active
 // identity per login session (personal profile vs. a managed Page). Since
@@ -538,7 +677,10 @@ async function isTabCreationOnCooldown(role) {
 async function getFacebookTab(accountId) {
   const role = `personal:${accountId}`;
   const registered = await getRegisteredTab(role);
-  if (registered && !isBusinessSuiteUrl(registered.url)) return registered;
+  if (registered && !isBusinessSuiteUrl(registered.url)) {
+    const singleton = await enforceSingleMessengerTab(accountId, registered.id);
+    return singleton || registered;
+  }
   if (registered) {
     // The tab we previously registered as "personal" now resolves to
     // business.facebook.com. This is Facebook's shared-identity session
@@ -582,7 +724,10 @@ async function getFacebookTab(accountId) {
         resolved = messagesTab || matchingTabs[0];
       }
 
-      if (resolved?.id) await registerTab(role, resolved.id);
+      if (resolved?.id) {
+        resolved = await enforceSingleMessengerTab(accountId, resolved.id) || resolved;
+        await registerTab(role, resolved.id);
+      }
       resolve(resolved);
     });
   });
@@ -616,7 +761,7 @@ async function ensureFacebookMessagesTab(accountId, reason = 'background_sync') 
             }
           } catch (e) {}
         }
-        return created || null;
+        return await enforceSingleMessengerTabThrottled(accountId, created?.id, true) || created || null;
       }
     );
     return tab || null;
@@ -635,7 +780,7 @@ async function ensureFacebookMessagesTab(accountId, reason = 'background_sync') 
     }
   }
 
-  return tab;
+  return await enforceSingleMessengerTabThrottled(accountId, tab?.id, true) || tab;
 }
 
 // ── Gửi tin nhắn qua Facebook GraphQL API ──────────────────────────────────
@@ -651,6 +796,9 @@ async function handleSendPersonalMessageWithAttachment({ thread_id, content, att
   try {
     const tab = await ensureFacebookMessagesTab(account_id, 'rich_message_attachment_send');
     if (!tab) {
+      const missingTabError = new Error('Facebook tab not found for attachment send');
+      missingTabError.code = 'FACEBOOK_TAB_NOT_FOUND';
+      throw missingTabError;
       sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không tìm thấy Tab Facebook hoạt động', error_code: 'FACEBOOK_TAB_NOT_FOUND' });
       return;
     }
@@ -658,15 +806,17 @@ async function handleSendPersonalMessageWithAttachment({ thread_id, content, att
     const recipientPsid = thread_id.includes(':') ? thread_id.split(':')[1] : thread_id;
     const onThread = await ensureTabOnThread(tab, recipientPsid, null);
     if (!onThread) {
+      const navigationError = new Error('Messenger thread navigation failed for attachment send');
+      navigationError.code = 'THREAD_NAV_FAILED';
+      throw navigationError;
       sendToBackend('SEND_MESSAGE_RESULT', { thread_id, client_message_id, success: false, error: 'Không thể điều hướng đúng hội thoại Messenger để gửi attachment', error_code: 'THREAD_NAV_FAILED' });
       return;
     }
 
+    await dismissMessengerRecoveryBlocker(tab.id);
     await stagePersonalMessengerAttachment(tab.id, attachmentManifest || attachment);
     await delay(1000);
     await typeAndSubmitComposer(tab.id, content);
-    await delay(300);
-    await dispatchTrustedEnter(tab.id);
     await delay(1500);
 
     console.log('[FB Engine] ✅ Đã dispatch tin nhắn (có đính kèm) qua Messenger cá nhân');
@@ -687,6 +837,7 @@ async function handleSendPersonalMessageWithAttachment({ thread_id, content, att
       error: error.message || 'Lỗi gửi attachment qua Messenger cá nhân',
       error_code: error.code || 'ATTACHMENT_SEND_FAILED'
     });
+    throw error;
   }
 }
 
@@ -1177,18 +1328,20 @@ async function stageAttachmentViaFileChooser(tabId, point, attachmentOrList) {
           selector: 'input[type="file"]'
         }).catch(() => null);
         if (node?.nodeId) {
-          chooserParams = { backendNodeId: node.nodeId };
+          chooserParams = { nodeId: node.nodeId };
         }
       }
       if (!chooserParams) throw e;
     }
 
-    if (!chooserParams?.backendNodeId) {
+    if (!chooserParams?.backendNodeId && !chooserParams?.nodeId) {
       throw new Error('Page.fileChooserOpened không trả về backendNodeId');
     }
     await chrome.debugger.sendCommand(target, 'DOM.setFileInputFiles', {
       files: paths,
-      backendNodeId: chooserParams.backendNodeId
+      ...(chooserParams.backendNodeId
+        ? { backendNodeId: chooserParams.backendNodeId }
+        : { nodeId: chooserParams.nodeId })
     });
     if (isFileTransport) {
       // Facebook displays the on-disk storage filename (local_path's
@@ -1352,8 +1505,13 @@ async function typeAndSubmitComposer(tabId, content) {
         const text = (el.textContent || '').trim();
         return /^(Gửi|Send)$/i.test(text);
       };
-      const findInScope = (scope) => scope.querySelector?.(SEND_SELECTOR) ||
-        [...(scope.querySelectorAll?.('button, [role="button"]') || [])].find(isTextSendButton) || null;
+      const isReadySendButton = (el) => el && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+      const findInScope = (scope) => {
+        const labelled = scope.querySelector?.(SEND_SELECTOR);
+        if (isReadySendButton(labelled)) return labelled;
+        return [...(scope.querySelectorAll?.('button, [role="button"]') || [])]
+          .find((el) => isTextSendButton(el) && isReadySendButton(el)) || null;
+      };
       // Spec 040 T020: an unscoped document-wide search can match an
       // unrelated "Gửi"/"Send"-labeled control elsewhere on Business Suite's
       // page instead of the composer's own send button, silently clicking
@@ -1380,6 +1538,9 @@ async function typeAndSubmitComposer(tabId, content) {
       if (!sendButton) return { success: false, error: 'Không tìm thấy nút Gửi' };
       const composerBefore = document.activeElement;
       const textBefore = (composerBefore?.innerText || composerBefore?.textContent || '').trim();
+      if (!textBefore) {
+        return { success: false, error: 'Attachment-only message requires trusted CDP Enter' };
+      }
       sendButton.click();
       await new Promise((resolve) => setTimeout(resolve, 1200));
       // Spec 040 T020: confirmed live 2026-08-18 - a script-dispatched
@@ -2342,7 +2503,7 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
         // Round-budget phải khớp đúng mode server thực sự gửi (initial/incremental/deep_backfill) -
         // trước đây map này canh theo 'backfill' (không bao giờ được gửi) nên 'initial', mode quan
         // trọng nhất cho lần sync đầu tiên, luôn rơi vào default 5 vòng.
-        const ROUND_BUDGET = { incremental: 1, initial: 8, deep_backfill: 12 };
+        const ROUND_BUDGET = { incremental: 1, initial: 12, deep_backfill: 20 };
         async function loadOlderMessages(container, modeStr) {
           const maxRounds = ROUND_BUDGET[modeStr] || 5;
 
@@ -2390,7 +2551,8 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
               prevScrollHeight = currentScrollHeight;
             }
 
-            if (roundsWithoutIncrease >= 2) {
+            const noGrowthLimit = modeStr === 'incremental' ? 2 : 5;
+            if (roundsWithoutIncrease >= noGrowthLimit) {
               stopReason = 'no_scroll_growth';
               console.log('[FB LazyLoad] Không phát hiện chiều cao scroll tăng sau 2 vòng liên tiếp. Dừng.');
               break;
@@ -2822,13 +2984,57 @@ async function handleSyncThreadMessages({ account_id, thread_id, thread_url, pag
   }
 }
 
-async function handleTriggerMessengerCall({ thread_id, account_id = user_id, call_type = 'audio' }) {
+const handledCallRequests = new Map();
+const recentOutgoingCallThreads = new Map();
+let callTriggerInFlight = false;
+
+async function handleTriggerMessengerCall({ thread_id, account_id = user_id, call_type = 'audio', call_request_id = '' }) {
+  if (callTriggerInFlight) {
+    sendToBackend('CALL_TRIGGER_RESULT', { thread_id, success: false, error: 'CALL_TRIGGER_ALREADY_RUNNING' });
+    return;
+  }
+  callTriggerInFlight = true;
   try {
-    const tab = await ensureFacebookMessagesTab(account_id, 'messenger_call_trigger');
+    const now = Date.now();
+    const requestKey = String(call_request_id || `${account_id}:${thread_id}:${call_type}`);
+    for (const [key, timestamp] of handledCallRequests) {
+      if (now - timestamp > 30000) handledCallRequests.delete(key);
+    }
+    if (handledCallRequests.has(requestKey)) return;
+    handledCallRequests.set(requestKey, now);
+
+    // Never start another Messenger call while this Chrome profile already
+    // owns a groupcall window. Focus the existing call and collapse any stale
+    // duplicates left by Facebook instead.
+    const existingTabs = await chrome.tabs.query({});
+    const existingPlan = CallTabDeduplicator.planGroupCallTabs(existingTabs);
+    if (existingPlan.keeper) {
+      for (const duplicateTabId of existingPlan.duplicateTabIds) {
+        try { await chrome.tabs.remove(duplicateTabId); } catch (_) {}
+      }
+      try {
+        await chrome.tabs.update(existingPlan.keeper.id, { active: true });
+        await chrome.windows.update(existingPlan.keeper.windowId, { focused: true });
+      } catch (_) {}
+      sendToBackend('CALL_TRIGGER_RESULT', {
+        thread_id,
+        success: true,
+        call_type,
+        reused_existing_window: true
+      });
+      return;
+    }
+
+    // Calls never create Messenger tabs. They only reuse the one background
+    // Messenger tab established by account startup.
+    const registeredCallTab = await getRegisteredTab(`personal:${account_id}`);
+    const tab = await enforceSingleMessengerTab(account_id, registeredCallTab?.id || null);
     if (!tab) {
       sendToBackend('CALL_TRIGGER_RESULT', { thread_id, success: false, error: 'Không tìm thấy Tab Facebook Messenger' });
       return;
     }
+
+    await registerTab(`personal:${account_id}`, tab.id);
 
     // Execute call trigger in background Messenger tab so user stays on CRM page (http://localhost:5050)
     // while Facebook's "Cuộc gọi qua Messenger" popup window opens on top.
@@ -2842,9 +3048,18 @@ async function handleTriggerMessengerCall({ thread_id, account_id = user_id, cal
 
     await delay(1200);
 
+    const windowsBeforeCall = await chrome.windows.getAll();
+    const windowIdsBeforeCall = new Set(windowsBeforeCall.map((win) => win.id));
+
     const callResult = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: async (targetType) => {
+        const lockKey = `crm_call_lock:${location.pathname}:${targetType}`;
+        const previousLock = Number(sessionStorage.getItem(lockKey) || 0);
+        if (Date.now() - previousLock < 15000) {
+          return { success: false, duplicate: true, error: 'DUPLICATE_CALL_TRIGGER' };
+        }
+        sessionStorage.setItem(lockKey, String(Date.now()));
         const isVideo = targetType === 'video';
 
         const findButton = () => {
@@ -2901,10 +3116,10 @@ async function handleTriggerMessengerCall({ thread_id, account_id = user_id, cal
 
         if (btn) {
           btn.focus();
+          // HTMLElement.click() already performs the full activation. The
+          // previous synthetic mouse sequence included a second click and
+          // could open two Messenger call windows.
           btn.click();
-          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-          btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
           return { success: true, label: btn.getAttribute('aria-label') };
         }
         return { success: false, error: 'Không tìm thấy nút gọi trên Facebook Messenger' };
@@ -2914,6 +3129,7 @@ async function handleTriggerMessengerCall({ thread_id, account_id = user_id, cal
 
     const res = callResult?.[0]?.result;
     if (res?.success) {
+      recentOutgoingCallThreads.set(String(thread_id).split(':').pop(), Date.now());
       console.log('[FB Engine] ✅ Đã kích hoạt cuộc gọi Messenger thành công:', res.label);
       sendToBackend('CALL_TRIGGER_RESULT', { thread_id, success: true, call_type, label: res.label });
 
@@ -2923,18 +3139,62 @@ async function handleTriggerMessengerCall({ thread_id, account_id = user_id, cal
       // ===========================================================
       const callStartTime = Date.now();
 
-      // Snapshot all windows before the popup opens so we can detect the new one
-      const windowsBefore = await chrome.windows.getAll();
-      const windowIdsBefore = new Set(windowsBefore.map(w => w.id));
+      // Deduplicate by TAB, not by window. Facebook sometimes navigates the
+      // already-existing hidden Messenger tab to /groupcall and also creates
+      // a popup, so filtering only newly-created window IDs misses one copy.
+      let guardedCallTabId = null;
+      for (let guardTick = 0; guardTick < 40; guardTick++) {
+        await delay(200);
+        const allTabs = await chrome.tabs.query({});
+        const preferredWindowIds = allTabs
+          .filter((candidate) => !windowIdsBeforeCall.has(candidate.windowId))
+          .map((candidate) => candidate.windowId);
+        const plan = CallTabDeduplicator.planGroupCallTabs(
+          allTabs,
+          guardedCallTabId,
+          preferredWindowIds
+        );
+        if (!plan.keeper) continue;
+        guardedCallTabId = plan.keeper.id;
+        for (const duplicateTabId of plan.duplicateTabIds) {
+          try { await chrome.tabs.remove(duplicateTabId); } catch (_) {}
+        }
+      }
 
+      // Snapshot all windows before the popup opens so we can detect the new one
       // Wait up to 8 seconds for the Facebook call popup window to open
       let callWindowId = null;
-      for (let i = 0; i < 40; i++) {
+      if (guardedCallTabId != null) {
+        try {
+          const guardedTab = await chrome.tabs.get(guardedCallTabId);
+          callWindowId = guardedTab.windowId;
+        } catch (_) {}
+      }
+      for (let i = 0; !callWindowId && i < 40; i++) {
         await delay(200);
-        const allWindows = await chrome.windows.getAll();
-        const newWin = allWindows.find(w => !windowIdsBefore.has(w.id));
-        if (newWin) {
+        const allWindows = await chrome.windows.getAll({ populate: true });
+        const callWindows = allWindows.filter((win) =>
+          !windowIdsBeforeCall.has(win.id) &&
+          (win.tabs || []).some((callTab) => /facebook\.com\/groupcall\//i.test(String(callTab.url || '')))
+        );
+        if (callWindows.length > 0) {
+          const [newWin, ...duplicates] = callWindows;
           callWindowId = newWin.id;
+          for (const duplicate of duplicates) {
+            try { await chrome.windows.remove(duplicate.id); } catch (_) {}
+          }
+          for (let guardTick = 0; guardTick < 32; guardTick++) {
+            await delay(250);
+            const settledWindows = await chrome.windows.getAll({ populate: true });
+            const lateDuplicates = settledWindows.filter((win) =>
+              win.id !== callWindowId &&
+              !windowIdsBeforeCall.has(win.id) &&
+              (win.tabs || []).some((callTab) => /facebook\.com\/groupcall\//i.test(String(callTab.url || '')))
+            );
+            for (const duplicate of lateDuplicates) {
+              try { await chrome.windows.remove(duplicate.id); } catch (_) {}
+            }
+          }
           console.log('[FB Engine] 📞 Phát hiện window cuộc gọi mới, window ID:', callWindowId, 'type:', newWin.type);
           break;
         }
@@ -2979,6 +3239,8 @@ async function handleTriggerMessengerCall({ thread_id, account_id = user_id, cal
   } catch (err) {
     console.error('[FB Engine] ❌ Lỗi ngoại lệ khi kích hoạt cuộc gọi:', err.message);
     sendToBackend('CALL_TRIGGER_RESULT', { thread_id, success: false, error: err.message });
+  } finally {
+    callTriggerInFlight = false;
   }
 }
 

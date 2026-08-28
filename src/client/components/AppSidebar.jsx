@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { MessageSquare, Search, Zap, Megaphone, Cpu, UserCheck, ShieldAlert, ChevronLeft, ChevronRight, Sun, Moon, Phone, Key, CreditCard } from 'lucide-react';
+import { MessageSquare, Search, Zap, Megaphone, Cpu, UserCheck, ShieldAlert, ChevronLeft, ChevronRight, Sun, Moon, Phone, Key, CreditCard, LogOut } from 'lucide-react';
 import { SIDEBAR_CLOSE_DELAY_MS, shouldKeepSidebarExpanded } from '../utils/appSidebarPresentation.js';
 
 const ICON_SIZE = 18;
@@ -10,7 +10,7 @@ function supportsPointerHover() {
   return typeof window === 'undefined' || !window.matchMedia || window.matchMedia('(hover: hover)').matches;
 }
 
-export default function AppSidebar({ activeView, onSelectView, onOpenModal, theme, onToggleTheme, hasCheckpoint = false, collapsed = false, onToggleCollapse }) {
+export default function AppSidebar({ activeView, onSelectView, onOpenModal, theme, onToggleTheme, hasCheckpoint = false, collapsed = false, onToggleCollapse, sessionUser, onLogout }) {
   const [isExpanded, setIsExpanded] = useState(false);
   const sidebarRef = useRef(null);
   const closeTimerRef = useRef(null);
@@ -143,10 +143,15 @@ export default function AppSidebar({ activeView, onSelectView, onOpenModal, them
             <span className="app-sidebar-label" aria-hidden={!isExpanded}>Giao diện</span>
           </button>
 
-          <div title="Tài khoản Admin" className="app-sidebar-account">
-            <span className="app-sidebar-account-avatar">AD</span>
-            <span className="app-sidebar-label" aria-hidden={!isExpanded}>Tài khoản Admin</span>
+          <div title={sessionUser?.username || 'Tài khoản'} className="app-sidebar-account">
+            <span className="app-sidebar-account-avatar">{String(sessionUser?.username || 'U').slice(0, 2).toUpperCase()}</span>
+            <span className="app-sidebar-label" aria-hidden={!isExpanded}>{sessionUser?.username || 'Tài khoản'}</span>
           </div>
+
+          <button type="button" onClick={onLogout} title={isExpanded ? undefined : 'Đăng xuất'} aria-label="Đăng xuất" style={{ minWidth: BTN_SIZE, minHeight: BTN_SIZE }} className="app-sidebar-control">
+            <LogOut size={ICON_SIZE} strokeWidth={ICON_STROKE} className="shrink-0" />
+            <span className="app-sidebar-label" aria-hidden={!isExpanded}>Đăng xuất</span>
+          </button>
 
           {onToggleCollapse && (
             <button

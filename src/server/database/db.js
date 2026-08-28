@@ -641,6 +641,39 @@ const migrations = [
       `);
       console.log('[DB] Migration v26: Added durable message sequence and sender role.');
     }
+  },
+  {
+    version: 27,
+    name: 'add_local_user_auth_sessions',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          token_hash TEXT NOT NULL UNIQUE,
+          expires_at DATETIME NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
+      `);
+      console.log('[DB] Migration v27: Added local CRM user sessions.');
+    }
+  },
+  {
+    version: 28,
+    name: 'fix_crm_outgoing_call_direction',
+    up: (db) => {
+      db.exec(`
+        UPDATE messages
+        SET is_outgoing = 1,
+            sender_role = 'operator',
+            direction_status = 'confirmed'
+        WHERE fb_message_id LIKE 'call_ended_%';
+      `);
+      console.log('[DB] Migration v28: Corrected CRM-originated call logs to outgoing.');
+    }
   }
 ];
 

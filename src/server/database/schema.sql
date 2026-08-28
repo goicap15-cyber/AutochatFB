@@ -7,6 +7,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    expires_at DATETIME NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
+
 -- 2. Bảng Tài khoản Facebook cá nhân
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
@@ -18,6 +29,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     last_broadcast_date DATE DEFAULT (DATE('now')),
     status TEXT CHECK(status IN ('ACTIVE', 'DISCONNECTED', 'CHECKPOINT')) DEFAULT 'ACTIVE',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Persistent tombstones prevent a detached/stale Chrome extension from
+-- recreating an account after the backend restarts. A deliberate new-account
+-- login removes the matching tombstone.
+CREATE TABLE IF NOT EXISTS removed_accounts (
+    account_id TEXT PRIMARY KEY,
+    removed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 2b. Bảng Nguồn inbox hợp nhất: personal Messenger account hoặc Facebook Page

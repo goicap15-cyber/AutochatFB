@@ -8,7 +8,7 @@
 // duplication pattern as textFilter.js (extension copy vs server copy).
 
 (function () {
-  const ROUND_BUDGET = { incremental: 1, initial: 8, deep_backfill: 12 };
+  const ROUND_BUDGET = { incremental: 1, initial: 12, deep_backfill: 20 };
   const DEFAULT_MAX_ROUNDS = 5;
 
   function getMaxRounds(mode) {

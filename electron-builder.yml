@@ -16,6 +16,8 @@ files:
   - dist/server/**/*
   - dist/client/**/*
   - dist/extension/**/*
+  - chrome-bundling/resolveChromePath.js
+  - .env
   - src/electron.js
   - data/.gitkeep
   - node_modules/**/*

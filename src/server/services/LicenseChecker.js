@@ -1,8 +1,9 @@
 const fs = require('fs');
 const path = require('path');
-const { getMachineId } = require('../../client/utils/machineId_server');
+const { getMachineId } = require('../utils/machineId');
+const { APP_DATA_ROOT } = require('../utils/appDataRoot');
 
-const DATA_DIR = path.join(__dirname, '../../../data');
+const DATA_DIR = APP_DATA_ROOT;
 const LICENSE_FILE = path.join(DATA_DIR, 'license.json');
 const LICENSE_SERVER_URL = process.env.LICENSE_SERVER_URL || 'http://localhost:5055';
 

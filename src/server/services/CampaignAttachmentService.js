@@ -100,8 +100,8 @@ class CampaignAttachmentService {
   }, {
     database = require('../database/db'),
     storageDir = this.getDefaultStorageDir(),
-    imageEnabled = process.env.CAMPAIGN_IMAGE_ENABLED === 'true',
-    fileEnabled = process.env.CAMPAIGN_FILE_ENABLED === 'true',
+    imageEnabled = process.env.CAMPAIGN_IMAGE_ENABLED !== 'false',
+    fileEnabled = process.env.CAMPAIGN_FILE_ENABLED !== 'false',
     maxBytes = DEFAULT_MAX_IMAGE_BYTES,
     allowAnyFile = fileEnabled
   } = {}) {

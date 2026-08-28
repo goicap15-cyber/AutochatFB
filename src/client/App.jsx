@@ -17,14 +17,13 @@ import IncomingCallModal from './components/IncomingCallModal.jsx';
 import PaymentModal from './components/PaymentModal.jsx';
 import LicenseManagerModal from './components/LicenseManagerModal.jsx';
 import LicenseLockScreen from './components/LicenseLockScreen.jsx';
+import AuthScreen from './components/AuthScreen.jsx';
 import { useSocket } from './hooks/useSocket.js';
 import { MessageSquare } from 'lucide-react';
 
-const SESSION_USER = { id: 1, role: 'ADMIN', username: 'admin' };
 const THEME_VERSION = 'chat-redesign-v1';
 
 export default function App() {
-  const { socket, isConnected } = useSocket();
   const [theme, setTheme] = useState(() => {
     if (localStorage.getItem('app_theme_version') !== THEME_VERSION) return 'light';
     return localStorage.getItem('app_theme') || 'light';
@@ -86,6 +85,23 @@ export default function App() {
   const [campaignRefreshVersion, setCampaignRefreshVersion] = useState(0);
   const [incomingCallInfo, setIncomingCallInfo] = useState(null);
   const [licenseStatus, setLicenseStatus] = useState(null);
+  const [sessionUser, setSessionUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const { socket, isConnected } = useSocket(Boolean(sessionUser));
+
+  const checkSession = useCallback(async () => {
+    try {
+      const res = await fetch('/api/auth/me');
+      const json = await res.json().catch(() => ({}));
+      setSessionUser(res.ok && json.success ? json.user : null);
+    } catch {
+      setSessionUser(null);
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { checkSession(); }, [checkSession]);
 
   const checkLicenseStatus = useCallback(async () => {
     try {
@@ -100,8 +116,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    checkLicenseStatus();
-  }, [checkLicenseStatus]);
+    if (sessionUser) checkLicenseStatus();
+    else setLicenseStatus(null);
+  }, [checkLicenseStatus, sessionUser]);
 
   const loadInboxSources = useCallback(async () => {
     try {
@@ -179,19 +196,24 @@ export default function App() {
   }, []);
 
   const loadThreads = useCallback(async () => {
+    if (!sessionUser) return;
     try {
-      const res = await fetch(`/api/threads?user_id=${SESSION_USER.id}&role=${SESSION_USER.role}&tab=${activeTab}`);
+      const res = await fetch(`/api/threads?tab=${activeTab}`);
       const data = await res.json();
       const threadList = Array.isArray(data) ? data : [];
       setThreads(threadList.map(t => ({ ...t, thread_key: t.thread_key || (t.account_id ? `${t.account_id}:${t.id}` : String(t.id)) })));
     } catch {
       setThreads([]);
     }
-  }, [activeTab]);
+  }, [activeTab, sessionUser]);
 
   const loadThreadsRef = useRef(loadThreads);
   useEffect(() => { loadThreadsRef.current = loadThreads; }, [loadThreads]);
-  useEffect(() => { loadThreads(); loadAccounts(); loadInboxSources(); loadLeadStatuses(); }, [loadThreads, loadAccounts, loadInboxSources, loadLeadStatuses]);
+  useEffect(() => {
+    if (sessionUser && licenseStatus?.isLicensed) {
+      loadThreads(); loadAccounts(); loadInboxSources(); loadLeadStatuses();
+    }
+  }, [sessionUser, licenseStatus?.isLicensed, loadThreads, loadAccounts, loadInboxSources, loadLeadStatuses]);
 
   useEffect(() => {
     if (!isMobile && !activeThreadId && threads.length > 0) {
@@ -786,8 +808,8 @@ export default function App() {
   const handleAssignStaff = async (threadId) => {
     const threadIdStr = String(threadId);
     try {
-      await fetch(`/api/threads/${threadIdStr}/assign`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: SESSION_USER.id }) });
-      setThreads(prev => prev.map(t => String(t.id) === threadIdStr ? { ...t, status: 'ASSIGNED', assigned_user_id: SESSION_USER.id } : t));
+      await fetch(`/api/threads/${threadIdStr}/assign`, { method: 'POST' });
+      setThreads(prev => prev.map(t => String(t.id) === threadIdStr ? { ...t, status: 'ASSIGNED', assigned_user_id: sessionUser.id } : t));
     } catch (e) { console.error('Assign error:', e); }
   };
 
@@ -888,6 +910,15 @@ export default function App() {
     setActiveModal(modalName);
   };
 
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    setSessionUser(null);
+    setLicenseStatus(null);
+    setThreads([]);
+    setAccounts([]);
+    setActiveThreadId(null);
+  };
+
   const selectedCampaignThreads = threads.filter((thread) => (
     selectedCampaignThreadIds.some((threadId) => String(threadId) === String(thread.id))
   ));
@@ -926,9 +957,22 @@ export default function App() {
     socket.emit('TRIGGER_CALL', {
       thread_id: selectedThread.id,
       account_id: selectedThread.account_id,
-      call_type: callType
+      call_type: callType,
+      call_request_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
     });
   }, [activeThreadId, selectedThread, socket, isConnected]);
+
+  if (authLoading) {
+    return <div className="min-h-screen bg-slate-950 text-slate-400 flex items-center justify-center">Đang kiểm tra phiên đăng nhập...</div>;
+  }
+
+  if (!sessionUser) {
+    return <AuthScreen onAuthenticated={setSessionUser} />;
+  }
+
+  if (licenseStatus === null) {
+    return <div className="min-h-screen bg-slate-950 text-slate-400 flex items-center justify-center">Đang kiểm tra bản quyền...</div>;
+  }
 
   return (
     <div className={gridClass}>
@@ -939,6 +983,7 @@ export default function App() {
         theme={theme} onToggleTheme={toggleTheme}
         hasCheckpoint={hasCheckpoint} collapsed={leadPanelCollapsed}
         onToggleCollapse={() => setLeadPanelCollapsed(!leadPanelCollapsed)}
+        sessionUser={sessionUser} onLogout={handleLogout}
       />
 
       {/* Column 2: Conversation List */}

@@ -1,12 +1,19 @@
 const path = require('path');
 const fs = require('fs');
+const { parseEnv } = require('util');
 // Neither the plain `node src/server/index.js` entrypoint nor Electron's
 // require(serverPath) load .env on their own (no dotenv dependency, no
 // --env-file flag) - PAGE_TOKEN_SECRET/WEBHOOK_VERIFY_TOKEN/RICH_MESSAGE_*
 // flags etc. were silently falling back to unset. Node 20.6+'s built-in
 // loadEnvFile covers both launch paths without adding a dependency.
 try {
-  process.loadEnvFile(path.join(__dirname, '../../.env'));
+  // fs.readFileSync is ASAR-aware, unlike process.loadEnvFile's native file
+  // loader. This reads repo/.env in dev and app.asar/.env when packaged.
+  const envPath = path.join(__dirname, '../../.env');
+  const packagedEnv = parseEnv(fs.readFileSync(envPath, 'utf8'));
+  for (const [key, value] of Object.entries(packagedEnv)) {
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
 } catch (_) {
   // Missing .env is fine (e.g. a fresh checkout) - env vars just stay unset.
 }
@@ -26,11 +33,13 @@ const CampaignPhoneCaptureService = require('./services/CampaignPhoneCaptureServ
 const GlobalPhoneAutomationService = require('./services/GlobalPhoneAutomationService');
 const HistorySyncRetryPolicy = require('./services/HistorySyncRetryPolicy');
 const SidebarSyncCooldown = require('./services/SidebarSyncCooldown');
+const CallEventDeduplicator = require('./services/CallEventDeduplicator');
 const { resolveInternalThreadId } = require('./utils/threadIdResolver');
 const http = require('http');
 const WebSocket = require('ws');
 const { Server: SocketIOServer } = require('socket.io');
 const db = require('./database/db');
+const { AuthService, AuthError } = require('./services/AuthService');
 const processManager = require('./services/ProcessManager');
 const mediaDownloader = require('./services/MediaDownloader');
 const assignmentManager = require('./services/AssignmentManager');
@@ -56,6 +65,7 @@ const CampaignAttachmentService = require('./services/CampaignAttachmentService'
 const CampaignRecoveryService = require('./services/CampaignRecoveryService');
 const LeadStatusService = require('./services/LeadStatusService');
 const ContactService = require('./services/ContactService');
+const AccountService = require('./services/AccountService');
 const FollowupService = require('./services/FollowupService');
 const InboxSourceService = require('./services/InboxSourceService');
 const InboxSyncScheduler = require('./services/InboxSyncScheduler');
@@ -63,7 +73,67 @@ const licenseChecker = require('./services/LicenseChecker');
 
 const app = express();
 const followupService = new FollowupService(db);
+const authService = new AuthService(db);
 app.use(express.json());
+
+function sendAuthError(res, error) {
+  const status = error instanceof AuthError ? error.status : 500;
+  if (status === 500) console.error('[Auth]', error);
+  res.status(status).json({
+    success: false,
+    code: error.code || 'AUTH_ERROR',
+    message: status === 500 ? 'Không thể xử lý yêu cầu đăng nhập.' : error.message
+  });
+}
+
+// Authentication comes before license activation: users sign in first, then
+// the authenticated application checks or activates this machine's key.
+app.post('/api/auth/register', (req, res) => {
+  try {
+    const user = authService.register(req.body || {});
+    const session = authService.login(req.body || {});
+    res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
+    res.status(201).json({ success: true, user });
+  } catch (error) {
+    sendAuthError(res, error);
+  }
+});
+
+app.post('/api/auth/login', (req, res) => {
+  try {
+    const session = authService.login(req.body || {});
+    res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
+    res.json({ success: true, user: session.user });
+  } catch (error) {
+    sendAuthError(res, error);
+  }
+});
+
+app.get('/api/auth/me', (req, res) => {
+  const user = authService.getRequestUser(req);
+  if (!user) return res.status(401).json({ success: false, code: 'AUTH_REQUIRED' });
+  res.json({ success: true, user });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  authService.revokeRequestSession(req);
+  res.setHeader('Set-Cookie', authService.clearCookie());
+  res.json({ success: true });
+});
+
+const requireAuthenticatedApi = authService.middleware();
+app.use('/api', (req, res, next) => {
+  // Central payment callbacks and order polling must remain reachable before
+  // a user session exists. License status/activation intentionally do not:
+  // the product flow is authenticate first, then activate the workstation.
+  const unauthenticatedPaymentPaths = [
+    '/payment/sepay-webhook',
+    '/orders/create',
+    '/orders/status'
+  ];
+  if (unauthenticatedPaymentPaths.some((pathPrefix) => req.path.startsWith(pathPrefix))) return next();
+  return requireAuthenticatedApi(req, res, next);
+});
 
 // 1. API Kiểm tra trạng thái bản quyền cục bộ
 app.get('/api/license/status', async (req, res) => {
@@ -78,7 +148,7 @@ app.post('/api/license/activate', async (req, res) => {
     if (!key) return res.status(400).json({ success: false, message: 'Thiếu mã Key' });
 
     const normalizedKey = key.trim();
-    const { getMachineId } = require('../client/utils/machineId_server');
+    const { getMachineId } = require('./utils/machineId');
     const machineId = getMachineId();
 
     const centralResponse = await fetch('http://localhost:5055/api/license/activate', {
@@ -147,7 +217,7 @@ app.post('/api/license/deactivate', async (req, res) => {
   try {
     const key = licenseChecker.getSavedKey();
     if (key) {
-      const { getMachineId } = require('../client/utils/machineId_server');
+      const { getMachineId } = require('./utils/machineId');
       const machineId = getMachineId();
       await fetch('http://localhost:5055/api/license/deactivate', {
         method: 'POST',
@@ -196,10 +266,18 @@ app.use('/data/media', express.static(path.join(APP_DATA_ROOT, 'media')));
 app.use('/data/exports', express.static(path.join(APP_DATA_ROOT, 'exports')));
 
 const server = http.createServer(app);
-const io = new SocketIOServer(server, { cors: { origin: '*' } });
+const io = new SocketIOServer(server, { cors: { origin: true, credentials: true } });
+io.use((socket, next) => {
+  const user = authService.getRequestUser({ headers: socket.handshake.headers });
+  if (!user) return next(new Error('AUTH_REQUIRED'));
+  socket.user = user;
+  next();
+});
 const wss = new WebSocket.Server({ noServer: true });
 const extensionConnections = new Map();
 const domReplaySuppressUntil = new Map();
+const callEventDeduplicator = new CallEventDeduplicator();
+const historyBackfillJobs = new Map();
 
 const richContentSecret = crypto.randomBytes(32);
 
@@ -463,6 +541,21 @@ wss.on('connection', (ws, req) => {
             console.warn(`[WS] Bỏ qua REGISTER_ACCOUNT với account_id không hợp lệ: ${JSON.stringify(account_id)}`);
             break;
           }
+          const removedAccount = db.prepare(
+            'SELECT account_id FROM removed_accounts WHERE account_id = ?'
+          ).get(String(account_id));
+          if (removedAccount && !pending_key) {
+            console.warn(`[WS] Từ chối stale REGISTER_ACCOUNT của tài khoản đã xóa: ${account_id}`);
+            ws.close(1000, 'ACCOUNT_REMOVED');
+            break;
+          }
+          if (pending_key) {
+            db.prepare('DELETE FROM removed_accounts WHERE account_id = ?').run(String(account_id));
+          }
+          const previousExtension = extensionConnections.get(account_id);
+          if (previousExtension && previousExtension !== ws && previousExtension.readyState === WebSocket.OPEN) {
+            previousExtension.close(1000, 'ACCOUNT_CONNECTION_REPLACED');
+          }
           extensionConnections.set(account_id, ws);
           InboxSyncScheduler.registerAccount(account_id);
           domReplaySuppressUntil.set(account_id, Date.now() + 8000);
@@ -473,10 +566,11 @@ wss.on('connection', (ws, req) => {
           let profileDir = null;
           if (pending_key) {
             // New account just logged in via pending Chrome session
-            profileDir = `data/profiles/${pending_key}`;
+            profileDir = path.join(APP_DATA_ROOT, 'profiles', pending_key);
             if (processManager.processes.has(pending_key)) {
               const procData = processManager.processes.get(pending_key);
-              processManager.processes.set(account_id, procData);
+              processManager.promotePendingProcess(pending_key, account_id);
+              profileDir = procData.profileDir || profileDir;
             }
           } else {
             // Reconnect of an existing account - preserve whatever profile_dir is already in DB.
@@ -664,6 +758,13 @@ wss.on('connection', (ws, req) => {
           console.log(`[CALL_DEBUG] 🔔 Phát hiện CUỘC GỌI ĐANG REO từ Extension: thread=${m.thread_id || 'unknown'}, caller=${m.caller_name}`);
           const targetAcct = m.account_id || ws.accountId || null;
           const internalThreadId = m.thread_id ? resolveInternalThreadId(db, targetAcct, m.thread_id) : null;
+          if (!callEventDeduplicator.claimIncoming({
+            threadId: internalThreadId || m.thread_id,
+            callerName: m.caller_name
+          })) {
+            console.log(`[CALL_DEBUG] Bỏ qua INCOMING_CALL_RINGING trùng: caller=${m.caller_name || 'unknown'}`);
+            break;
+          }
           io.emit('INCOMING_CALL_RINGING', {
             thread_id: internalThreadId || m.thread_id || null,
             external_thread_id: m.thread_id || null,
@@ -1462,6 +1563,7 @@ wss.on('connection', (ws, req) => {
           HistorySyncRetryPolicy.cancelRetry(thread_id);
 
           const HistorySyncManager = require('./services/HistorySyncManager');
+          let resolvedSyncStatus = null;
           
           if (Array.isArray(messages) && messages.length > 0) {
             const validMessages = messages.map(m => ({ ...m, content: cleanMessageText(m.content) }))
@@ -1489,9 +1591,9 @@ wss.on('connection', (ws, req) => {
             console.log(`[WS] Diagnostics thread=${thread_id}: fetched=${fetchedTotal} inserted=${persistence.insertedIds.length} updated=${persistence.updatedIds.length} skipped=${skippedTotal}`);
 
             if (checkpoint) {
-              const resolvedStatus = HistorySyncManager.resolveStatusFromCheckpoint(checkpoint);
-              HistorySyncManager.updateSyncStatus(thread_id, resolvedStatus, checkpoint);
-              console.log(`[WS] History sync status thread=${thread_id}: ${resolvedStatus} (stop_reason=${checkpoint.stop_reason || 'n/a'})`);
+              resolvedSyncStatus = HistorySyncManager.resolveStatusFromCheckpoint(checkpoint);
+              HistorySyncManager.updateSyncStatus(thread_id, resolvedSyncStatus, checkpoint);
+              console.log(`[WS] History sync status thread=${thread_id}: ${resolvedSyncStatus} (stop_reason=${checkpoint.stop_reason || 'n/a'})`);
             }
 
             const latest = validMessages.reduce((currentLatest, candidate) => {
@@ -1519,10 +1621,47 @@ wss.on('connection', (ws, req) => {
           } else {
              // Empty messages list but no error means we might have reached the end or just no new messages
              if (checkpoint) {
-               const resolvedStatus = HistorySyncManager.resolveStatusFromCheckpoint(checkpoint);
-               HistorySyncManager.updateSyncStatus(thread_id, resolvedStatus, checkpoint);
-               console.log(`[WS] History sync status thread=${thread_id}: ${resolvedStatus} (stop_reason=${checkpoint.stop_reason || 'n/a'})`);
+               resolvedSyncStatus = HistorySyncManager.resolveStatusFromCheckpoint(checkpoint);
+               HistorySyncManager.updateSyncStatus(thread_id, resolvedSyncStatus, checkpoint);
+               console.log(`[WS] History sync status thread=${thread_id}: ${resolvedSyncStatus} (stop_reason=${checkpoint.stop_reason || 'n/a'})`);
              }
+          }
+
+          const historyJobKey = String(account_id);
+          const activeJob = historyBackfillJobs.get(historyJobKey);
+          if (resolvedSyncStatus === 'PARTIAL' && activeJob && String(activeJob.threadId) === String(thread_id)) {
+            const generation = activeJob.generation;
+            activeJob.batches += 1;
+            if (activeJob.batches <= 100) {
+              setTimeout(() => {
+                const latestJob = historyBackfillJobs.get(historyJobKey);
+                if (!latestJob || latestJob.generation !== generation || String(latestJob.threadId) !== String(thread_id)) return;
+                const extWs = extensionConnections.get(account_id);
+                if (!extWs || extWs.readyState !== WebSocket.OPEN) return;
+                const threadRow = db.prepare('SELECT thread_url, contact_name FROM threads WHERE id = ?').get(thread_id);
+                const pageSource = ConversationRepository.getThreadSource(thread_id);
+                extWs.send(JSON.stringify({
+                  type: 'SYNC_THREAD_MESSAGES',
+                  data: {
+                    account_id,
+                    thread_id,
+                    thread_url: threadRow?.thread_url || null,
+                    page_id: pageSource?.pageId || null,
+                    mode: 'deep_backfill',
+                    cursor: checkpoint,
+                    contact_name: threadRow?.contact_name || null,
+                    reason: 'crm_navigation',
+                    allow_navigation: true
+                  }
+                }));
+                console.log(`[WS] Continue deep-backfill batch ${latestJob.batches} for thread=${thread_id}`);
+              }, 350);
+            } else {
+              HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', checkpoint, 'BACKFILL_BATCH_LIMIT');
+              historyBackfillJobs.delete(historyJobKey);
+            }
+          } else if (resolvedSyncStatus === 'SYNCED' && activeJob && String(activeJob.threadId) === String(thread_id)) {
+            historyBackfillJobs.delete(historyJobKey);
           }
           break;
         }
@@ -1681,8 +1820,8 @@ wss.on('connection', (ws, req) => {
             db.prepare(`
               INSERT OR IGNORE INTO messages
                 (thread_id, fb_message_id, sender_id, content, is_outgoing, direction_status, timestamp_ms, created_at)
-              VALUES (?, ?, 'CONTACT', ?, 0, 'confirmed', ?, CURRENT_TIMESTAMP)
-            `).run(internalThreadId, callFbId, callContent, callTsMs);
+              VALUES (?, ?, ?, ?, 1, 'confirmed', ?, CURRENT_TIMESTAMP)
+            `).run(internalThreadId, callFbId, String(callAccountId || ws.accountId || 'CURRENT_USER'), callContent, callTsMs);
           } catch (dbErr) {
             console.warn('[WS] CALL_ENDED: Lỗi lưu DB:', dbErr.message);
           }
@@ -1694,7 +1833,7 @@ wss.on('connection', (ws, req) => {
             thread_id: internalThreadId,
             fb_message_id: callFbId,
             content: callContent,
-            is_outgoing: false,
+            is_outgoing: true,
             direction_status: 'confirmed',
             source: 'call_log',
             timestamp_ms: callTsMs,
@@ -1740,6 +1879,14 @@ io.on('connection', (socket) => {
     }
     if (!targetAccId || !thread_id) return;
 
+    const historyJobKey = String(targetAccId);
+    const previousHistoryJob = historyBackfillJobs.get(historyJobKey);
+    historyBackfillJobs.set(historyJobKey, {
+      threadId: String(thread_id),
+      generation: (previousHistoryJob?.generation || 0) + 1,
+      batches: 0
+    });
+
     HistorySyncRetryPolicy.noteManualRequest(targetAccId, thread_id);
 
     const pageSource = ConversationRepository.getThreadSource(thread_id);
@@ -1762,7 +1909,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('TRIGGER_CALL', ({ thread_id, call_type = 'audio', account_id }) => {
+  socket.on('TRIGGER_CALL', ({ thread_id, call_type = 'audio', account_id, call_request_id }) => {
     let targetAccId = account_id;
     if (!targetAccId && thread_id) {
       const thread = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(thread_id);
@@ -1776,12 +1923,25 @@ io.on('connection', (socket) => {
       return;
     }
 
+    if (!callEventDeduplicator.claimOutgoing({
+      accountId: targetAccId,
+      threadId: thread_id,
+      callType: call_type
+    })) {
+      socket.emit('CALL_TRIGGER_RESPONSE', {
+        success: false,
+        error: 'Cuộc gọi này vừa được kích hoạt. Vui lòng chờ trong giây lát.'
+      });
+      return;
+    }
+
+    const requestId = String(call_request_id || require('crypto').randomUUID());
     const extWs = extensionConnections.get(targetAccId);
     if (extWs && extWs.readyState === WebSocket.OPEN) {
       console.log(`[Socket.io] 📞 Yêu cầu kích hoạt cuộc gọi Messenger ${call_type} cho thread ${thread_id} (account ${targetAccId})`);
       extWs.send(JSON.stringify({
         type: 'TRIGGER_MESSENGER_CALL',
-        data: { account_id: targetAccId, thread_id, call_type }
+        data: { account_id: targetAccId, thread_id, call_type, call_request_id: requestId }
       }));
       socket.emit('CALL_TRIGGER_RESPONSE', { success: true, message: 'Đã gửi lệnh kích hoạt cuộc gọi tới Extension' });
     } else {
@@ -1954,11 +2114,39 @@ app.post('/api/accounts/new-session', (req, res) => {
   const success = processManager.startNewAccountProcess(pendingKey);
   res.json({ success, pending_key: pendingKey });
 });
+app.delete('/api/accounts/:id', (req, res) => {
+  try {
+    const accountId = String(req.params.id || '').trim();
+    const account = db.prepare('SELECT id FROM accounts WHERE id = ?').get(accountId);
+    if (!account) {
+      return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
+    }
+
+    // Block late REGISTER_ACCOUNT frames before terminating the detached
+    // Chrome tree, otherwise the account can be recreated during deletion.
+    processManager.stopAccountProcess(accountId);
+    const extension = extensionConnections.get(accountId);
+    extensionConnections.delete(accountId);
+    InboxSyncScheduler.unregisterAccount(accountId);
+    domReplaySuppressUntil.delete(accountId);
+    if (extension && extension.readyState === WebSocket.OPEN) {
+      extension.close(1000, 'ACCOUNT_REMOVED');
+    }
+
+    const result = AccountService.removeAccount(accountId, db);
+    io.emit('ACCOUNT_REMOVED', { account_id: accountId });
+    io.emit('INBOX_SOURCE_REMOVED', { id: 'src_personal_' + accountId });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    console.error('[API] Không thể xóa tài khoản Facebook:', error);
+    res.status(500).json({ success: false, error: 'Không thể xóa tài khoản Facebook', detail: error.message });
+  }
+});
 
 // Threads
 app.get('/api/threads', (req, res) => {
-  const { user_id = 1, role = 'ADMIN', tab = 'ALL' } = req.query;
-  const threads = assignmentManager.getThreadsByFilter(Number(user_id), role, tab);
+  const { tab = 'ALL' } = req.query;
+  const threads = assignmentManager.getThreadsByFilter(req.user.id, req.user.role, tab);
   res.json(threads);
 });
 
@@ -2006,8 +2194,7 @@ app.post('/api/threads/:id/restore', (req, res) => {
 });
 
 app.post('/api/threads/:id/assign', (req, res) => {
-  const { user_id } = req.body;
-  if (!user_id) return res.status(400).json({ error: 'Thiếu user_id' });
+  const user_id = req.user.id;
   const result = assignmentManager.assignThread(req.params.id, user_id);
   if (result.success) io.emit('THREAD_ASSIGNED', { thread_id: req.params.id, user_id });
   res.json(result);
@@ -2362,7 +2549,7 @@ app.get("/api/campaigns", (req, res) => {
 app.post("/api/campaigns", (req, res) => {
   try {
     CampaignService.assertFeatureEnabled();
-    const campaign = CampaignService.createDraft(req.body || {}, db, {
+    const campaign = CampaignService.createDraft({ ...(req.body || {}), created_by: req.user.id }, db, {
       getConnection: (accountId) => extensionConnections.get(accountId)
     });
     res.status(201).json(campaign);
@@ -2671,6 +2858,12 @@ app.get('*', (req, res) => {
 // ────────────────────────────────────────────────
 const PORT = process.env.PORT || 5050;
 function startServer() {
+  const allowedProfileDirs = db.prepare('SELECT profile_dir FROM accounts WHERE profile_dir IS NOT NULL').all()
+    .map(({ profile_dir }) => path.isAbsolute(profile_dir)
+      ? profile_dir
+      : path.resolve(__dirname, '../..', profile_dir));
+  processManager.stopOrphanedManagedChromeProfiles(allowedProfileDirs);
+
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`[Server] http://localhost:${PORT}`);
     console.log(`[Server] WebSocket ws://localhost:${PORT}`);
@@ -2786,4 +2979,8 @@ InboxSyncScheduler.configure({
   }
 });
 
-module.exports = { app, server, startServer, extensionConnections, io };
+function stopManagedProcesses() {
+  return processManager.stopAllAccountProcesses();
+}
+
+module.exports = { app, server, startServer, stopManagedProcesses, extensionConnections, io };
