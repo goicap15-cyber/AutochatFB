@@ -176,19 +176,26 @@ export default function MessageComposer({
   };
 
   const attachmentKind = (file) => String(file?.type || '').toLowerCase().startsWith('image/') ? 'image' : 'file';
+
+  const isFileDragEvent = (event) => {
+    if (!event.dataTransfer?.types) return false;
+    const types = Array.from(event.dataTransfer.types);
+    return types.some((t) => t.toLowerCase() === 'files' || t.toLowerCase().startsWith('image/'));
+  };
+
   const handleDragEnter = (event) => {
-    if (!event.dataTransfer?.types?.includes('Files')) return;
+    if (!isFileDragEvent(event)) return;
     event.preventDefault();
     dragDepthRef.current += 1;
     setDraggingAttachment(true);
   };
   const handleDragOver = (event) => {
-    if (!event.dataTransfer?.types?.includes('Files')) return;
+    if (!isFileDragEvent(event)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = attachment || disabled ? 'none' : 'copy';
   };
   const handleDragLeave = (event) => {
-    if (!event.dataTransfer?.types?.includes('Files')) return;
+    if (!isFileDragEvent(event)) return;
     event.preventDefault();
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
     if (dragDepthRef.current === 0) setDraggingAttachment(false);
@@ -197,7 +204,13 @@ export default function MessageComposer({
     event.preventDefault();
     dragDepthRef.current = 0;
     setDraggingAttachment(false);
-    const files = Array.from(event.dataTransfer?.files || []);
+    let files = Array.from(event.dataTransfer?.files || []);
+    if (files.length === 0 && event.dataTransfer?.items) {
+      files = Array.from(event.dataTransfer.items)
+        .filter((item) => item.kind === 'file')
+        .map((item) => item.getAsFile())
+        .filter(Boolean);
+    }
     if (files.length === 0) return;
     if (files.length > 1) {
       setError('Mỗi tin nhắn chỉ đính kèm được 1 file.');
