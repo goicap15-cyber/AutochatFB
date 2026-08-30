@@ -2,14 +2,105 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const crypto = require('crypto');
 const licenseService = require('./services/licenseService');
+const clientUserService = require('./services/clientUserService');
 
 const app = express();
 const PORT = process.env.PORT || 5055;
+const adminSessions = new Set();
 
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+function isAdminRequest(req) {
+  const pass = process.env.ADMIN_PASSWORD || 'admin123';
+  const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  return token === pass || adminSessions.has(token);
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdminRequest(req)) return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
+  next();
+}
+
+app.post('/api/admin/login', (req, res) => {
+  const pass = process.env.ADMIN_PASSWORD || 'admin123';
+  if (String(req.body?.password || '') !== pass) {
+    return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  adminSessions.add(token);
+  res.json({ success: true, token });
+});
+
+app.post('/api/client-auth/register', (req, res) => {
+  try {
+    const result = clientUserService.register(req.body);
+    res.status(result.success ? 201 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, code: 'AUTH_SERVER_ERROR', message: 'Không thể đăng ký tài khoản.' }); }
+});
+
+app.post('/api/client-auth/login', (req, res) => {
+  try {
+    const result = clientUserService.login(req.body);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, code: 'AUTH_SERVER_ERROR', message: 'Không thể đăng nhập tài khoản.' }); }
+});
+
+app.post('/api/client-auth/license-status', (req, res) => {
+  res.json({ success: true, data: clientUserService.licenseStatus(req.body || {}) });
+});
+
+app.post('/api/client-auth/account-status', (req, res) => {
+  const result = clientUserService.accountStatus(req.body || {});
+  res.status(result.success ? 200 : result.status || 400).json(result);
+});
+
+app.post('/api/client-auth/company-employees', (req, res) => {
+  try {
+    const result = clientUserService.createCompanyEmployee(req.body || {});
+    res.status(result.success ? 201 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, message: 'Không thể tạo nhân viên doanh nghiệp.' }); }
+});
+
+app.delete('/api/client-auth/company-employees', (req, res) => {
+  try {
+    const result = clientUserService.removeCompanyEmployee(req.body || {});
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, message: 'Không thể xóa nhân viên doanh nghiệp.' }); }
+});
+
+app.get('/api/admin/client-users', requireAdmin, (req, res) => {
+  res.json({ success: true, data: clientUserService.list() });
+});
+
+app.patch('/api/admin/client-users/:id/status', requireAdmin, (req, res) => {
+  try {
+    const result = clientUserService.setStatus(req.params.id, req.body.status);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, message: 'Không thể cập nhật tài khoản.' }); }
+});
+
+app.patch('/api/admin/client-users/:id/password', requireAdmin, (req, res) => {
+  try {
+    const result = clientUserService.resetPassword(req.params.id, req.body.password);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, message: 'Không thể đặt lại mật khẩu.' }); }
+});
+
+app.delete('/api/admin/client-users', requireAdmin, (req, res) => {
+  try { res.json(clientUserService.removeAll()); }
+  catch (error) { res.status(500).json({ success: false, message: 'Không thể xóa tất cả tài khoản.' }); }
+});
+
+app.delete('/api/admin/client-users/:id', requireAdmin, (req, res) => {
+  try {
+    const result = clientUserService.remove(req.params.id);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) { res.status(500).json({ success: false, message: 'Không thể xóa tài khoản.' }); }
+});
 
 // Trang chủ health check
 app.get('/', (req, res) => {
@@ -37,8 +128,8 @@ app.get('/api/pricing', (req, res) => {
  */
 app.post('/api/orders/create', (req, res) => {
   try {
-    const { months, machines } = req.body;
-    const orderInfo = licenseService.createOrder({ months, machines });
+    const { months, machines, licenseKey } = req.body;
+    const orderInfo = licenseService.createOrder({ months, machines, licenseKey });
     res.json({ success: true, data: orderInfo });
   } catch (error) {
     console.error('[API Create Order Error]:', error);
@@ -116,10 +207,11 @@ app.post('/api/sepay/webhook', (req, res) => {
  */
 app.post('/api/license/activate', (req, res) => {
   try {
-    const { key, machineId, deviceName } = req.body;
+    const { key, machineId, deviceName, clientUsername } = req.body;
     const result = licenseService.activateLicense({ key, machineId, deviceName });
 
     if (result.success) {
+      if (clientUsername) clientUserService.bindLicense(clientUsername, key);
       res.json(result);
     } else {
       res.status(400).json(result);
@@ -176,9 +268,7 @@ app.post('/api/license/verify', (req, res) => {
  */
 app.get('/api/admin/licenses', (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    const pass = process.env.ADMIN_PASSWORD || 'admin123';
-    if (authHeader !== `Bearer ${pass}`) {
+    if (!isAdminRequest(req)) {
       return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
     }
     const licenses = licenseService.getAllLicenses();
@@ -189,8 +279,7 @@ app.get('/api/admin/licenses', (req, res) => {
 });
 
 app.get('/api/admin/pricing', (req, res) => {
-  const pass = process.env.ADMIN_PASSWORD || 'admin123';
-  if (req.headers.authorization !== `Bearer ${pass}`) {
+  if (!isAdminRequest(req)) {
     return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
   }
   res.json({ success: true, data: licenseService.getPricingSettings() });
@@ -198,8 +287,7 @@ app.get('/api/admin/pricing', (req, res) => {
 
 app.put('/api/admin/pricing', (req, res) => {
   try {
-    const pass = process.env.ADMIN_PASSWORD || 'admin123';
-    if (req.headers.authorization !== `Bearer ${pass}`) {
+    if (!isAdminRequest(req)) {
       return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
     }
     const result = licenseService.updatePricingSettings(req.body);
@@ -215,9 +303,7 @@ app.put('/api/admin/pricing', (req, res) => {
  */
 app.post('/api/admin/remove-device', (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    const pass = process.env.ADMIN_PASSWORD || 'admin123';
-    if (authHeader !== `Bearer ${pass}`) {
+    if (!isAdminRequest(req)) {
       return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
     }
     const { deviceId } = req.body;
@@ -233,9 +319,7 @@ app.post('/api/admin/remove-device', (req, res) => {
  */
 app.delete('/api/admin/licenses/:licenseId', (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    const pass = process.env.ADMIN_PASSWORD || 'admin123';
-    if (authHeader !== `Bearer ${pass}`) {
+    if (!isAdminRequest(req)) {
       return res.status(401).json({ success: false, message: 'Mật khẩu Admin không đúng' });
     }
 

@@ -8,7 +8,9 @@ CREATE TABLE IF NOT EXISTS orders (
     total_amount INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'PENDING', -- PENDING | PAID | CANCELLED
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    paid_at DATETIME
+    paid_at DATETIME,
+    order_type TEXT NOT NULL DEFAULT 'NEW',
+    target_license_id INTEGER REFERENCES licenses(id) ON DELETE SET NULL
 );
 
 -- CẤU HÌNH BẢNG GIÁ ĐỘNG (một bản ghi duy nhất)
@@ -52,3 +54,19 @@ CREATE TABLE IF NOT EXISTS license_devices (
 CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(order_code);
 CREATE INDEX IF NOT EXISTS idx_licenses_key ON licenses(key_value);
 CREATE INDEX IF NOT EXISTS idx_devices_machine ON license_devices(machine_id);
+
+-- Tài khoản đăng nhập của các CRM client, quản lý tập trung tại Admin.
+CREATE TABLE IF NOT EXISTS client_users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    password_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'BLOCKED')),
+    last_login_at DATETIME,
+    last_machine_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    license_id INTEGER REFERENCES licenses(id) ON DELETE SET NULL
+    ,company_admin_id INTEGER REFERENCES client_users(id) ON DELETE CASCADE
+    ,company_role TEXT NOT NULL DEFAULT 'ADMIN' CHECK(company_role IN ('ADMIN','EMPLOYEE'))
+);
+CREATE INDEX IF NOT EXISTS idx_client_users_status ON client_users(status);

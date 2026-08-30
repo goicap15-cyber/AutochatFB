@@ -59,18 +59,21 @@ class LicenseService {
   /**
    * Tạo đơn hàng thanh toán mới
    */
-  createOrder({ months, machines }) {
-    const monthsNum = Math.max(1, parseInt(months, 10) || 1);
-    const machinesNum = Math.max(1, parseInt(machines, 10) || 1);
-    const priceInfo = this.calculatePrice(monthsNum, machinesNum);
+  createOrder({ months, machines, licenseKey }) {
+    const target = licenseKey ? db.prepare('SELECT * FROM licenses WHERE key_value=? AND is_active=1').get(String(licenseKey).trim()) : null;
+    if (licenseKey && !target) throw new Error('License cần gia hạn không tồn tại hoặc đã bị khóa');
+    const monthsNum = target ? Math.max(0, parseInt(months, 10) || 0) : Math.max(1, parseInt(months, 10) || 1);
+    const machinesNum = target ? Math.max(0, parseInt(machines, 10) || 0) : Math.max(1, parseInt(machines, 10) || 1);
+    if (target && monthsNum === 0 && machinesNum === 0) throw new Error('Cần chọn thêm tháng hoặc thêm máy');
+    const priceInfo = target ? this.calculateUpgradePrice(target, monthsNum, machinesNum) : this.calculatePrice(monthsNum, machinesNum);
 
     const orderId = 'ORD_' + Date.now() + '_' + Math.floor(Math.random() * 1000);
     const orderCode = 'FB' + Math.floor(100000 + Math.random() * 900000);
 
     db.prepare(`
-      INSERT INTO orders (id, order_code, months, machines, unit_price, total_amount, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
-    `).run(orderId, orderCode, monthsNum, machinesNum, priceInfo.unitPrice, priceInfo.finalTotal);
+      INSERT INTO orders (id, order_code, months, machines, unit_price, total_amount, status, order_type, target_license_id)
+      VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+    `).run(orderId, orderCode, monthsNum, machinesNum, priceInfo.unitPrice, priceInfo.finalTotal, target ? 'UPGRADE' : 'NEW', target?.id || null);
 
     const bankNo = process.env.BANK_ACCOUNT_NUMBER || '0813468094';
     const bankName = process.env.BANK_NAME || 'MBBank';
@@ -90,7 +93,19 @@ class LicenseService {
       accountName,
       qrCodeUrl,
       status: 'PENDING'
+      ,orderType: target ? 'UPGRADE' : 'NEW'
+      ,licenseKey: target?.key_value || null
     };
+  }
+
+  calculateUpgradePrice(license, addMonths, addMachines) {
+    const pricing = this.getPricingSettings();
+    const discount = pricing.discounts[addMonths] || 0;
+    const extensionRaw = addMonths * (pricing.unitPrice + Math.max(0, license.machines - 1) * pricing.extraSlotPrice);
+    const remainingMonths = Math.max(1, Math.ceil((new Date(license.expires_at) - Date.now()) / (30 * 86400000)) + addMonths);
+    const slotsRaw = addMachines * pricing.extraSlotPrice * remainingMonths;
+    const rawTotal = extensionRaw + slotsRaw;
+    return { unitPrice: pricing.unitPrice, extraSlotPrice: pricing.extraSlotPrice, discountPercent: discount, rawTotal, finalTotal: Math.floor(rawTotal * (1-discount/100)) };
   }
 
   /**
@@ -100,7 +115,7 @@ class LicenseService {
     return db.prepare(`
       SELECT o.*, l.key_value, l.expires_at
       FROM orders o
-      LEFT JOIN licenses l ON o.id = l.order_id
+      LEFT JOIN licenses l ON l.id=o.target_license_id OR (o.target_license_id IS NULL AND o.id=l.order_id)
       WHERE o.id = ? OR o.order_code = ?
     `).get(orderCodeOrId, orderCodeOrId);
   }
@@ -123,7 +138,7 @@ class LicenseService {
     }
 
     if (order.status === 'PAID') {
-      const existingLicense = db.prepare('SELECT * FROM licenses WHERE order_id = ?').get(order.id);
+      const existingLicense = order.target_license_id ? db.prepare('SELECT * FROM licenses WHERE id=?').get(order.target_license_id) : db.prepare('SELECT * FROM licenses WHERE order_id = ?').get(order.id);
       return { success: true, alreadyPaid: true, order, license: existingLicense };
     }
 
@@ -132,14 +147,18 @@ class LicenseService {
       return { success: false, reason: 'AMOUNT_MISMATCH', required: order.total_amount, received: transactionAmount };
     }
 
-    const expiresAt = new Date();
+    const targetLicense = order.target_license_id ? db.prepare('SELECT * FROM licenses WHERE id=?').get(order.target_license_id) : null;
+    const expiresAt = targetLicense ? new Date(Math.max(Date.now(), new Date(targetLicense.expires_at).getTime())) : new Date();
     expiresAt.setDate(expiresAt.getDate() + (order.months * 30));
 
     const keyValue = this.generateKeyString();
 
     const tx = db.transaction(() => {
       db.prepare(`UPDATE orders SET status = 'PAID', paid_at = CURRENT_TIMESTAMP WHERE id = ?`).run(order.id);
-      db.prepare(`
+      if (targetLicense) {
+        db.prepare('UPDATE licenses SET machines=machines+?,months=months+?,expires_at=? WHERE id=?')
+          .run(order.machines, order.months, expiresAt.toISOString(), targetLicense.id);
+      } else db.prepare(`
         INSERT INTO licenses (order_id, key_value, machines, months, expires_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(order.id, keyValue, order.machines, order.months, expiresAt.toISOString());
@@ -147,7 +166,7 @@ class LicenseService {
 
     tx();
 
-    const createdLicense = db.prepare('SELECT * FROM licenses WHERE order_id = ?').get(order.id);
+    const createdLicense = targetLicense ? db.prepare('SELECT * FROM licenses WHERE id=?').get(targetLicense.id) : db.prepare('SELECT * FROM licenses WHERE order_id = ?').get(order.id);
     const updatedOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
 
     console.log(`[Payment] ✅ Đã khớp đơn ${orderCode}! Đã cấp Key: ${keyValue}`);
@@ -333,6 +352,9 @@ class LicenseService {
     if (!license) return { success: false, status: 404, message: 'Không tìm thấy License Key' };
 
     const removeLicense = db.transaction(() => {
+      // Giữ lịch sử thanh toán nhưng bỏ tham chiếu để khóa ngoại không chặn xóa Key.
+      db.prepare('UPDATE orders SET target_license_id = NULL WHERE target_license_id = ?').run(licenseId);
+      db.prepare('UPDATE client_users SET license_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE license_id = ?').run(licenseId);
       db.prepare('DELETE FROM license_devices WHERE license_id = ?').run(licenseId);
       db.prepare('DELETE FROM licenses WHERE id = ?').run(licenseId);
     });

@@ -56,6 +56,7 @@ class AuthService {
       const result = this.db.prepare(
         "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'STAFF')"
       ).run(credentials.username, passwordHash);
+      this.db.prepare("UPDATE users SET company_id=id,company_role='ADMIN' WHERE id=?").run(result.lastInsertRowid);
       return this.publicUser(this.db.prepare('SELECT id, username, role FROM users WHERE id = ?').get(result.lastInsertRowid));
     } catch (error) {
       if (String(error.code || '').startsWith('SQLITE_CONSTRAINT')) {
@@ -63,6 +64,55 @@ class AuthService {
       }
       throw error;
     }
+  }
+
+  ensureLocalUser({ username, password }, centralIdentity = null) {
+    const credentials = this.validateCredentials(username, password);
+    let user = this.db.prepare('SELECT id,username,role,company_id,company_role FROM users WHERE lower(username)=?').get(credentials.username);
+    if (!user) {
+      const result = this.db.prepare("INSERT INTO users (username,password_hash,role) VALUES (?,?,'STAFF')")
+        .run(credentials.username, bcrypt.hashSync(credentials.password, 12));
+      this.db.prepare("UPDATE users SET company_id=id,company_role='ADMIN' WHERE id=?").run(result.lastInsertRowid);
+      user = this.db.prepare('SELECT id,username,role,company_id,company_role FROM users WHERE id=?').get(result.lastInsertRowid);
+    } else {
+      this.db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(credentials.password, 12), user.id);
+    }
+    if (centralIdentity) {
+      const companyId = Number(centralIdentity.company_admin_id || centralIdentity.id || user.id);
+      const companyRole = centralIdentity.company_role === 'EMPLOYEE' ? 'EMPLOYEE' : 'ADMIN';
+      const previousCompanyId = Number(user.company_id || user.id);
+      if (companyRole === 'ADMIN' && previousCompanyId !== companyId) {
+        this.db.prepare('UPDATE accounts SET company_id=? WHERE company_id=?').run(companyId, previousCompanyId);
+        this.db.prepare('UPDATE users SET company_id=? WHERE company_id=?').run(companyId, previousCompanyId);
+      }
+      this.db.prepare('UPDATE users SET company_id=?,company_role=? WHERE id=?').run(companyId, companyRole, user.id);
+      user = this.db.prepare('SELECT id,username,role,company_id,company_role FROM users WHERE id=?').get(user.id);
+    }
+    return this.publicUser(user);
+  }
+
+  async registerManaged(input, centralClient) {
+    const centralIdentity = await centralClient.register(input);
+    return this.ensureLocalUser(input, centralIdentity);
+  }
+
+  async loginManaged(input, centralClient) {
+    let centralIdentity;
+    try {
+      centralIdentity = await centralClient.login(input);
+    } catch (error) {
+      if (error.code !== 'USER_NOT_FOUND') throw error;
+      // One-time migration for accounts created before central auth existed:
+      // only somebody who proves the existing local password may claim the
+      // same username centrally.
+      const username = this.normalizeUsername(input.username);
+      const local = this.db.prepare('SELECT password_hash FROM users WHERE lower(username)=?').get(username);
+      if (!local || !bcrypt.compareSync(String(input.password || ''), local.password_hash)) throw error;
+      centralIdentity = await centralClient.register(input);
+      centralIdentity = await centralClient.login(input);
+    }
+    const user = this.ensureLocalUser(input, centralIdentity);
+    return { user, ...this.createSession(user.id) };
   }
 
   login({ username, password }) {
@@ -91,7 +141,7 @@ class AuthService {
     const now = new Date().toISOString();
     this.db.prepare('DELETE FROM auth_sessions WHERE expires_at <= ?').run(now);
     const row = this.db.prepare(`
-      SELECT session.id AS session_id, user.id, user.username, user.role
+      SELECT session.id AS session_id, user.id, user.username, user.role, user.company_id, user.company_role
       FROM auth_sessions session
       JOIN users user ON user.id = session.user_id
       WHERE session.token_hash = ? AND session.expires_at > ?
@@ -134,7 +184,7 @@ class AuthService {
   }
 
   publicUser(user) {
-    return { id: Number(user.id), username: user.username, role: user.role };
+    return { id: Number(user.id), username: user.username, role: user.role, company_id: Number(user.company_id || user.id), company_role: user.company_role || 'ADMIN' };
   }
 }
 

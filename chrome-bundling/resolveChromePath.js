@@ -38,7 +38,22 @@ const BUNDLED_CHROME_RELATIVE_PATH = {
  * @returns {string} an executable path or command name to spawn - never throws,
  *   never returns null (callers historically spawn this value unconditionally).
  */
-function resolveChromePath({ repoRoot, legacyBinChromePath }) {
+function findSystemChromePath() {
+  if (process.platform !== 'win32') return null;
+  const sysWinPaths = [
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google\\Chrome\\Application\\chrome.exe') : null,
+    process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Google\\Chrome\\Application\\chrome.exe') : null,
+    process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Google\\Chrome\\Application\\chrome.exe') : null
+  ].filter(Boolean);
+  return sysWinPaths.find((sysPath) => fs.existsSync(sysPath)) || null;
+}
+
+function resolveChromePath({ repoRoot, legacyBinChromePath, preferSystemChrome = false }) {
+  const systemChrome = findSystemChromePath();
+  if (preferSystemChrome && systemChrome) return systemChrome;
+
   const relative = BUNDLED_CHROME_RELATIVE_PATH[process.platform];
   if (relative) {
     const bundled = path.join(repoRoot, relative);
@@ -47,21 +62,9 @@ function resolveChromePath({ repoRoot, legacyBinChromePath }) {
 
   if (legacyBinChromePath && fs.existsSync(legacyBinChromePath)) return legacyBinChromePath;
 
-  if (process.platform === 'win32') {
-    const sysWinPaths = [
-      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google\\Chrome\\Application\\chrome.exe') : null,
-      process.env.PROGRAMFILES ? path.join(process.env.PROGRAMFILES, 'Google\\Chrome\\Application\\chrome.exe') : null,
-      process.env['PROGRAMFILES(X86)'] ? path.join(process.env['PROGRAMFILES(X86)'], 'Google\\Chrome\\Application\\chrome.exe') : null
-    ].filter(Boolean);
-
-    for (const sysPath of sysWinPaths) {
-      if (fs.existsSync(sysPath)) return sysPath;
-    }
-  }
+  if (systemChrome) return systemChrome;
 
   return 'google-chrome';
 }
 
-module.exports = { resolveChromePath, BUNDLED_CHROME_RELATIVE_PATH };
+module.exports = { resolveChromePath, findSystemChromePath, BUNDLED_CHROME_RELATIVE_PATH };

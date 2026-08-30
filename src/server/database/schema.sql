@@ -4,6 +4,8 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     role TEXT CHECK(role IN ('ADMIN', 'STAFF')) NOT NULL DEFAULT 'STAFF',
+    company_id INTEGER,
+    company_role TEXT NOT NULL DEFAULT 'ADMIN' CHECK(company_role IN ('ADMIN', 'EMPLOYEE')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -18,6 +20,17 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
 
+CREATE TABLE IF NOT EXISTS account_user_assignments (
+    account_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    assigned_by INTEGER NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(account_id, user_id),
+    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY(assigned_by) REFERENCES users(id) ON DELETE CASCADE
+);
+
 -- 2. Bảng Tài khoản Facebook cá nhân
 CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
@@ -28,6 +41,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     broadcast_daily_count INTEGER DEFAULT 0,
     last_broadcast_date DATE DEFAULT (DATE('now')),
     status TEXT CHECK(status IN ('ACTIVE', 'DISCONNECTED', 'CHECKPOINT')) DEFAULT 'ACTIVE',
+    owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    company_id INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

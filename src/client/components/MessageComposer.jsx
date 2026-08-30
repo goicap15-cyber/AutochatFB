@@ -8,7 +8,8 @@ export default function MessageComposer({
   onStageAttachment,
   onDiscardAttachment,
   capabilities = null,
-  disabled = false
+  disabled = false,
+  disabledReason = 'Không thể gửi - tài khoản Facebook chưa kết nối'
 }) {
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
@@ -259,7 +260,7 @@ export default function MessageComposer({
       {disabled && (
         <div className="flex items-center gap-2 px-3 py-2 bg-[var(--color-danger-subtle)] border border-[var(--color-danger)]/20 rounded-lg text-xs font-medium text-[var(--color-danger)] mb-2.5">
           <WifiOff size={14} className="shrink-0" strokeWidth={1.75} />
-          <span>Không thể gửi - account Facebook chưa kết nối</span>
+          <span>{disabledReason}</span>
         </div>
       )}
 
@@ -390,7 +391,7 @@ export default function MessageComposer({
           onKeyDown={handleKeyDown}
           disabled={disabled || sending}
           aria-label="Nội dung tin nhắn"
-          placeholder={disabled ? 'Đã ngắt kết nối extension...' : 'Nhập tin nhắn...'}
+          placeholder={disabled ? disabledReason : 'Nhập tin nhắn...'}
           className="flex-1 bg-transparent text-sm focus:outline-none text-[var(--color-text-primary)] placeholder:text-[var(--color-text-muted)] resize-none disabled:opacity-50 leading-5 py-2 max-h-32 min-h-9"
           style={{ height: 36 }}
         />

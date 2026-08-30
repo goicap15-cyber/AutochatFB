@@ -8,7 +8,7 @@ test('registration creates STAFF and login creates a hashed server-side session'
   try {
     const auth = new AuthService(db);
     const user = auth.register({ username: '  Staff.One ', password: 'secure-pass-123' });
-    assert.deepEqual(user, { id: user.id, username: 'staff.one', role: 'STAFF' });
+    assert.deepEqual(user, { id: user.id, username: 'staff.one', role: 'STAFF', company_id: user.id, company_role: 'ADMIN' });
 
     const login = auth.login({ username: 'STAFF.ONE', password: 'secure-pass-123' });
     assert.equal(login.user.id, user.id);
@@ -55,4 +55,24 @@ test('invalid login is generic and logout revokes the cookie session', () => {
 
 test('cookie parser preserves values containing equals signs', () => {
   assert.deepEqual(parseCookies('a=one; token=abc%3D%3D'), { a: 'one', token: 'abc==' });
+});
+
+test('managed login migrates a valid legacy local account to central auth', async () => {
+  const db = getTestDatabase();
+  try {
+    const auth = new AuthService(db);
+    auth.register({ username: 'legacy.user', password: 'legacy-password' });
+    const calls = [];
+    const central = {
+      async login() {
+        calls.push('login');
+        if (calls.length === 1) throw Object.assign(new Error('missing'), { code: 'USER_NOT_FOUND' });
+        return { username: 'legacy.user', status: 'ACTIVE' };
+      },
+      async register() { calls.push('register'); }
+    };
+    const result = await auth.loginManaged({ username: 'legacy.user', password: 'legacy-password' }, central);
+    assert.equal(result.user.username, 'legacy.user');
+    assert.deepEqual(calls, ['login', 'register', 'login']);
+  } finally { db.close(); }
 });

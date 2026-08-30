@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { ShieldAlert, Key, CreditCard, RefreshCw, CheckCircle2 } from 'lucide-react';
 
-export default function LicenseLockScreen({ status, onOpenPayment }) {
+export default function LicenseLockScreen({ status, onOpenPayment, onBackToLogin }) {
   const [inputKey, setInputKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -117,6 +117,13 @@ export default function LicenseLockScreen({ status, onOpenPayment }) {
           <span>Mua Bản Quyền Mới Qua Mã QR Ngân Hàng (Tự Động 1s)</span>
         </button>
 
+        <button
+          type="button"
+          onClick={onBackToLogin}
+          className="text-sm font-medium text-[var(--color-text-muted,#7f95aa)] hover:text-[var(--color-accent,#0ea5e9)] underline underline-offset-4 transition"
+        >
+          Quay lại trang đăng nhập
+        </button>
       </div>
     </div>
   );

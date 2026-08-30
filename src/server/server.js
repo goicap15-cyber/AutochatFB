@@ -40,9 +40,11 @@ const WebSocket = require('ws');
 const { Server: SocketIOServer } = require('socket.io');
 const db = require('./database/db');
 const { AuthService, AuthError } = require('./services/AuthService');
+const { CentralAuthClient, CentralAuthError } = require('./services/CentralAuthClient');
 const processManager = require('./services/ProcessManager');
 const mediaDownloader = require('./services/MediaDownloader');
 const assignmentManager = require('./services/AssignmentManager');
+const enterpriseAccess = require('./services/EnterpriseAccessService');
 const searchService = require('./services/SearchService');
 const exportService = require('./services/ExportService');
 const autoReplyEngine = require('./services/AutoReplyEngine');
@@ -74,10 +76,11 @@ const licenseChecker = require('./services/LicenseChecker');
 const app = express();
 const followupService = new FollowupService(db);
 const authService = new AuthService(db);
+const centralAuthClient = new CentralAuthClient();
 app.use(express.json());
 
 function sendAuthError(res, error) {
-  const status = error instanceof AuthError ? error.status : 500;
+  const status = error instanceof AuthError || error instanceof CentralAuthError ? error.status : 500;
   if (status === 500) console.error('[Auth]', error);
   res.status(status).json({
     success: false,
@@ -88,9 +91,9 @@ function sendAuthError(res, error) {
 
 // Authentication comes before license activation: users sign in first, then
 // the authenticated application checks or activates this machine's key.
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   try {
-    const user = authService.register(req.body || {});
+    const user = await authService.registerManaged(req.body || {}, centralAuthClient);
     const session = authService.login(req.body || {});
     res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
     res.status(201).json({ success: true, user });
@@ -99,9 +102,9 @@ app.post('/api/auth/register', (req, res) => {
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   try {
-    const session = authService.login(req.body || {});
+    const session = await authService.loginManaged(req.body || {}, centralAuthClient);
     res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
     res.json({ success: true, user: session.user });
   } catch (error) {
@@ -109,9 +112,19 @@ app.post('/api/auth/login', (req, res) => {
   }
 });
 
-app.get('/api/auth/me', (req, res) => {
+app.get('/api/auth/me', async (req, res) => {
   const user = authService.getRequestUser(req);
   if (!user) return res.status(401).json({ success: false, code: 'AUTH_REQUIRED' });
+  try {
+    await centralAuthClient.accountStatus(user.username);
+  } catch (error) {
+    if (error instanceof CentralAuthError && ['USER_NOT_FOUND', 'ACCOUNT_BLOCKED'].includes(error.code)) {
+      authService.revokeRequestSession(req);
+      res.setHeader('Set-Cookie', authService.clearCookie());
+      return res.status(401).json({ success: false, code: error.code, message: error.message });
+    }
+    // A temporary License Server outage must not destroy a valid local session.
+  }
   res.json({ success: true, user });
 });
 
@@ -137,8 +150,18 @@ app.use('/api', (req, res, next) => {
 
 // 1. API Kiểm tra trạng thái bản quyền cục bộ
 app.get('/api/license/status', async (req, res) => {
-  const status = await licenseChecker.verify();
-  res.json({ success: true, data: status });
+  try {
+    const user = authService.getRequestUser(req);
+    const { getMachineId } = require('./utils/machineId');
+    const response = await fetch('http://localhost:5055/api/client-auth/license-status', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user.username, key: licenseChecker.getSavedKey(), machineId: getMachineId() })
+    });
+    const result = await response.json();
+    res.json({ success: true, data: { isLicensed: Boolean(result.data?.valid), ...result.data } });
+  } catch (error) {
+    res.json({ success: true, data: { isLicensed: false, reason: 'LICENSE_SERVER_UNAVAILABLE', message: 'Không thể kiểm tra gói tài khoản.' } });
+  }
 });
 
 // 2. API Kích hoạt Key mới
@@ -157,7 +180,8 @@ app.post('/api/license/activate', async (req, res) => {
       body: JSON.stringify({
         key: normalizedKey,
         machineId,
-        deviceName: 'Máy CRM Desktop'
+        deviceName: 'Máy CRM Desktop',
+        clientUsername: authService.getRequestUser(req).username
       })
     });
     const centralResult = await centralResponse.json();
@@ -275,6 +299,7 @@ io.use((socket, next) => {
 });
 const wss = new WebSocket.Server({ noServer: true });
 const extensionConnections = new Map();
+const pendingAccountOwners = new Map();
 const domReplaySuppressUntil = new Map();
 const callEventDeduplicator = new CallEventDeduplicator();
 const historyBackfillJobs = new Map();
@@ -552,6 +577,7 @@ wss.on('connection', (ws, req) => {
           if (pending_key) {
             db.prepare('DELETE FROM removed_accounts WHERE account_id = ?').run(String(account_id));
           }
+          const ownerUserId = pending_key ? pendingAccountOwners.get(String(pending_key)) : null;
           const previousExtension = extensionConnections.get(account_id);
           if (previousExtension && previousExtension !== ws && previousExtension.readyState === WebSocket.OPEN) {
             previousExtension.close(1000, 'ACCOUNT_CONNECTION_REPLACED');
@@ -582,8 +608,8 @@ wss.on('connection', (ws, req) => {
           const accName = name || `FB Account (${account_id})`;
 
           db.prepare(`
-            INSERT INTO accounts (id, name, profile_dir, status)
-            VALUES (?, ?, ?, 'ACTIVE')
+            INSERT INTO accounts (id, name, profile_dir, status, owner_user_id, company_id)
+            VALUES (?, ?, ?, 'ACTIVE', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               name = COALESCE(excluded.name, accounts.name),
               profile_dir = CASE
@@ -591,8 +617,12 @@ wss.on('connection', (ws, req) => {
                 ELSE COALESCE(accounts.profile_dir, excluded.profile_dir)
               END,
               status = 'ACTIVE',
+              owner_user_id = COALESCE(excluded.owner_user_id, accounts.owner_user_id),
+              company_id = COALESCE(excluded.company_id, accounts.company_id),
               last_broadcast_date = DATE('now')
-          `).run(account_id, accName, profileDir);
+          `).run(account_id, accName, profileDir, ownerUserId || null,
+            ownerUserId ? db.prepare('SELECT company_id FROM users WHERE id=?').get(ownerUserId)?.company_id || ownerUserId : null);
+          if (pending_key) pendingAccountOwners.delete(String(pending_key));
 
           console.log(`[WS] REGISTER_ACCOUNT thành công: account_id=${account_id}, profile_dir=${profileDir}`);
           try {
@@ -1873,6 +1903,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('REQUEST_SYNC_THREAD_MESSAGES', ({ account_id, thread_id, thread_url, page_id, contact_name }) => {
+    if (!enterpriseAccess.canAccessAccount(socket.user, account_id) && !enterpriseAccess.canAccessThread(socket.user, thread_id)) return;
     let targetAccId = account_id;
     if (!targetAccId && extensionConnections.size > 0) {
       targetAccId = extensionConnections.keys().next().value;
@@ -1910,6 +1941,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('TRIGGER_CALL', ({ thread_id, call_type = 'audio', account_id, call_request_id }) => {
+    if (!enterpriseAccess.canAccessThread(socket.user, thread_id)) return socket.emit('CALL_ERROR', { error: 'Không có quyền sử dụng hội thoại này.' });
     let targetAccId = account_id;
     if (!targetAccId && thread_id) {
       const thread = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(thread_id);
@@ -1951,6 +1983,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('ANSWER_INCOMING_CALL', ({ action, thread_id, account_id } = {}) => {
+    if (thread_id && !enterpriseAccess.canAccessThread(socket.user, thread_id)) return;
     if (action !== 'accept' && action !== 'decline') {
       socket.emit('ANSWER_INCOMING_CALL_RESPONSE', { success: false, error: 'Hành động cuộc gọi không hợp lệ' });
       return;
@@ -1983,6 +2016,9 @@ io.on('connection', (socket) => {
   socket.on('SEND_MESSAGE', async (payload = {}) => {
     const { thread_id, content, client_message_id, attachment_id, contract_version } = payload;
     const isRichMessage = Number(contract_version) === 2 || Boolean(attachment_id);
+    if (!enterpriseAccess.canAccessThread(socket.user, thread_id)) {
+      return socket.emit('SEND_ERROR', { client_message_id, code: 'ACCOUNT_NOT_ASSIGNED', error: 'Tài khoản Facebook chưa được Admin cấp cho bạn.' });
+    }
 
     // Nhân viên gõ tay → tạm dừng AI 30 phút
     const pauseResult = aiMediator.pauseForThread(thread_id);
@@ -2046,6 +2082,7 @@ io.on('connection', (socket) => {
 
   socket.on('RETRY_MESSAGE', (payload = {}) => {
     try {
+      if (!enterpriseAccess.canAccessThread(socket.user, payload.thread_id)) throw Object.assign(new Error('Tài khoản Facebook chưa được Admin cấp cho bạn.'), { code: 'ACCOUNT_NOT_ASSIGNED' });
       if (isLoopbackAddress(socket.handshake?.address) === false) {
         throw new RichMessageService.Error(
           'LOCAL_CRM_REQUIRED',
@@ -2092,32 +2129,114 @@ app.get('/api/health', (req, res) => res.json({
   db: 'SQLite WAL Mode', activeExtensions: extensionConnections.size
 }));
 
+function requireCompanyAdmin(req, res, next) {
+  if (enterpriseAccess.isCompanyAdmin(req.user) || (req.user.role === 'ADMIN' && req.user.username === 'admin')) return next();
+  return res.status(403).json({ success: false, error: 'Chỉ Admin doanh nghiệp được sử dụng chức năng này.' });
+}
+
+app.get('/api/company/employees', requireCompanyAdmin, (req, res) => {
+  res.json({ success: true, employees: enterpriseAccess.listEmployees(req.user), assignments: enterpriseAccess.assignmentMap(req.user.company_id), accounts: enterpriseAccess.listAccounts(req.user) });
+});
+
+app.post('/api/company/employees', requireCompanyAdmin, async (req, res) => {
+  try {
+    const centralResponse = await fetch('http://localhost:5055/api/client-auth/company-employees', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adminUsername: req.user.username, username: req.body?.username, password: req.body?.password })
+    });
+    const central = await centralResponse.json().catch(() => ({}));
+    if (!centralResponse.ok || !central.success) return res.status(centralResponse.status).json({ success: false, error: central.message || 'License Server từ chối tạo nhân viên.' });
+    const employee = enterpriseAccess.createEmployee(req.user, req.body || {});
+    res.status(201).json({ success: true, employee });
+  } catch (error) {
+    res.status(error.status || 500).json({ success: false, error: error.message || 'Không thể tạo nhân viên.' });
+  }
+});
+
+app.delete('/api/company/employees/:id', requireCompanyAdmin, async (req, res) => {
+  const employee = db.prepare("SELECT username FROM users WHERE id=? AND company_id=? AND company_role='EMPLOYEE'").get(Number(req.params.id), req.user.company_id);
+  if (!employee) return res.status(404).json({ success: false, error: 'Không tìm thấy nhân viên.' });
+  try {
+    const centralResponse = await fetch('http://localhost:5055/api/client-auth/company-employees', {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ adminUsername: req.user.username, username: employee.username })
+    });
+    if (!centralResponse.ok && centralResponse.status !== 404) throw new Error('Không thể xóa nhân viên trên License Server.');
+    enterpriseAccess.deleteEmployee(req.user, req.params.id);
+    res.json({ success: true });
+  } catch (error) { res.status(502).json({ success: false, error: error.message }); }
+});
+
+app.put('/api/company/employees/:id/accounts', requireCompanyAdmin, (req, res) => {
+  try {
+    const accountIds = enterpriseAccess.setAssignments(req.user, req.params.id, Array.isArray(req.body?.account_ids) ? req.body.account_ids : []);
+    res.json({ success: true, account_ids: accountIds });
+  } catch (error) { res.status(error.status || 500).json({ success: false, error: error.message }); }
+});
+
 // Accounts
 app.get('/api/accounts', (req, res) => {
-  const accounts = db.prepare('SELECT * FROM accounts').all();
+  const accounts = enterpriseAccess.listAccounts(req.user);
   const result = accounts.map(acc => ({
     ...acc,
-    is_extension_connected: extensionConnections.has(acc.id) && extensionConnections.get(acc.id).readyState === WebSocket.OPEN
+    is_extension_connected: extensionConnections.has(acc.id) && extensionConnections.get(acc.id).readyState === WebSocket.OPEN,
+    is_chrome_running: processManager.getStatus(acc.id) === 'RUNNING',
+    chrome_display_mode: processManager.getDisplayMode(acc.id)
   }));
   res.json(result);
 });
 app.post('/api/accounts/:id/start', (req, res) => {
+  if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
+    return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
+  }
   res.json({ success: processManager.startAccountProcess(req.params.id) });
 });
+app.post('/api/accounts/:id/stop', (req, res) => {
+  if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
+    return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
+  }
+  const stopped = processManager.stopAccountProcess(req.params.id);
+  res.json({ success: true, stopped });
+});
+app.post('/api/accounts/:id/open', (req, res) => {
+  if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
+    return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
+  }
+  const started = processManager.startAccountProcess(req.params.id);
+  if (started) processManager.unhideWindow(req.params.id);
+  res.json({ success: started });
+});
+app.post('/api/accounts/:id/background', (req, res) => {
+  if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
+    return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
+  }
+  const started = processManager.startAccountProcess(req.params.id);
+  const hidden = started ? processManager.hideAccountProcess(req.params.id) : false;
+  res.json({ success: started, hidden });
+});
 app.post('/api/accounts/new-session', (req, res) => {
+  if (!enterpriseAccess.isCompanyAdmin(req.user) && !(req.user.role === 'ADMIN' && req.user.username === 'admin')) {
+    return res.status(403).json({ success: false, error: 'Chỉ Admin doanh nghiệp được thêm tài khoản Facebook.' });
+  }
   const now = new Date();
   const dateStr = now.toISOString().replace(/[-T:.Z]/g, '').substring(0, 14);
   const randomStr = Math.random().toString(36).substring(2, 7);
   const pendingKey = `pending_${dateStr}_${randomStr}`;
+  pendingAccountOwners.set(pendingKey, req.user.id);
 
   console.log(`[API] Tạo phiên đăng ký tài khoản Facebook mới: ${pendingKey}`);
   const success = processManager.startNewAccountProcess(pendingKey);
+  if (!success) pendingAccountOwners.delete(pendingKey);
   res.json({ success, pending_key: pendingKey });
 });
 app.delete('/api/accounts/:id', (req, res) => {
   try {
     const accountId = String(req.params.id || '').trim();
-    const account = db.prepare('SELECT id FROM accounts WHERE id = ?').get(accountId);
+    const account = enterpriseAccess.canAccessAccount(req.user, accountId)
+      ? db.prepare('SELECT id FROM accounts WHERE id = ?').get(accountId) : null;
+    if (!enterpriseAccess.isCompanyAdmin(req.user) && !(req.user.role === 'ADMIN' && req.user.username === 'admin')) {
+      return res.status(403).json({ success: false, error: 'Chỉ Admin doanh nghiệp được xóa tài khoản Facebook.' });
+    }
     if (!account) {
       return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
     }
@@ -2146,7 +2265,7 @@ app.delete('/api/accounts/:id', (req, res) => {
 // Threads
 app.get('/api/threads', (req, res) => {
   const { tab = 'ALL' } = req.query;
-  const threads = assignmentManager.getThreadsByFilter(req.user.id, req.user.role, tab);
+  const threads = assignmentManager.getThreadsByFilter(req.user.id, req.user.role, tab, 'all', req.user.company_id, req.user.company_role, req.user.username);
   res.json(threads);
 });
 
@@ -2217,6 +2336,7 @@ app.get(
   requireLocalCrmRequest,
   (req, res) => {
     try {
+      if (!enterpriseAccess.canAccessThread(req.user, req.params.threadId)) return res.status(404).json({ error: 'Không tìm thấy hội thoại.' });
       res.json(RichMessageCapabilityService.getForThread(
         req.params.threadId,
         getRichMessageCapabilityOptions()
@@ -2233,7 +2353,8 @@ app.post(
   express.raw({ type: 'multipart/form-data', limit: '105mb' }),
   (req, res) => {
     try {
-      const operatorId = getLocalOperatorId();
+      if (!enterpriseAccess.canAccessThread(req.user, req.params.threadId)) return res.status(404).json({ error: 'Không tìm thấy hội thoại.' });
+      const operatorId = req.user.id;
       if (operatorId == null) {
         return res.status(401).json({ code: 'AUTH_REQUIRED', error: 'CRM chưa có operator hợp lệ.' });
       }
@@ -2270,7 +2391,8 @@ app.delete(
   requireLocalCrmRequest,
   (req, res) => {
     try {
-      const operatorId = getLocalOperatorId();
+      if (!enterpriseAccess.canAccessThread(req.user, req.params.threadId)) return res.status(404).json({ error: 'Không tìm thấy hội thoại.' });
+      const operatorId = req.user.id;
       if (operatorId == null) {
         return res.status(401).json({ code: 'AUTH_REQUIRED', error: 'CRM chưa có operator hợp lệ.' });
       }
@@ -2347,12 +2469,14 @@ app.get(
 );
 
 app.get('/api/contacts/:thread_id', (req, res) => {
+  if (!enterpriseAccess.canAccessThread(req.user, req.params.thread_id)) return res.status(404).json({ error: 'Không tìm thấy hội thoại' });
   const contact = db.prepare('SELECT * FROM contacts WHERE thread_id=?').get(req.params.thread_id) || {};
   const phoneView = PhoneCaptureService.getContactPhoneView(req.params.thread_id, db);
   res.json({ ...contact, phone_candidates: phoneView.phone_candidates, phone_capture: phoneView.phone_capture });
 });
 
 app.put('/api/contacts/:thread_id', (req, res) => {
+  if (!enterpriseAccess.canAccessThread(req.user, req.params.thread_id)) return res.status(404).json({ error: 'Không tìm thấy hội thoại' });
   let updatedContact;
   try {
     updatedContact = ContactService.update(req.params.thread_id, req.body, db);
@@ -2382,7 +2506,11 @@ app.put('/api/contacts/:thread_id', (req, res) => {
 // Inbox Sources — Personal and Page connected sources
 app.get('/api/inbox-sources', (req, res) => {
   try {
-    const sources = InboxSourceService.getAllSources(db);
+    const accountIds = enterpriseAccess.listAccounts(req.user).map(account => String(account.id));
+    const sources = accountIds.length ? db.prepare(`
+      SELECT id,source_type,owner_account_id,external_id,display_name,avatar_url,status,webhook_verify_token,created_at
+      FROM inbox_sources WHERE owner_account_id IN (${accountIds.map(() => '?').join(',')}) ORDER BY created_at ASC
+    `).all(...accountIds) : [];
     res.json(sources);
   } catch (error) {
     console.error('[InboxSource] Fetch failed:', error);
@@ -2827,6 +2955,7 @@ app.get('/api/ollama/health', async (req, res) => {
 
 // Messages REST API - With UI Guard Filter
 app.get('/api/threads/:id/messages', (req, res) => {
+  if (!enterpriseAccess.canAccessThread(req.user, req.params.id)) return res.status(404).json({ error: 'Không tìm thấy hội thoại' });
   // `id` is the durable per-database receive sequence. is_outgoing identifies
   // the side (0 = customer, 1 = operator); timestamps are display-only.
   const msgs = db.prepare('SELECT * FROM messages WHERE thread_id=? ORDER BY COALESCE(sequence_order, id) ASC, id ASC').all(req.params.id);
@@ -2847,6 +2976,7 @@ app.get('/api/threads/:id/messages', (req, res) => {
 // content/media - used by page_content.js/content.js to re-seed their
 // client-side timestamp-anchor map after a script restart (feature 014).
 app.get('/api/threads/:id/message-timestamps', (req, res) => {
+  if (!enterpriseAccess.canAccessThread(req.user, req.params.id)) return res.status(404).json({ error: 'Không tìm thấy hội thoại' });
   res.json(ConversationRepository.getMessageTimestamps(req.params.id));
 });
 

@@ -195,6 +195,17 @@ html, body, #root {
   max-height: 100dvh;
 }
 
+/* Dedicated application page: keep the navigation column and remove chat columns. */
+.employee-view > :not(.app-sidebar-shell):not(.employee-management-page) {
+  display: none;
+}
+
+.employee-view .employee-management-page {
+  display: block;
+  grid-column: 2 / -1;
+  grid-row: 1;
+}
+
 /* ═══════════════════════════════════════════════
    ≤ 1439px: Narrow panels
    ═══════════════════════════════════════════════ */

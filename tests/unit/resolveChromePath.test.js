@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { resolveChromePath, BUNDLED_CHROME_RELATIVE_PATH } = require('../../chrome-bundling/resolveChromePath');
+const { resolveChromePath, findSystemChromePath, BUNDLED_CHROME_RELATIVE_PATH } = require('../../chrome-bundling/resolveChromePath');
 
 function makeFakeRepoRoot() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crm-chrome-test-'));
@@ -37,10 +37,20 @@ test('falls back to legacyBinChromePath when the new bundled path is missing (no
   fs.rmSync(legacyDir, { recursive: true, force: true });
 });
 
-test('falls back to the literal "google-chrome" command when nothing else exists (pre-spec-046 behavior preserved)', () => {
+test('falls back to installed system Chrome or the literal google-chrome command', () => {
   const repoRoot = makeFakeRepoRoot();
   const result = resolveChromePath({ repoRoot, legacyBinChromePath: path.join(repoRoot, 'does-not-exist.exe') });
-  assert.equal(result, 'google-chrome');
+  assert.equal(result, findSystemChromePath() || 'google-chrome');
+  fs.rmSync(repoRoot, { recursive: true, force: true });
+});
+
+test('preferSystemChrome selects Chrome Stable before an available bundled browser', () => {
+  const systemChrome = findSystemChromePath();
+  if (!systemChrome) return;
+  const repoRoot = makeFakeRepoRoot();
+  touchFile(repoRoot, BUNDLED_CHROME_RELATIVE_PATH[process.platform]);
+  const result = resolveChromePath({ repoRoot, preferSystemChrome: true });
+  assert.equal(result, systemChrome);
   fs.rmSync(repoRoot, { recursive: true, force: true });
 });
 

@@ -4,7 +4,8 @@ import { X, Check, Copy, RefreshCw, CreditCard, ShieldCheck, Laptop, Calendar } 
 
 const LICENSE_SERVER_URL = 'http://localhost:5055';
 
-export default function PaymentModal({ isOpen, onClose, onActivated }) {
+export default function PaymentModal({ isOpen, onClose, onActivated, existingLicense = null }) {
+  const isUpgrade = Boolean(existingLicense?.key);
   const [step, setStep] = useState(1); // 1: Configure, 2: Payment QR, 3: Success
   const [months, setMonths] = useState(1);
   const [machines, setMachines] = useState(1);
@@ -23,6 +24,8 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
   // Reset state when opening modal
   useEffect(() => {
     if (isOpen) {
+      setMonths(1);
+      setMachines(isUpgrade ? 0 : 1);
       setStep(1);
       setOrderData(null);
       setCopiedField(null);
@@ -31,7 +34,7 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
       setCompanyError('');
       setSavingCompany(false);
     }
-  }, [isOpen]);
+  }, [isOpen, isUpgrade]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -91,7 +94,10 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
   const UNIT_PRICE = pricing?.unitPrice || 0;
   const EXTRA_SLOT_PRICE = pricing?.extraSlotPrice || 0;
   const discountPercent = pricing?.discounts?.[months] ?? 0;
-  const rawTotal = months * (UNIT_PRICE + Math.max(0, machines - 1) * EXTRA_SLOT_PRICE);
+  const remainingMonths = Math.max(1, Math.ceil((existingLicense?.daysRemaining || 0) / 30) + months);
+  const rawTotal = isUpgrade
+    ? months * (UNIT_PRICE + Math.max(0, (existingLicense?.machines || 1) - 1) * EXTRA_SLOT_PRICE) + machines * EXTRA_SLOT_PRICE * remainingMonths
+    : months * (UNIT_PRICE + Math.max(0, machines - 1) * EXTRA_SLOT_PRICE);
   const finalTotal = Math.floor(rawTotal * (1 - discountPercent / 100));
 
   // Tạo đơn hàng thanh toán
@@ -101,7 +107,7 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
       const res = await fetch(`${LICENSE_SERVER_URL}/api/orders/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ months, machines })
+        body: JSON.stringify({ months, machines, licenseKey: isUpgrade ? existingLicense.key : undefined })
       });
       const json = await res.json();
       if (json.success) {
@@ -160,7 +166,7 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--color-border,#284057)] bg-[var(--color-bg-sidebar,#0b1624)]">
           <div className="flex items-center gap-2 font-semibold text-lg">
             <CreditCard className="w-5 h-5 text-[var(--color-accent,#0ea5e9)]" />
-            <span>Đăng Ký Bản Quyền CRM</span>
+            <span>{isUpgrade ? 'Gia Hạn / Nâng Cấp Bản Quyền' : 'Đăng Ký Bản Quyền CRM'}</span>
           </div>
           <button onClick={onClose} className="p-1 rounded-lg hover:bg-[var(--color-bg-surface,#132235)] text-[var(--color-text-muted,#7f95aa)] transition">
             <X className="w-5 h-5" />
@@ -177,10 +183,11 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
               {/* Chọn số tháng */}
               <div>
                 <label className="block text-xs font-medium text-[var(--color-text-muted,#7f95aa)] uppercase tracking-wider mb-2">
-                  1. Chọn Thời Hạn (Tháng)
+                  1. {isUpgrade ? 'Cộng Thêm Thời Hạn' : 'Chọn Thời Hạn'} (Tháng)
                 </label>
-                <div className="grid grid-cols-4 gap-2">
+                <div className={`grid ${isUpgrade ? 'grid-cols-5' : 'grid-cols-4'} gap-2`}>
                   {[
+                    ...(isUpgrade ? [{ m: 0, label: 'Không thêm', discount: 0 }] : []),
                     { m: 1, label: '1 Tháng', discount: pricing?.discounts?.[1] || 0 },
                     { m: 3, label: '3 Tháng', discount: pricing?.discounts?.[3] || 0 },
                     { m: 6, label: '6 Tháng', discount: pricing?.discounts?.[6] || 0 },
@@ -209,21 +216,21 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
               {/* Chọn số máy */}
               <div>
                 <label className="block text-xs font-medium text-[var(--color-text-muted,#7f95aa)] uppercase tracking-wider mb-2">
-                  2. Chọn Số Máy (Thiết bị)
+                  2. {isUpgrade ? 'Cộng Thêm Slot Máy' : 'Chọn Số Máy'}
                 </label>
                 <div className="flex items-center gap-3">
                   <button
-                    onClick={() => setMachines(Math.max(1, machines - 1))}
+                    onClick={() => setMachines(Math.max(isUpgrade ? 0 : 1, machines - 1))}
                     className="w-10 h-10 rounded-lg border border-[var(--color-border,#284057)] bg-[var(--color-bg-surface,#132235)] hover:bg-[var(--color-bg-elevated,#172b42)] font-bold text-lg"
                   >
                     -
                   </button>
                   <input
                     type="number"
-                    min="1"
+                    min={isUpgrade ? 0 : 1}
                     max="100"
                     value={machines}
-                    onChange={(e) => setMachines(Math.max(1, parseInt(e.target.value) || 1))}
+                    onChange={(e) => setMachines(Math.max(isUpgrade ? 0 : 1, parseInt(e.target.value) || 0))}
                     className="w-24 h-10 text-center rounded-lg border border-[var(--color-border,#284057)] bg-[var(--color-bg-surface,#132235)] text-lg font-bold focus:outline-none focus:border-[var(--color-accent,#0ea5e9)]"
                   />
                   <button
@@ -232,7 +239,7 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
                   >
                     +
                   </button>
-                  <span className="text-sm text-[var(--color-text-muted,#7f95aa)]">máy tính sử dụng</span>
+                  <span className="text-sm text-[var(--color-text-muted,#7f95aa)]">{isUpgrade ? 'slot máy cộng thêm' : 'máy tính sử dụng'}</span>
                 </div>
               </div>
 
@@ -242,9 +249,9 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
                   <span className="text-[var(--color-text-muted,#7f95aa)]">Đơn giá gốc:</span>
                   <span>{pricing ? `${UNIT_PRICE.toLocaleString('vi-VN')}đ / máy đầu tiên / tháng` : 'Đang tải bảng giá...'}</span>
                 </div>
-                {pricing && machines > 1 && (
+                {pricing && machines > (isUpgrade ? 0 : 1) && (
                   <div className="flex justify-between text-sm">
-                    <span className="text-[var(--color-text-muted,#7f95aa)]">{machines - 1} slot máy bổ sung:</span>
+                    <span className="text-[var(--color-text-muted,#7f95aa)]">{isUpgrade ? machines : machines - 1} slot máy bổ sung:</span>
                     <span>{EXTRA_SLOT_PRICE.toLocaleString('vi-VN')}đ / slot / tháng</span>
                   </div>
                 )}
@@ -265,7 +272,7 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
               {pricingError && <p className="text-sm text-red-400">{pricingError}. Vui lòng đóng và mở lại bảng thanh toán.</p>}
               <button
                 onClick={handleCreateOrder}
-                disabled={loading || !pricing || Boolean(pricingError)}
+                disabled={loading || !pricing || Boolean(pricingError) || (isUpgrade && months === 0 && machines === 0)}
                 className="w-full py-3 rounded-lg bg-[var(--color-accent,#0ea5e9)] hover:bg-sky-400 text-white font-semibold text-base shadow-lg transition flex items-center justify-center gap-2"
               >
                 {loading ? <RefreshCw className="w-5 h-5 animate-spin" /> : 'Tiếp Tục Thanh Toán VietQR ➔'}
@@ -375,7 +382,7 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
                 <strong>Key đã được lưu tự động.</strong> Bạn không cần nhập lại Key khi sử dụng CRM trên máy này.
               </div>
 
-              <form onSubmit={handleSaveCompany} className="space-y-3 text-left">
+              <form onSubmit={handleSaveCompany} className={`${isUpgrade ? 'hidden' : ''} space-y-3 text-left`}>
                 <div>
                   <label htmlFor="payment-company-name" className="mb-1.5 block text-sm font-semibold text-slate-700">
                     Tên công ty <span className="text-red-500">*</span>
@@ -406,6 +413,13 @@ export default function PaymentModal({ isOpen, onClose, onActivated }) {
                   {savingCompany ? <><RefreshCw className="h-4 w-4 animate-spin" /> Đang lưu tên công ty...</> : 'Xác Nhận & Bắt Đầu Sử Dụng CRM'}
                 </button>
               </form>
+              {isUpgrade && (
+                <button
+                  type="button"
+                  onClick={async () => { await onActivated?.(); onClose(); }}
+                  className="flex w-full items-center justify-center rounded-lg bg-blue-600 py-3 text-base font-semibold text-white shadow-lg transition hover:bg-blue-500"
+                >Hoàn Tất Gia Hạn / Nâng Cấp</button>
+              )}
 
             </div>
           )}

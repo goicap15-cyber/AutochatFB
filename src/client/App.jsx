@@ -18,6 +18,7 @@ import PaymentModal from './components/PaymentModal.jsx';
 import LicenseManagerModal from './components/LicenseManagerModal.jsx';
 import LicenseLockScreen from './components/LicenseLockScreen.jsx';
 import AuthScreen from './components/AuthScreen.jsx';
+import EmployeeManagementModal from './components/EmployeeManagementModal.jsx';
 import { useSocket } from './hooks/useSocket.js';
 import { MessageSquare } from 'lucide-react';
 
@@ -86,6 +87,8 @@ export default function App() {
   const [incomingCallInfo, setIncomingCallInfo] = useState(null);
   const [licenseStatus, setLicenseStatus] = useState(null);
   const [sessionUser, setSessionUser] = useState(null);
+  const sessionUserIdRef = useRef(null);
+  const accountsRef = useRef([]);
   const [authLoading, setAuthLoading] = useState(true);
   const { socket, isConnected } = useSocket(Boolean(sessionUser));
 
@@ -102,6 +105,23 @@ export default function App() {
   }, []);
 
   useEffect(() => { checkSession(); }, [checkSession]);
+
+  useEffect(() => {
+    const nextUserId = sessionUser?.id ?? null;
+    if (sessionUserIdRef.current !== nextUserId) {
+      setThreads([]);
+      setAccounts([]);
+      accountsRef.current = [];
+      setInboxSources([]);
+      setMessages({});
+      setContacts({});
+      setActiveThreadId(null);
+      setSelectedCampaignThreadIds([]);
+      setCampaignSelectionMode(false);
+      setActiveCampaignId(null);
+    }
+    sessionUserIdRef.current = nextUserId;
+  }, [sessionUser?.id]);
 
   const checkLicenseStatus = useCallback(async () => {
     try {
@@ -188,6 +208,7 @@ export default function App() {
       const data = await res.json();
       const accountList = Array.isArray(data) ? data : [];
       setAccounts(accountList);
+      accountsRef.current = accountList;
       setHasCheckpoint(accountList.some(a => a.status === 'CHECKPOINT'));
     } catch (e) {
       console.warn('Failed to load accounts:', e);
@@ -197,9 +218,11 @@ export default function App() {
 
   const loadThreads = useCallback(async () => {
     if (!sessionUser) return;
+    const requestedUserId = sessionUser.id;
     try {
       const res = await fetch(`/api/threads?tab=${activeTab}`);
       const data = await res.json();
+      if (sessionUserIdRef.current !== requestedUserId) return;
       const threadList = Array.isArray(data) ? data : [];
       setThreads(threadList.map(t => ({ ...t, thread_key: t.thread_key || (t.account_id ? `${t.account_id}:${t.id}` : String(t.id)) })));
     } catch {
@@ -322,6 +345,7 @@ export default function App() {
   useEffect(() => {
     if (!socket) return;
     socket.on('NEW_MESSAGE', (newMsg) => {
+      if (!accountsRef.current.some((account) => String(account.id) === String(newMsg.account_id))) return;
       const tidStr = String(newMsg.thread_id);
       setMessages(prev => {
         const currentMsgs = prev[tidStr] || [];
@@ -626,6 +650,7 @@ export default function App() {
     socket.on('CAMPAIGN_AUDIT_EVENT', handleCampaignEvent);
     socket.on('THREADS_SYNCED', ({ account_id, threads: syncedThreads }) => {
       if (!syncedThreads || !Array.isArray(syncedThreads)) return;
+      if (!accountsRef.current.some((account) => String(account.id) === String(account_id))) return;
       setThreads(prev => {
         const accIdStr = String(account_id || '');
         const updatedThreads = [...prev];
@@ -672,6 +697,7 @@ export default function App() {
       socket.off('MESSAGE_SEND_ACCEPTED');
       socket.off('MESSAGE_SEND_STATUS');
       socket.off('SEND_ERROR');
+      socket.off('THREAD_MESSAGES_UPDATED');
       socket.off('EXTENSION_CONNECTION_CHANGED');
       socket.off('MESSAGE_UNSENT');
       socket.off('ACCOUNT_STATUS_CHANGED');
@@ -945,8 +971,11 @@ export default function App() {
   const isCurrentSendDisabled = selectedThread?.source_type === 'page_messenger'
     ? selectedThread?.source_status && selectedThread.source_status !== 'ACTIVE'
     : isCurrentExtensionDisconnected;
+  const currentSendDisabledReason = selectedThread?.source_type === 'page_messenger'
+    ? 'Đang chờ Page Messenger sẵn sàng. Vui lòng đợi trong giây lát.'
+    : 'Đang chờ Messenger trên Chrome tải xong. Vui lòng đợi trong giây lát.';
 
-  const gridClass = leadPanelCollapsed ? 'app-grid-collapsed' : 'app-grid';
+  const gridClass = `${leadPanelCollapsed ? 'app-grid-collapsed' : 'app-grid'}${activeView === 'employees' ? ' employee-view' : ''}`;
 
   const handleStartCall = useCallback((callType = 'audio') => {
     if (!activeThreadId || !selectedThread) return;
@@ -985,6 +1014,8 @@ export default function App() {
         onToggleCollapse={() => setLeadPanelCollapsed(!leadPanelCollapsed)}
         sessionUser={sessionUser} onLogout={handleLogout}
       />
+
+      {activeView === 'employees' && <EmployeeManagementModal />}
 
       {/* Column 2: Conversation List */}
       <ConversationSidebar
@@ -1036,6 +1067,7 @@ export default function App() {
               onDiscardAttachment={handleDiscardAttachment}
               capabilities={richCapabilities}
               disabled={!!isCurrentSendDisabled || richCapabilities?.text?.enabled === false}
+              disabledReason={currentSendDisabledReason}
             />
           </div>
         ) : (
@@ -1060,7 +1092,7 @@ export default function App() {
 
       {/* Modals */}
       {activeModal === 'search' && <SearchOverlay onClose={() => setActiveModal(null)} onSelectThread={(tid) => { setActiveThreadId(tid); setActiveModal(null); }} />}
-      {activeModal === 'accounts' && <AccountManagerModal socket={socket} onClose={() => { setActiveModal(null); loadAccounts(); loadInboxSources(); }} onSourcesChanged={() => { loadInboxSources(); loadThreads(); }} />}
+      {activeModal === 'accounts' && <AccountManagerModal sessionUser={sessionUser} socket={socket} onClose={() => { setActiveModal(null); loadAccounts(); loadInboxSources(); }} onSourcesChanged={() => { loadInboxSources(); loadThreads(); }} />}
       {activeModal === 'autoReply' && <AutoReplyModal onClose={() => setActiveModal(null)} />}
       {activeModal === 'campaigns' && (
         <CampaignCreateModal
@@ -1088,6 +1120,7 @@ export default function App() {
           isOpen={true}
           onClose={() => setActiveModal(null)}
           onActivated={checkLicenseStatus}
+          existingLicense={licenseStatus?.isLicensed ? licenseStatus : null}
         />
       )}
       {activeModal === 'license' && (
@@ -1116,6 +1149,7 @@ export default function App() {
         <LicenseLockScreen
           status={licenseStatus}
           onOpenPayment={() => setActiveModal('payment')}
+          onBackToLogin={handleLogout}
         />
       )}
     </div>

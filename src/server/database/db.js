@@ -674,6 +674,39 @@ const migrations = [
       `);
       console.log('[DB] Migration v28: Corrected CRM-originated call logs to outgoing.');
     }
+  },
+  {
+    version: 29,
+    name: 'isolate_facebook_accounts_by_crm_user',
+    up: (db) => {
+      try { db.exec('ALTER TABLE accounts ADD COLUMN owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;'); } catch (error) { }
+      db.exec('CREATE INDEX IF NOT EXISTS idx_accounts_owner_user ON accounts(owner_user_id);');
+      console.log('[DB] Migration v29: Added per-user ownership for Facebook accounts.');
+    }
+  },
+  {
+    version: 30,
+    name: 'enterprise_company_membership_and_account_assignments',
+    up: (db) => {
+      try { db.exec('ALTER TABLE users ADD COLUMN company_id INTEGER;'); } catch (error) { }
+      try { db.exec("ALTER TABLE users ADD COLUMN company_role TEXT NOT NULL DEFAULT 'ADMIN' CHECK(company_role IN ('ADMIN','EMPLOYEE'));"); } catch (error) { }
+      try { db.exec('ALTER TABLE accounts ADD COLUMN company_id INTEGER;'); } catch (error) { }
+      db.exec(`
+        UPDATE users SET company_id=id WHERE company_id IS NULL;
+        UPDATE accounts SET company_id=owner_user_id WHERE company_id IS NULL;
+        CREATE TABLE IF NOT EXISTS account_user_assignments (
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          assigned_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY(account_id,user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_users_company ON users(company_id,company_role);
+        CREATE INDEX IF NOT EXISTS idx_accounts_company ON accounts(company_id);
+        CREATE INDEX IF NOT EXISTS idx_account_assignments_user ON account_user_assignments(user_id,account_id);
+      `);
+      console.log('[DB] Migration v30: Added enterprise membership and Facebook assignments.');
+    }
   }
 ];
 

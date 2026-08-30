@@ -167,6 +167,7 @@ class ProcessManager {
       `--disable-extensions-except=${absExtPath}`,
       '--no-first-run',
       '--no-default-browser-check',
+      '--disable-background-mode',
       '--use-fake-ui-for-media-stream',
       '--disable-popup-blocking',
       '--disable-notifications',
@@ -204,7 +205,8 @@ class ProcessManager {
         process: child,
         profileDir: absProfileDir,
         pid: child.pid,
-        status: 'RUNNING'
+        status: 'RUNNING',
+        displayMode: 'BACKGROUND'
       });
 
       // Tự động ẩn cửa sổ Chrome ngầm khỏi màn hình PC & Taskbar sau khi bật
@@ -242,6 +244,7 @@ class ProcessManager {
       `--disable-extensions-except=${absExtPath}`,
       '--no-first-run',
       '--no-default-browser-check',
+      '--disable-background-mode',
       '--use-fake-ui-for-media-stream',
       '--disable-popup-blocking',
       '--disable-notifications',
@@ -297,6 +300,7 @@ class ProcessManager {
     if (procInfo && procInfo.pid) {
       hideFromTaskbar(procInfo.pid, 500);
       hideFromTaskbar(procInfo.pid, 2500);
+      procInfo.displayMode = 'BACKGROUND';
       console.log(`[ProcessManager] Tự động ẩn Chrome của account ${accountId} khỏi Taskbar.`);
       return true;
     }
@@ -308,11 +312,27 @@ class ProcessManager {
     console.log(`[ProcessManager] Bật sáng cửa sổ Chrome cho account ${accountId}!`);
     const procInfo = this.processes.get(accountId);
     const pid = procInfo?.pid;
+    const escapedProfileDir = String(procInfo?.profileDir || '').replace(/'/g, "''").replace(/\\/g, '/');
+    if (procInfo) procInfo.displayMode = 'VISIBLE';
 
     if (process.platform === 'win32') {
-      const psScript = pid
-        ? `$app = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($app -and $app.MainWindowHandle -ne 0) { try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Win32Helper { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int m); }' } catch {}; [Win32Helper]::ShowWindowAsync($app.MainWindowHandle, 9); [Win32Helper]::SetForegroundWindow($app.MainWindowHandle); }`
-        : `$apps = Get-Process -Name 'chrome' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }; if ($apps) { try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Win32Helper { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int m); }' } catch {}; foreach ($a in $apps) { [Win32Helper]::ShowWindowAsync($a.MainWindowHandle, 9); [Win32Helper]::SetForegroundWindow($a.MainWindowHandle); } }`;
+      const psScript = `
+try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class Win32Helper { [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h, int m); [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int n); [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr h, int n, int v); }' } catch {}
+$targetPids = @(${pid || 0})
+$profile = '${escapedProfileDir}'
+if ($profile) {
+  $profileProcesses = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { ($_.CommandLine -replace '\\','/') -like "*$profile*" }
+  foreach ($processInfo in $profileProcesses) { $targetPids += $processInfo.ProcessId }
+}
+$apps = Get-Process -Name 'chrome' -ErrorAction SilentlyContinue | Where-Object { $targetPids -contains $_.Id -and $_.MainWindowHandle -ne 0 }
+foreach ($app in $apps) {
+  $handle = $app.MainWindowHandle
+  $style = [Win32Helper]::GetWindowLong($handle, -20)
+  $style = ($style -band -bnot 0x00000080) -bor 0x00040000
+  [Win32Helper]::SetWindowLong($handle, -20, $style) | Out-Null
+  [Win32Helper]::ShowWindowAsync($handle, 9) | Out-Null
+  [Win32Helper]::SetForegroundWindow($handle) | Out-Null
+}`;
 
       const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
       exec(`powershell -NoProfile -NonInteractive -EncodedCommand ${encoded}`, (err) => {
@@ -357,6 +377,10 @@ class ProcessManager {
   getStatus(accountId) {
     const procInfo = this.processes.get(accountId);
     return procInfo ? procInfo.status : 'STOPPED';
+  }
+
+  getDisplayMode(accountId) {
+    return this.processes.get(accountId)?.displayMode || 'STOPPED';
   }
 
   stopAllAccountProcesses() {

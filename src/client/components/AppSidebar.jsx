@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { MessageSquare, Search, Zap, Megaphone, Cpu, UserCheck, ShieldAlert, ChevronLeft, ChevronRight, Sun, Moon, Phone, Key, CreditCard, LogOut } from 'lucide-react';
+import { MessageSquare, Search, Zap, Megaphone, Cpu, UserCheck, Users, ShieldAlert, ChevronLeft, ChevronRight, Sun, Moon, Phone, Key, CreditCard, LogOut } from 'lucide-react';
 import { SIDEBAR_CLOSE_DELAY_MS, shouldKeepSidebarExpanded } from '../utils/appSidebarPresentation.js';
 
 const ICON_SIZE = 18;
@@ -28,6 +28,7 @@ export default function AppSidebar({ activeView, onSelectView, onOpenModal, them
     { id: 'payment', label: 'Mua License', icon: CreditCard, isModal: true },
     { id: 'accounts', label: 'Quản lý', icon: UserCheck, isModal: true }
   ];
+  if (sessionUser?.company_role === 'ADMIN') navItems.push({ id: 'employees', label: 'Nhân viên', icon: Users });
 
   const cancelScheduledCollapse = () => {
     if (closeTimerRef.current) {

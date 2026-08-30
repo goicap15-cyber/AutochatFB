@@ -30,6 +30,25 @@ if (!pricingColumns.some((column) => column.name === 'extra_slot_price')) {
   db.exec('ALTER TABLE pricing_settings ADD COLUMN extra_slot_price INTEGER NOT NULL DEFAULT 99000');
 }
 
+const clientUserColumns = db.prepare('PRAGMA table_info(client_users)').all();
+if (!clientUserColumns.some((column) => column.name === 'license_id')) {
+  db.exec('ALTER TABLE client_users ADD COLUMN license_id INTEGER REFERENCES licenses(id) ON DELETE SET NULL');
+}
+if (!clientUserColumns.some((column) => column.name === 'company_admin_id')) {
+  db.exec('ALTER TABLE client_users ADD COLUMN company_admin_id INTEGER REFERENCES client_users(id) ON DELETE CASCADE');
+}
+if (!clientUserColumns.some((column) => column.name === 'company_role')) {
+  db.exec("ALTER TABLE client_users ADD COLUMN company_role TEXT NOT NULL DEFAULT 'ADMIN' CHECK(company_role IN ('ADMIN','EMPLOYEE'))");
+}
+
+const orderColumns = db.prepare('PRAGMA table_info(orders)').all();
+if (!orderColumns.some((column) => column.name === 'order_type')) {
+  db.exec("ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'NEW'");
+}
+if (!orderColumns.some((column) => column.name === 'target_license_id')) {
+  db.exec('ALTER TABLE orders ADD COLUMN target_license_id INTEGER REFERENCES licenses(id)');
+}
+
 console.log('[LicenseDB] SQLite Database ready:', DB_PATH);
 
 module.exports = db;

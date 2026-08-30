@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle, Trash2 } from 'lucide-react';
 
-export default function AccountManagerModal({ onClose, onSourcesChanged, socket }) {
+export default function AccountManagerModal({ onClose, onSourcesChanged, socket, sessionUser }) {
+  const isCompanyAdmin = sessionUser?.company_role === 'ADMIN';
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [startingId, setStartingId] = useState(null);
+  const [togglingId, setTogglingId] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
   const [accountActionError, setAccountActionError] = useState('');
   const [addingSession, setAddingSession] = useState(false);
@@ -69,18 +71,27 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
           : account
       )));
     };
+    const handleAccountLinkFailed = (data) => {
+      if (!pendingKey || data?.pending_key !== pendingKey) return;
+      setAccountActionError(data.error || 'Không thể liên kết tài khoản Facebook');
+      setAddingSession(false);
+      setPendingKey(null);
+      setInitialAccountIds(null);
+    };
     socket.on('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
     socket.on('EXTENSION_CONNECTION_CHANGED', handleExtensionConnection);
+    socket.on('ACCOUNT_LINK_FAILED', handleAccountLinkFailed);
     return () => {
       socket.off('ACCOUNT_STATUS_CHANGED', handleAccountStatus);
       socket.off('EXTENSION_CONNECTION_CHANGED', handleExtensionConnection);
+      socket.off('ACCOUNT_LINK_FAILED', handleAccountLinkFailed);
     };
-  }, [socket, addingSession, initialAccountIds, onSourcesChanged]);
+  }, [socket, addingSession, pendingKey, initialAccountIds, onSourcesChanged]);
 
   const handleStartChrome = async (accountId) => {
     setStartingId(accountId);
     try {
-      await fetch(`/api/accounts/${accountId}/start`, { method: 'POST' });
+      await fetch(`/api/accounts/${accountId}/open`, { method: 'POST' });
       await loadAccounts();
     } catch (e) {
       console.error(e);
@@ -110,6 +121,26 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
       setAccountActionError(e.message || 'Không thể kết nối backend để thêm tài khoản');
       setAddingSession(false);
       setInitialAccountIds(null);
+    }
+  };
+
+  const handleToggleChrome = async (account) => {
+    setTogglingId(account.id);
+    setAccountActionError('');
+    try {
+      const isVisible = account.chrome_display_mode === 'VISIBLE';
+      const action = isVisible ? 'background' : 'open';
+      const res = await fetch(`/api/accounts/${account.id}/${action}`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Không thể chuyển Chrome sang chế độ ${action === 'open' ? 'hiển thị' : 'chạy ngầm'}`);
+      setAccounts((current) => current.map((item) => String(item.id) === String(account.id)
+        ? { ...item, is_chrome_running: true, chrome_display_mode: action === 'open' ? 'VISIBLE' : 'BACKGROUND' }
+        : item));
+      window.setTimeout(loadAccounts, 700);
+    } catch (error) {
+      setAccountActionError(error.message);
+    } finally {
+      setTogglingId(null);
     }
   };
 
@@ -189,7 +220,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
 
         {/* Content */}
         <div className="p-5 space-y-4 max-h-[70vh] overflow-y-auto">
-          <div className="flex items-center justify-between gap-3">
+          <div className={'flex items-center justify-between gap-3 ' + (!isCompanyAdmin ? 'hidden' : '')}>
             <p className="text-xs text-slate-400 leading-relaxed flex-1">
               Mở cửa sổ Chrome Portable để kết nối tài khoản mới hoặc xử lý Checkpoint/OTP 2FA.
             </p>
@@ -234,7 +265,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
           )}
 
           {/* Kết nối Page Messenger */}
-          <div className="border-t border-slate-800 pt-4 space-y-3">
+          <div className={'border-t border-slate-800 pt-4 space-y-3 ' + (!isCompanyAdmin ? 'hidden' : '')}>
             <div>
               <h4 className="text-xs font-semibold text-slate-100 uppercase tracking-wider">Kết nối Page Messenger</h4>
               <p className="text-[11px] text-slate-500 mt-1">Dán Link Page, ID Page, hoặc Page Access Token để kết nối. Không cần API token vì Extension sẽ lo việc gửi/nhận.</p>
@@ -291,13 +322,17 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
             </div>
           ) : accounts.length === 0 ? (
             <div className="py-8 text-center text-slate-500 text-xs">
-              Chưa có tài khoản Facebook kết nối. Bấm nút &quot;+ Thêm tài khoản Facebook&quot; để kết nối tài khoản đầu tiên.
+              {isCompanyAdmin
+                ? 'Chưa có tài khoản Facebook kết nối. Bấm "+ Thêm tài khoản Facebook" để kết nối tài khoản đầu tiên.'
+                : 'Admin doanh nghiệp chưa cấp tài khoản Facebook cho bạn.'}
             </div>
           ) : (
             <div className="space-y-2.5">
               {accounts.map((acc) => {
                 const isCheckpoint = acc.status === 'CHECKPOINT';
                 const isConnected = acc.is_extension_connected === true;
+                const isChromeRunning = acc.is_chrome_running === true;
+                const isChromeVisible = acc.chrome_display_mode === 'VISIBLE';
                 return (
                   <div
                     key={acc.id}
@@ -332,9 +367,24 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
+                      <div className="mr-1 flex flex-col items-center gap-1">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={isChromeVisible}
+                          aria-label={`${isChromeVisible ? 'Chuyển Chrome sang chạy ngầm' : 'Hiện cửa sổ Chrome'} cho ${acc.name || acc.id}`}
+                          title={isChromeVisible ? 'Ẩn cửa sổ, tiếp tục chạy ngầm' : 'Hiện cửa sổ Chrome'}
+                          onClick={() => handleToggleChrome(acc)}
+                          disabled={togglingId === acc.id || deletingId === acc.id}
+                          className={`relative h-6 w-11 rounded-full border transition-colors disabled:opacity-50 ${isChromeVisible ? 'border-blue-500 bg-blue-500' : 'border-slate-600 bg-slate-700'}`}
+                        >
+                          <span className={`absolute top-0.5 h-[18px] w-[18px] rounded-full bg-white shadow transition-transform ${isChromeVisible ? 'left-[21px]' : 'left-0.5'}`} />
+                        </button>
+                        <span className={`text-[9px] font-semibold ${isChromeVisible ? 'text-blue-400' : 'text-slate-400'}`}>{togglingId === acc.id ? 'Đang chuyển' : (isChromeVisible ? 'ON · Đang mở' : (isChromeRunning ? 'OFF · Chạy ngầm' : 'OFF · Đã đóng'))}</span>
+                      </div>
                       <button
                         onClick={() => handleStartChrome(acc.id)}
-                        disabled={startingId === acc.id || deletingId === acc.id}
+                        disabled={startingId === acc.id || deletingId === acc.id || togglingId === acc.id}
                         className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors border disabled:opacity-50 ${
                           isCheckpoint
                             ? 'bg-red-600 hover:bg-red-500 text-white border-red-500'
@@ -342,9 +392,9 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
                         }`}
                       >
                         <ExternalLink size={13} />
-                        <span>{startingId === acc.id ? 'Đang mở...' : 'Mở Chrome'}</span>
+                        <span>{startingId === acc.id ? 'Đang mở...' : (isCompanyAdmin ? 'Mở Chrome' : 'Sử dụng')}</span>
                       </button>
-                      <button
+                      {isCompanyAdmin && <button
                         type="button"
                         onClick={() => handleDeleteAccount(acc)}
                         disabled={deletingId === acc.id || startingId === acc.id}
@@ -355,7 +405,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket 
                         {deletingId === acc.id
                           ? <RefreshCw size={13} className="animate-spin" />
                           : <Trash2 size={13} />}
-                      </button>
+                      </button>}
                     </div>
                   </div>
                 );
