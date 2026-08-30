@@ -82,15 +82,37 @@ function bindLicense(username, key) {
 }
 
 function licenseStatus({ username, key, machineId }) {
-  const row = db.prepare(`SELECT l.key_value,l.expires_at,l.machines,l.is_active
+  const row = db.prepare(`SELECT l.id AS license_id, l.key_value, l.expires_at, l.machines, l.is_active
     FROM client_users u LEFT JOIN licenses l ON l.id=u.license_id
     WHERE u.username=? COLLATE NOCASE`).get(String(username || '').trim());
   if (!row?.key_value) return { valid: false, reason: 'NO_PACKAGE', message: 'Tài khoản chưa có gói License.' };
-  if (row.key_value !== String(key || '').trim()) return { valid: false, reason: 'WRONG_ACCOUNT_LICENSE', message: 'License trên máy không thuộc tài khoản này.' };
-  const device = db.prepare('SELECT id FROM license_devices WHERE license_id=(SELECT id FROM licenses WHERE key_value=?) AND machine_id=?')
-    .get(row.key_value, String(machineId || ''));
-  if (!device) return { valid: false, reason: 'DEVICE_NOT_ACTIVATED', message: 'Máy chưa được kích hoạt cho gói của tài khoản.' };
-  if (!row.is_active || new Date(row.expires_at) <= new Date()) return { valid: false, reason: 'EXPIRED', message: 'Gói License đã hết hạn.' };
+  
+  const providedKey = String(key || '').trim();
+  if (providedKey && row.key_value !== providedKey) {
+    return { valid: false, reason: 'WRONG_ACCOUNT_LICENSE', message: 'License trên máy không thuộc tài khoản này.' };
+  }
+  
+  if (!row.is_active || new Date(row.expires_at) <= new Date()) {
+    return { valid: false, reason: 'EXPIRED', message: 'Gói License đã hết hạn.' };
+  }
+
+  const mId = String(machineId || '').trim();
+  if (mId) {
+    const device = db.prepare('SELECT id FROM license_devices WHERE license_id=? AND machine_id=?')
+      .get(row.license_id, mId);
+    if (!device) {
+      const registeredCount = db.prepare('SELECT COUNT(*) AS total FROM license_devices WHERE license_id=?').get(row.license_id)?.total || 0;
+      if (registeredCount < (row.machines || 1)) {
+        try {
+          db.prepare('INSERT INTO license_devices (license_id, machine_id, device_name) VALUES (?, ?, ?)')
+            .run(row.license_id, mId, 'Máy CRM (' + String(username || '') + ')');
+        } catch (e) {}
+      } else {
+        return { valid: false, reason: 'MAX_DEVICES_REACHED', message: `Gói đã đạt giới hạn tối đa ${row.machines} thiết bị sử dụng.` };
+      }
+    }
+  }
+
   return { valid: true, key: row.key_value, expiresAt: row.expires_at, machines: row.machines, daysRemaining: Math.ceil((new Date(row.expires_at)-Date.now())/86400000) };
 }
 

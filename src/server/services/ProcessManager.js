@@ -1,4 +1,5 @@
 const { spawn, exec, spawnSync } = require('child_process');
+const puppeteer = require('puppeteer-core');
 const path = require('path');
 const fs = require('fs');
 const { resolveChromePath } = require('../../../chrome-bundling/resolveChromePath');
@@ -6,7 +7,7 @@ const { resolveExtensionPath, resolveBinRoot } = require('../utils/appResourceRo
 const { APP_DATA_ROOT } = require('../utils/appDataRoot');
 
 // Ẩn cửa sổ Chrome khỏi màn hình và taskbar Windows bằng Win32 API
-function hideFromTaskbar(pid, delayMs = 2500) {
+function hideFromTaskbar(pid, profileDir = '', delayMs = 2500) {
   if (process.platform !== 'win32') return;
   const psScript = `
 Add-Type -TypeDefinition @'
@@ -27,8 +28,11 @@ if (${pid || 0}) {
   if ($children) { foreach ($c in $children) { $targetPids += $c.ProcessId } }
 }
 
-$crmProcs = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*profiles*' -and $_.CommandLine -notlike '*pending_*' }
-if ($crmProcs) { foreach ($c in $crmProcs) { $targetPids += $c.ProcessId } }
+$profile = '${String(profileDir || '').replace(/'/g, "''").replace(/\\/g, '/')}'
+if ($profile) {
+  $profileProcs = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue | Where-Object { ($_.CommandLine -replace '\\','/') -like "*$profile*" }
+  if ($profileProcs) { foreach ($c in $profileProcs) { $targetPids += $c.ProcessId } }
+}
 
 $allChrome = Get-Process -Name 'chrome' -ErrorAction SilentlyContinue
 foreach ($p in $allChrome) {
@@ -50,6 +54,39 @@ foreach ($p in $allChrome) {
 }
 
 // Tự động cấp quyền (Micro, Camera, Popups, Notifications) cho Facebook trong Chrome Profile Preferences
+function findBundledChromePidByProfile(profileDir, chromeExecutable) {
+  if (process.platform !== 'win32' || !profileDir || !chromeExecutable) return null;
+  const normalizedProfile = path.resolve(profileDir).replace(/\\/g, '/').replace(/'/g, "''");
+  const normalizedExecutable = path.resolve(chromeExecutable).replace(/\\/g, '/').replace(/'/g, "''");
+  const psScript = `
+$profile = '${normalizedProfile}'
+$expectedExecutable = '${normalizedExecutable}'
+$profileProcesses = Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { ($_.CommandLine -replace '\\','/') -like "*$profile*" }
+
+# A regular/old Chrome process holding this CRM profile would make a new
+# Chrome-for-Testing invocation hand the URL to that old process and exit.
+# Stop only that profile's mismatched browser tree before launching CFT.
+$mismatchedRoots = $profileProcesses | Where-Object {
+  $_.ExecutablePath -and (($_.ExecutablePath -replace '\\','/') -ne $expectedExecutable)
+}
+foreach ($proc in $mismatchedRoots) {
+  & taskkill.exe /PID $proc.ProcessId /T /F | Out-Null
+}
+
+$match = $profileProcesses | Where-Object {
+  $_.ExecutablePath -and (($_.ExecutablePath -replace '\\','/') -eq $expectedExecutable)
+} | Select-Object -First 1 -ExpandProperty ProcessId
+if ($match) { Write-Output $match }
+`;
+  const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+  const result = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+    encoding: 'utf8', windowsHide: true, timeout: 5000
+  });
+  const pid = Number.parseInt(String(result.stdout || '').trim(), 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
 function ensureProfilePermissions(profileDir) {
   try {
     const defaultDir = path.join(profileDir, 'Default');
@@ -116,17 +153,62 @@ function ensureProfilePermissions(profileDir) {
 class ProcessManager {
   constructor() {
     this.processes = new Map(); // Key: account_id -> { process, profileDir }
+    this.hideTimers = new Map();
     this.extensionPath = resolveExtensionPath();
     this.binChromePath = path.join(resolveBinRoot(), 'bin', 'chrome-win', 'chrome.exe');
   }
 
-  // Khởi chạy Chrome Portable ngầm cho tài khoản FB
-  startAccountProcess(accountId, customProfileDir = null) {
+  getChromeExecutable() {
+    if (process.platform === 'win32') {
+      if (!fs.existsSync(this.binChromePath)) {
+        throw new Error(`Không tìm thấy Chrome for Testing được đóng gói: ${this.binChromePath}`);
+      }
+      return this.binChromePath;
+    }
+    return resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+  }
+
+  getInteractiveSetupChromeExecutable() {
+    // Facebook's encrypted-history/PIN setup has been observed hanging in the
+    // bundled Chrome for Testing 152 while the installed Stable browser loads
+    // it normally. Both account setup and later background connections use
+    // Stable; Puppeteer installs the extension through the debugging pipe.
+    return resolveChromePath({
+      repoRoot: resolveBinRoot(),
+      legacyBinChromePath: this.binChromePath,
+      preferSystemChrome: true
+    });
+  }
+
+  cancelScheduledHides(accountId) {
+    const timers = this.hideTimers.get(String(accountId)) || [];
+    timers.forEach((timer) => clearTimeout(timer));
+    this.hideTimers.delete(String(accountId));
+  }
+
+  scheduleHide(accountId, pid, delayMs) {
+    const key = String(accountId);
+    const timer = setTimeout(() => {
+      const current = this.processes.get(accountId);
+      if (current?.pid === pid && current.displayMode === 'BACKGROUND') {
+        hideFromTaskbar(pid, current.profileDir, 0);
+      }
+      const remaining = (this.hideTimers.get(key) || []).filter((item) => item !== timer);
+      if (remaining.length) this.hideTimers.set(key, remaining);
+      else this.hideTimers.delete(key);
+    }, delayMs);
+    this.hideTimers.set(key, [...(this.hideTimers.get(key) || []), timer]);
+  }
+
+  // Khởi chạy Chrome Portable hiển thị cho tài khoản FB
+  async startAccountProcess(accountId, customProfileDir = null) {
     if (this.processes.has(accountId)) {
       const existing = this.processes.get(accountId);
-      const isAlive = existing.process && !existing.process.killed && existing.pid &&
+      const isAlive = existing.pid &&
         (() => { try { process.kill(existing.pid, 0); return true; } catch { return false; } })();
       if (isAlive) {
+        existing.displayMode = 'VISIBLE';
+        this.unhideWindow(accountId);
         console.log(`[ProcessManager] Tài khoản ${accountId} đã đang chạy (PID ${existing.pid}).`);
         return true;
       } else {
@@ -157,63 +239,67 @@ class ProcessManager {
     }
     ensureProfilePermissions(profileDir);
 
-    const chromeExecutable = resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+    const chromeExecutable = this.getInteractiveSetupChromeExecutable();
     const absExtPath = path.resolve(this.extensionPath).replace(/\\/g, '/');
     const absProfileDir = path.resolve(profileDir).replace(/\\/g, '/');
 
-    const args = [
-      `--user-data-dir=${absProfileDir}`,
-      `--load-extension=${absExtPath}`,
-      `--disable-extensions-except=${absExtPath}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-mode',
-      '--use-fake-ui-for-media-stream',
-      '--disable-popup-blocking',
-      '--disable-notifications',
-      '--autoplay-policy=no-user-gesture-required',
-      '--no-sandbox',
-      '--remote-debugging-port=0',
-      'https://www.facebook.com/messages'
-    ];
+    const runningProfilePid = findBundledChromePidByProfile(absProfileDir, chromeExecutable);
+    if (runningProfilePid) {
+      this.processes.set(accountId, {
+        process: null,
+        profileDir: absProfileDir,
+        pid: runningProfilePid,
+        status: 'RUNNING',
+        displayMode: 'VISIBLE'
+      });
+      this.unhideWindow(accountId);
+      console.log(`[ProcessManager] Dùng lại Chrome đang chạy cho account ${accountId} (PID ${runningProfilePid}).`);
+      return true;
+    }
 
-    console.log(`[ProcessManager] Khởi chạy Chrome Portable cho account ${accountId} (Profile: ${absProfileDir})...`);
+    console.log(`[ProcessManager] Khởi chạy Chrome Stable + tự cài extension cho account ${accountId} (Profile: ${absProfileDir})...`);
     try {
-      const child = spawn(chromeExecutable, args, {
-        detached: true,
-        stdio: 'ignore'
+      const browser = await puppeteer.launch({
+        executablePath: chromeExecutable,
+        headless: false,
+        userDataDir: absProfileDir,
+        defaultViewport: null,
+        enableExtensions: true,
+        args: [
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-background-mode',
+          '--disable-popup-blocking',
+          '--disable-notifications',
+          '--autoplay-policy=no-user-gesture-required'
+        ]
       });
+      await browser.installExtension(absExtPath);
+      const child = browser.process();
+      if (!child?.pid) throw new Error('Puppeteer không trả về PID Chrome');
 
-      child.unref();
-
-      child.on('error', (err) => {
-        console.error(`[ProcessManager] Lỗi tiến trình Chrome account ${accountId}:`, err.message);
-        if (this.processes.get(accountId)?.pid === child.pid) {
-          this.processes.delete(accountId);
-        }
-      });
-
-      child.on('exit', (code) => {
+      browser.on('disconnected', () => {
         const entry = this.processes.get(accountId);
         if (entry && entry.pid === child.pid) {
-          console.log(`[ProcessManager] Chrome [PID ${child.pid}] cho account ${accountId} đã tắt (code=${code}). Xóa khỏi danh sách.`);
+          console.log(`[ProcessManager] Chrome Stable [PID ${child.pid}] cho account ${accountId} đã tắt.`);
           this.processes.delete(accountId);
         }
       });
 
       this.processes.set(accountId, {
         process: child,
+        browser,
         profileDir: absProfileDir,
         pid: child.pid,
         status: 'RUNNING',
-        displayMode: 'BACKGROUND'
+        displayMode: 'VISIBLE'
       });
 
-      // Tự động ẩn cửa sổ Chrome ngầm khỏi màn hình PC & Taskbar sau khi bật
-      hideFromTaskbar(child.pid, 2000);
-      hideFromTaskbar(child.pid, 5000);
+      const pages = await browser.pages();
+      const page = pages[0] || await browser.newPage();
+      await page.goto('https://www.facebook.com/messages', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-      console.log(`[ProcessManager] Chrome Portable [PID ${child.pid}] khởi chạy thành công và đã tự động chạy ngầm.`);
+      console.log(`[ProcessManager] Chrome Stable [PID ${child.pid}] đã tự cài extension cho account ${accountId}.`);
       return true;
     } catch (err) {
       console.error(`[ProcessManager] Lỗi khởi chạy Chrome cho ${accountId}:`, err.message);
@@ -222,7 +308,7 @@ class ProcessManager {
   }
 
   // Khởi chạy Chrome Portable cho phiên thêm tài khoản mới (pending session)
-  startNewAccountProcess(pendingKey) {
+  async startNewAccountProcess(pendingKey) {
     if (this.processes.has(pendingKey)) {
       console.log(`[ProcessManager] Phiên pending ${pendingKey} đã đang chạy.`);
       return true;
@@ -234,59 +320,55 @@ class ProcessManager {
     }
     ensureProfilePermissions(profileDir);
 
-    const chromeExecutable = resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+    const chromeExecutable = this.getInteractiveSetupChromeExecutable();
     const absExtPath = path.resolve(this.extensionPath).replace(/\\/g, '/');
     const absProfileDir = path.resolve(profileDir).replace(/\\/g, '/');
 
-    const args = [
-      `--user-data-dir=${absProfileDir}`,
-      `--load-extension=${absExtPath}`,
-      `--disable-extensions-except=${absExtPath}`,
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-mode',
-      '--use-fake-ui-for-media-stream',
-      '--disable-popup-blocking',
-      '--disable-notifications',
-      '--autoplay-policy=no-user-gesture-required',
-      '--no-sandbox',
-      '--remote-debugging-port=0',
-      '--enable-background-networking',
-      `https://www.facebook.com/messages/?crm_pending_key=${encodeURIComponent(pendingKey)}`
-    ];
-
-    console.log(`[ProcessManager] Khởi chạy Chrome mới cho phiên thêm account [${pendingKey}]...`);
+    const setupUrl = `https://www.facebook.com/messages/?crm_pending_key=${encodeURIComponent(pendingKey)}`;
+    console.log(`[ProcessManager] Khởi chạy Chrome Stable + tự cài extension cho phiên [${pendingKey}]: ${chromeExecutable}`);
     try {
-      const child = spawn(chromeExecutable, args, {
-        detached: true,
-        stdio: 'ignore'
+      const browser = await puppeteer.launch({
+        executablePath: chromeExecutable,
+        headless: false,
+        userDataDir: absProfileDir,
+        defaultViewport: null,
+        enableExtensions: true,
+        args: [
+          '--no-first-run',
+          '--no-default-browser-check',
+          '--disable-background-mode',
+          '--disable-popup-blocking',
+          '--disable-notifications',
+          '--autoplay-policy=no-user-gesture-required'
+        ]
       });
+      await browser.installExtension(absExtPath);
+      const child = browser.process();
+      if (!child?.pid) throw new Error('Puppeteer không trả về PID Chrome');
 
-      child.unref();
-
-      child.on('error', (err) => {
-        console.error(`[ProcessManager] Lỗi tiến trình Chrome phiên pending ${pendingKey}:`, err.message);
-        if (this.processes.get(pendingKey)?.pid === child.pid) {
-          this.processes.delete(pendingKey);
-        }
-      });
-
-      child.on('exit', (code) => {
+      browser.on('disconnected', () => {
         const entry = this.processes.get(pendingKey);
         if (entry && entry.pid === child.pid) {
-          console.log(`[ProcessManager] Chrome pending [PID ${child.pid}] cho ${pendingKey} đã đóng (code=${code}).`);
+          console.log(`[ProcessManager] Chrome setup [PID ${child.pid}] cho ${pendingKey} đã đóng.`);
           this.processes.delete(pendingKey);
         }
       });
 
       this.processes.set(pendingKey, {
         process: child,
+        browser,
         profileDir,
         pid: child.pid,
         status: 'RUNNING'
       });
 
-      console.log(`[ProcessManager] Chrome pending session [PID ${child.pid}] khởi chạy thành công (cửa sổ mở để người dùng đăng nhập).`);
+      // launch() installs the extension first; only then open Facebook so the
+      // pending-key capture runs on the first Facebook document.
+      const pages = await browser.pages();
+      const page = pages[0] || await browser.newPage();
+      await page.goto(setupUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+      console.log(`[ProcessManager] Chrome Stable [PID ${child.pid}] đã tự cài extension và mở Facebook.`);
       return true;
     } catch (err) {
       console.error(`[ProcessManager] Lỗi khởi chạy Chrome cho phiên ${pendingKey}:`, err.message);
@@ -298,9 +380,10 @@ class ProcessManager {
   hideAccountProcess(accountId) {
     const procInfo = this.processes.get(accountId);
     if (procInfo && procInfo.pid) {
-      hideFromTaskbar(procInfo.pid, 500);
-      hideFromTaskbar(procInfo.pid, 2500);
+      this.cancelScheduledHides(accountId);
       procInfo.displayMode = 'BACKGROUND';
+      this.scheduleHide(accountId, procInfo.pid, 0);
+      this.scheduleHide(accountId, procInfo.pid, 1200);
       console.log(`[ProcessManager] Tự động ẩn Chrome của account ${accountId} khỏi Taskbar.`);
       return true;
     }
@@ -311,8 +394,11 @@ class ProcessManager {
   unhideWindow(accountId) {
     console.log(`[ProcessManager] Bật sáng cửa sổ Chrome cho account ${accountId}!`);
     const procInfo = this.processes.get(accountId);
+    this.cancelScheduledHides(accountId);
     const pid = procInfo?.pid;
     const escapedProfileDir = String(procInfo?.profileDir || '').replace(/'/g, "''").replace(/\\/g, '/');
+    const chromeExecutable = this.getInteractiveSetupChromeExecutable();
+    const escapedChromeExecutable = String(chromeExecutable).replace(/'/g, "''");
     if (procInfo) procInfo.displayMode = 'VISIBLE';
 
     if (process.platform === 'win32') {
@@ -332,6 +418,9 @@ foreach ($app in $apps) {
   [Win32Helper]::SetWindowLong($handle, -20, $style) | Out-Null
   [Win32Helper]::ShowWindowAsync($handle, 9) | Out-Null
   [Win32Helper]::SetForegroundWindow($handle) | Out-Null
+}
+if (-not $apps -and $profile) {
+  Start-Process -FilePath '${escapedChromeExecutable}' -ArgumentList @("--user-data-dir=$profile", '--new-window', 'https://www.facebook.com/messages')
 }`;
 
       const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
@@ -346,6 +435,7 @@ foreach ($app in $apps) {
 
   // Dừng tiến trình Chrome Portable
   stopAccountProcess(accountId) {
+    this.cancelScheduledHides(accountId);
     const procInfo = this.processes.get(accountId);
     if (!procInfo?.pid) return false;
 
@@ -401,7 +491,7 @@ foreach ($app in $apps) {
       .map((profileDir) => path.resolve(profileDir));
     const escapePs = (value) => String(value).replace(/'/g, "''");
     const allowedLiteral = allowed.map((profileDir) => `'${escapePs(profileDir)}'`).join(',');
-    const chromeExecutable = resolveChromePath({ repoRoot: resolveBinRoot(), legacyBinChromePath: this.binChromePath });
+    const chromeExecutable = this.getInteractiveSetupChromeExecutable();
     const psScript = `
 $profilesRoot = [IO.Path]::GetFullPath('${escapePs(profilesRoot)}').TrimEnd('\\') + '\\'
 $managedChrome = [IO.Path]::GetFullPath('${escapePs(chromeExecutable)}')

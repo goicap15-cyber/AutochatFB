@@ -79,6 +79,7 @@ export default function App() {
   const [hasCheckpoint, setHasCheckpoint] = useState(false);
   const [activeModal, setActiveModal] = useState(null);
   const [richCapabilities, setRichCapabilities] = useState(null);
+  const [bulkHistoryProgress, setBulkHistoryProgress] = useState(null);
 
   const [campaignSelectionMode, setCampaignSelectionMode] = useState(false);
   const [selectedCampaignThreadIds, setSelectedCampaignThreadIds] = useState([]);
@@ -244,30 +245,13 @@ export default function App() {
     }
   }, [isMobile, activeThreadId, threads]);
 
-  const requestedSyncRef = useRef(new Map());
   const threadsRef = useRef(threads);
   useEffect(() => { threadsRef.current = threads; }, [threads]);
 
   const requestThreadNavigation = useCallback((thread) => {
     if (!thread) return;
-    const threadIdStr = String(thread.id);
-    const externalThreadId = String(thread.external_thread_id || thread.id);
     setActiveThreadId(thread.id);
-
-    // A click is a navigation intent, not a background-history refresh. Always
-    // dispatch it, including repeated clicks on the same row. Mark the throttle
-    // so the activeThread effect below does not immediately duplicate this request.
-    requestedSyncRef.current.set(threadIdStr, Date.now());
-    if (socket) {
-      socket.emit('REQUEST_SYNC_THREAD_MESSAGES', {
-        account_id: thread.account_id || null,
-        thread_id: externalThreadId,
-        thread_url: thread.thread_url || null,
-        page_id: thread.page_id || thread.source_external_id || null,
-        contact_name: thread.contact_name || thread.name || null
-      });
-    }
-  }, [socket]);
+  }, []);
 
   useEffect(() => {
     if (!activeThreadId) return;
@@ -281,22 +265,7 @@ export default function App() {
       })
       .catch(() => {});
 
-    // Background/history fallback only. Direct row clicks are always dispatched
-    // by requestThreadNavigation above and are never swallowed by this throttle.
-    if (socket) {
-      const lastSync = requestedSyncRef.current.get(threadIdStr) || 0;
-      if (Date.now() - lastSync > 60000) {
-        requestedSyncRef.current.set(threadIdStr, Date.now());
-        const activeThreadObj = threadsRef.current.find(t => String(t.id) === threadIdStr);
-        socket.emit('REQUEST_SYNC_THREAD_MESSAGES', {
-          account_id: activeThreadObj?.account_id || null,
-          thread_id: activeThreadObj?.external_thread_id || threadIdStr,
-          thread_url: activeThreadObj?.thread_url || null,
-          page_id: activeThreadObj?.page_id || activeThreadObj?.source_external_id || null
-        });
-      }
-    }
-  }, [activeThreadId, socket]);
+  }, [activeThreadId]);
 
   useEffect(() => {
     if (!activeThreadId) return;
@@ -418,7 +387,7 @@ export default function App() {
       // can race a later socket event and make a freshly-arrived message disappear.
     });
 
-    socket.on('MESSAGE_SENT', ({ thread_id, client_message_id, fb_message_id }) => {
+    socket.on('MESSAGE_SENT', ({ thread_id, client_message_id, fb_message_id, provisional = false }) => {
       const tidStr = String(thread_id);
       setMessages(prev => {
         const currentMsgs = prev[tidStr] || [];
@@ -427,6 +396,9 @@ export default function App() {
           [tidStr]: currentMsgs.map(m => m.client_message_id === client_message_id ? { ...m, status: 'sent', delivery_status: 'sent', fb_message_id: fb_message_id || m.fb_message_id, error: null } : m)
         };
       });
+      // Keep the optimistic sent state while Facebook's late DOM confirmation
+      // attaches the official id. An immediate refetch would restore pending.
+      if (provisional) return;
       // Auto-refetch after message is marked sent to load full database row with media URL
       setTimeout(() => {
         fetch(`/api/threads/${tidStr}/messages`)
@@ -567,6 +539,22 @@ export default function App() {
       });
     });
 
+    socket.on('BULK_HISTORY_SYNC_PROGRESS', (progress) => {
+      setBulkHistoryProgress(progress);
+      if (progress?.status === 'completed') {
+        loadThreadsRef.current();
+        if (activeThreadId) {
+          const threadId = String(activeThreadId);
+          fetch(`/api/threads/${threadId}/messages`)
+            .then((response) => response.json())
+            .then((data) => {
+              if (Array.isArray(data)) setMessages((previous) => ({ ...previous, [threadId]: data }));
+            })
+            .catch(() => {});
+        }
+      }
+    });
+
     socket.on('EXTENSION_CONNECTION_CHANGED', ({ account_id, is_connected }) => {
       setAccounts(prev => prev.map(a => String(a.id) === String(account_id) ? { ...a, is_extension_connected: is_connected } : a));
     });
@@ -698,6 +686,7 @@ export default function App() {
       socket.off('MESSAGE_SEND_STATUS');
       socket.off('SEND_ERROR');
       socket.off('THREAD_MESSAGES_UPDATED');
+      socket.off('BULK_HISTORY_SYNC_PROGRESS');
       socket.off('EXTENSION_CONNECTION_CHANGED');
       socket.off('MESSAGE_UNSENT');
       socket.off('ACCOUNT_STATUS_CHANGED');
@@ -973,7 +962,7 @@ export default function App() {
     : isCurrentExtensionDisconnected;
   const currentSendDisabledReason = selectedThread?.source_type === 'page_messenger'
     ? 'Đang chờ Page Messenger sẵn sàng. Vui lòng đợi trong giây lát.'
-    : 'Đang chờ Messenger trên Chrome tải xong. Vui lòng đợi trong giây lát.';
+    : 'Tài khoản Facebook chưa được kết nối. Vui lòng vào Quản lý và bấm Kết nối Facebook.';
 
   const gridClass = `${leadPanelCollapsed ? 'app-grid-collapsed' : 'app-grid'}${activeView === 'employees' ? ' employee-view' : ''}`;
 
@@ -990,6 +979,21 @@ export default function App() {
       call_request_id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
     });
   }, [activeThreadId, selectedThread, socket, isConnected]);
+
+  const handleBulkHistorySync = useCallback(() => {
+    if (!socket || !isConnected || bulkHistoryProgress?.status === 'running') return;
+    const personalThreads = threads.filter((thread) => thread.source_type !== 'page_messenger');
+    const jobId = globalThis.crypto?.randomUUID?.() || `bulk_${Date.now()}`;
+    setBulkHistoryProgress({ job_id: jobId, status: 'running', total: personalThreads.length, completed: 0, failed: 0 });
+    socket.emit('REQUEST_BULK_HISTORY_SYNC', {
+      job_id: jobId,
+      threads: personalThreads.map((thread) => ({
+        thread_id: String(thread.id),
+        thread_url: thread.thread_url || null,
+        contact_name: thread.contact_name || thread.name || null
+      }))
+    });
+  }, [socket, isConnected, threads, bulkHistoryProgress?.status]);
 
   if (authLoading) {
     return <div className="min-h-screen bg-slate-950 text-slate-400 flex items-center justify-center">Đang kiểm tra phiên đăng nhập...</div>;
@@ -1036,6 +1040,8 @@ export default function App() {
         onStartCampaignSelection={startCampaignSelection}
         onCancelCampaignSelection={cancelCampaignSelection}
         onCreateCampaign={() => setActiveModal('campaigns')}
+        onBulkHistorySync={handleBulkHistorySync}
+        bulkHistoryProgress={bulkHistoryProgress}
       />
 
       {/* Column 3: Chat Area */}
@@ -1057,7 +1063,7 @@ export default function App() {
             <MessageList
               messages={activeMessages}
               activeThread={selectedThread}
-              onSyncThread={() => requestThreadNavigation(selectedThread)}
+              onSyncThread={undefined}
               onRetryMessage={handleRetryMessage}
             />
             <MessageComposer
@@ -1148,6 +1154,7 @@ export default function App() {
       {licenseStatus && !licenseStatus.isLicensed && activeModal !== 'payment' && (
         <LicenseLockScreen
           status={licenseStatus}
+          sessionUser={sessionUser}
           onOpenPayment={() => setActiveModal('payment')}
           onBackToLogin={handleLogout}
         />

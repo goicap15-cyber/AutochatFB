@@ -6,7 +6,6 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [startingId, setStartingId] = useState(null);
-  const [togglingId, setTogglingId] = useState(null);
   const [deletingId, setDeletingId] = useState(null);
   const [accountActionError, setAccountActionError] = useState('');
   const [addingSession, setAddingSession] = useState(false);
@@ -88,18 +87,6 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
     };
   }, [socket, addingSession, pendingKey, initialAccountIds, onSourcesChanged]);
 
-  const handleStartChrome = async (accountId) => {
-    setStartingId(accountId);
-    try {
-      await fetch(`/api/accounts/${accountId}/open`, { method: 'POST' });
-      await loadAccounts();
-    } catch (e) {
-      console.error(e);
-    } finally {
-      setStartingId(null);
-    }
-  };
-
   const handleAddNewAccount = async () => {
     setAccountActionError('');
     const currentAccounts = await loadAccounts();
@@ -124,23 +111,17 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
     }
   };
 
-  const handleToggleChrome = async (account) => {
-    setTogglingId(account.id);
-    setAccountActionError('');
+  const handleStartChrome = async (accountId) => {
+    setStartingId(accountId);
     try {
-      const isVisible = account.chrome_display_mode === 'VISIBLE';
-      const action = isVisible ? 'background' : 'open';
-      const res = await fetch(`/api/accounts/${account.id}/${action}`, { method: 'POST' });
+      const res = await fetch(`/api/accounts/${accountId}/start`, { method: 'POST' });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.success) throw new Error(data.error || `Không thể chuyển Chrome sang chế độ ${action === 'open' ? 'hiển thị' : 'chạy ngầm'}`);
-      setAccounts((current) => current.map((item) => String(item.id) === String(account.id)
-        ? { ...item, is_chrome_running: true, chrome_display_mode: action === 'open' ? 'VISIBLE' : 'BACKGROUND' }
-        : item));
-      window.setTimeout(loadAccounts, 700);
+      if (!res.ok || !data.success) throw new Error(data.error || 'Không thể mở Chrome');
+      await loadAccounts();
     } catch (error) {
-      setAccountActionError(error.message);
+      setAccountActionError(error.message || 'Không thể mở Chrome');
     } finally {
-      setTogglingId(null);
+      setStartingId(null);
     }
   };
 
@@ -250,7 +231,7 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
                 <div>
                   <p className="font-semibold text-sky-300">Đang chờ đăng nhập Facebook...</p>
                   <p className="text-[11px] text-sky-300/80 mt-0.5">
-                    Vui lòng hoàn tất đăng nhập tài khoản Facebook trên cửa sổ Chrome vừa mở. CRM sẽ tự động nhận biết và kích hoạt tài khoản.
+                    Tiện ích đã được cài tự động. Hãy đăng nhập và nhập PIN; CRM sẽ tự nhận tài khoản khi hoàn tất.
                   </p>
                 </div>
               </div>
@@ -331,8 +312,6 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
               {accounts.map((acc) => {
                 const isCheckpoint = acc.status === 'CHECKPOINT';
                 const isConnected = acc.is_extension_connected === true;
-                const isChromeRunning = acc.is_chrome_running === true;
-                const isChromeVisible = acc.chrome_display_mode === 'VISIBLE';
                 return (
                   <div
                     key={acc.id}
@@ -367,32 +346,18 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
-                      <div className="mr-1 flex flex-col items-center gap-1">
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={isChromeVisible}
-                          aria-label={`${isChromeVisible ? 'Chuyển Chrome sang chạy ngầm' : 'Hiện cửa sổ Chrome'} cho ${acc.name || acc.id}`}
-                          title={isChromeVisible ? 'Ẩn cửa sổ, tiếp tục chạy ngầm' : 'Hiện cửa sổ Chrome'}
-                          onClick={() => handleToggleChrome(acc)}
-                          disabled={togglingId === acc.id || deletingId === acc.id}
-                          className={`relative h-6 w-11 rounded-full border transition-colors disabled:opacity-50 ${isChromeVisible ? 'border-blue-500 bg-blue-500' : 'border-slate-600 bg-slate-700'}`}
-                        >
-                          <span className={`absolute top-0.5 h-[18px] w-[18px] rounded-full bg-white shadow transition-transform ${isChromeVisible ? 'left-[21px]' : 'left-0.5'}`} />
-                        </button>
-                        <span className={`text-[9px] font-semibold ${isChromeVisible ? 'text-blue-400' : 'text-slate-400'}`}>{togglingId === acc.id ? 'Đang chuyển' : (isChromeVisible ? 'ON · Đang mở' : (isChromeRunning ? 'OFF · Chạy ngầm' : 'OFF · Đã đóng'))}</span>
-                      </div>
                       <button
+                        type="button"
                         onClick={() => handleStartChrome(acc.id)}
-                        disabled={startingId === acc.id || deletingId === acc.id || togglingId === acc.id}
+                        disabled={startingId === acc.id || deletingId === acc.id}
                         className={`px-3 py-1.5 rounded-md text-xs font-medium flex items-center gap-1.5 transition-colors border disabled:opacity-50 ${
                           isCheckpoint
                             ? 'bg-red-600 hover:bg-red-500 text-white border-red-500'
                             : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700/60'
                         }`}
                       >
-                        <ExternalLink size={13} />
-                        <span>{startingId === acc.id ? 'Đang mở...' : (isCompanyAdmin ? 'Mở Chrome' : 'Sử dụng')}</span>
+                        {startingId === acc.id ? <RefreshCw size={13} className="animate-spin" /> : <ExternalLink size={13} />}
+                        <span>{startingId === acc.id ? 'Đang kết nối...' : (isCompanyAdmin ? 'Kết nối Facebook' : 'Kết nối')}</span>
                       </button>
                       {isCompanyAdmin && <button
                         type="button"

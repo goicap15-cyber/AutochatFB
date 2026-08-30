@@ -1,11 +1,12 @@
 import React, { useState } from 'react';
 import { ShieldAlert, Key, CreditCard, RefreshCw, CheckCircle2 } from 'lucide-react';
 
-export default function LicenseLockScreen({ status, onOpenPayment, onBackToLogin }) {
+export default function LicenseLockScreen({ status, onOpenPayment, onBackToLogin, sessionUser }) {
   const [inputKey, setInputKey] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+  const isEmployee = sessionUser?.company_role === 'EMPLOYEE';
 
   const handleActivate = async (e) => {
     e.preventDefault();
@@ -56,10 +57,12 @@ export default function LicenseLockScreen({ status, onOpenPayment, onBackToLogin
         {/* Title & Description */}
         <div className="space-y-2">
           <h2 className="text-2xl font-bold tracking-tight">
-            Ứng Dụng Chưa Được Kích Hoạt
+            {isEmployee ? 'Chờ Kích Hoạt Bản Quyền Doanh Nghiệp' : 'Ứng Dụng Chưa Được Kích Hoạt'}
           </h2>
           <p className="text-sm text-[var(--color-text-muted,#7f95aa)] max-w-sm mx-auto leading-relaxed">
-            {status?.message || 'Vui lòng kích hoạt License Key để tiếp tục sử dụng tất cả tính năng nhắn tin & chăm sóc khách hàng.'}
+            {isEmployee
+              ? 'Tài khoản nhân viên của bạn phụ thuộc vào License Key từ Admin doanh nghiệp. Vui lòng liên hệ Admin để kiểm tra gói bản quyền.'
+              : (status?.message || 'Vui lòng kích hoạt License Key để tiếp tục sử dụng tất cả tính năng nhắn tin & chăm sóc khách hàng.')}
           </p>
         </div>
 
@@ -76,51 +79,55 @@ export default function LicenseLockScreen({ status, onOpenPayment, onBackToLogin
           </div>
         )}
 
-        {/* Input Form */}
-        <form onSubmit={handleActivate} className="space-y-3 text-left">
-          <label className="block text-xs font-semibold text-[var(--color-text-muted,#7f95aa)] uppercase tracking-wider">
-            Nhập Mã License Key Của Bạn:
-          </label>
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-              <Key className="w-4 h-4 absolute left-3.5 top-3.5 text-[var(--color-text-muted,#7f95aa)]" />
-              <input
-                type="text"
-                placeholder="KEY-XXXX-XXXX-XXXX-XXXX"
-                value={inputKey}
-                onChange={(e) => setInputKey(e.target.value)}
-                className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-[var(--color-border,#284057)] bg-[var(--color-bg-surface,#132235)] text-sm font-mono tracking-wider focus:outline-none focus:border-[var(--color-accent,#0ea5e9)]"
-              />
+        {!isEmployee && (
+          <>
+            {/* Input Form */}
+            <form onSubmit={handleActivate} className="space-y-3 text-left">
+              <label className="block text-xs font-semibold text-[var(--color-text-muted,#7f95aa)] uppercase tracking-wider">
+                Nhập Mã License Key Của Bạn:
+              </label>
+              <div className="flex gap-2">
+                <div className="relative flex-1">
+                  <Key className="w-4 h-4 absolute left-3.5 top-3.5 text-[var(--color-text-muted,#7f95aa)]" />
+                  <input
+                    type="text"
+                    placeholder="KEY-XXXX-XXXX-XXXX-XXXX"
+                    value={inputKey}
+                    onChange={(e) => setInputKey(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2.5 rounded-xl border border-[var(--color-border,#284057)] bg-[var(--color-bg-surface,#132235)] text-sm font-mono tracking-wider focus:outline-none focus:border-[var(--color-accent,#0ea5e9)]"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={loading || !inputKey.trim()}
+                  className="px-5 py-2.5 rounded-xl bg-[var(--color-accent,#0ea5e9)] hover:bg-sky-400 text-white font-semibold text-sm shadow-md transition flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : 'Kích Hoạt'}
+                </button>
+              </div>
+            </form>
+
+            <div className="relative flex py-1 items-center">
+              <div className="flex-grow border-t border-[var(--color-border,#284057)]"></div>
+              <span className="flex-shrink mx-3 text-xs text-[var(--color-text-muted,#7f95aa)]">Hoặc</span>
+              <div className="flex-grow border-t border-[var(--color-border,#284057)]"></div>
             </div>
+
+            {/* Mua Key Qua VietQR Button */}
             <button
-              type="submit"
-              disabled={loading || !inputKey.trim()}
-              className="px-5 py-2.5 rounded-xl bg-[var(--color-accent,#0ea5e9)] hover:bg-sky-400 text-white font-semibold text-sm shadow-md transition flex items-center justify-center gap-2 disabled:opacity-50"
+              onClick={onOpenPayment}
+              className="w-full py-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg"
             >
-              {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : 'Kích Hoạt'}
+              <CreditCard className="w-5 h-5" />
+              <span>Mua Bản Quyền Mới Qua Mã QR Ngân Hàng (Tự Động 1s)</span>
             </button>
-          </div>
-        </form>
-
-        <div className="relative flex py-1 items-center">
-          <div className="flex-grow border-t border-[var(--color-border,#284057)]"></div>
-          <span className="flex-shrink mx-3 text-xs text-[var(--color-text-muted,#7f95aa)]">Hoặc</span>
-          <div className="flex-grow border-t border-[var(--color-border,#284057)]"></div>
-        </div>
-
-        {/* Mua Key Qua VietQR Button */}
-        <button
-          onClick={onOpenPayment}
-          className="w-full py-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 font-semibold text-sm transition flex items-center justify-center gap-2 shadow-lg"
-        >
-          <CreditCard className="w-5 h-5" />
-          <span>Mua Bản Quyền Mới Qua Mã QR Ngân Hàng (Tự Động 1s)</span>
-        </button>
+          </>
+        )}
 
         <button
           type="button"
           onClick={onBackToLogin}
-          className="text-sm font-medium text-[var(--color-text-muted,#7f95aa)] hover:text-[var(--color-accent,#0ea5e9)] underline underline-offset-4 transition"
+          className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium transition"
         >
           Quay lại trang đăng nhập
         </button>

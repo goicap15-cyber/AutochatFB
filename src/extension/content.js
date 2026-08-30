@@ -34,34 +34,61 @@
     } catch (e) { }
   }
 
-  function triggerCallAnswer(action) {
-    console.log('[CALL_CONTROL] 🎯 Dynamically clicking Facebook call button:', action);
+  function findCallButton(action) {
     var targetLabel = action === 'accept' ? 'Chấp nhận' : 'Từ chối';
-    
-    // 1. Direct query by aria-label
+    // 1. Direct aria-label
     var btn = document.querySelector('[aria-label="' + targetLabel + '"][role="button"]') ||
               document.querySelector('[aria-label="' + targetLabel + '"]');
-    
-    // 2. Fallback: text search in role="button"
+    // 2. Fallback: English labels (Facebook sometimes uses English)
+    if (!btn) {
+      var engLabel = action === 'accept' ? 'Accept' : 'Decline';
+      btn = document.querySelector('[aria-label="' + engLabel + '"][role="button"]') ||
+            document.querySelector('[aria-label*="' + engLabel + '"]');
+    }
+    // 3. Fallback: text content search
     if (!btn) {
       var allButtons = document.querySelectorAll('[role="button"]');
       for (var i = 0; i < allButtons.length; i++) {
         var txt = (allButtons[i].textContent || '').trim();
-        if (txt === targetLabel || (action === 'accept' && txt.includes('Chấp nhận')) || (action === 'decline' && txt.includes('Từ chối'))) {
+        if (txt === targetLabel ||
+            (action === 'accept' && (txt.includes('Chấp nhận') || txt.includes('Accept'))) ||
+            (action === 'decline' && (txt.includes('Từ chối') || txt.includes('Decline')))) {
           btn = allButtons[i];
           break;
         }
       }
     }
+    return btn || null;
+  }
 
+  function triggerCallAnswer(action, callback) {
+    console.log('[CALL_CONTROL] 🎯 Trying to click Facebook call button:', action);
+    var btn = findCallButton(action);
     if (btn) {
       btn.click();
-      console.log('[CALL_CONTROL] ✅ Successfully clicked ' + targetLabel + ' button on Facebook!');
-      return true;
-    } else {
-      console.warn('[CALL_CONTROL] ⚠️ Button ' + targetLabel + ' not found in Facebook DOM');
-      return false;
+      console.log('[CALL_CONTROL] ✅ Clicked on first attempt:', action);
+      if (callback) callback(true);
+      return;
     }
+
+    // Button not in DOM yet — retry every 300ms for up to 3s (10 attempts)
+    console.warn('[CALL_CONTROL] ⚠️ Button not found, retrying...');
+    var attempts = 0;
+    var maxAttempts = 10;
+    var retryInterval = setInterval(function() {
+      attempts++;
+      var retryBtn = findCallButton(action);
+      if (retryBtn) {
+        clearInterval(retryInterval);
+        retryBtn.click();
+        console.log('[CALL_CONTROL] ✅ Clicked on retry attempt ' + attempts + ':', action);
+        if (callback) callback(true);
+      } else if (attempts >= maxAttempts) {
+        clearInterval(retryInterval);
+        console.warn('[CALL_CONTROL] ❌ Could not find button after ' + maxAttempts + ' attempts:', action);
+        if (callback) callback(false);
+      }
+    }, 300);
   }
 
   try {
@@ -75,8 +102,13 @@
           } catch (e) {}
         }
         if (msg.type === 'ANSWER_INCOMING_CALL') {
-          var success = triggerCallAnswer(msg.action);
-          if (sendResponse) sendResponse({ success: success });
+          // Use async callback so sendResponse stays open
+          triggerCallAnswer(msg.action, function(success) {
+            if (sendResponse) {
+              try { sendResponse({ success: success }); } catch(e) {}
+            }
+          });
+          return true; // keep message channel open for async response
         }
       });
     }
@@ -904,6 +936,7 @@
   //   <span dir="auto">Cuộc gọi video</span>
   var _callSentIds = new Set();
   var _callSeenCounts = new Map();
+  var _callPendingDirections = new Map();
   var _lastScannedThreadId = null;
   var _callBaselineReady = false;
 
@@ -926,15 +959,25 @@
         _lastScannedThreadId = threadId;
         _callSentIds.clear();
         _callSeenCounts.clear();
+        _callPendingDirections.clear();
         _callBaselineReady = false;
       }
 
-      var mainContainer = document.querySelector('div[role="main"]') || document.querySelector('div[role="log"]');
+      // Scan only the active conversation's message log. role="main" also
+      // contains the Messenger sidebar, whose conversation previews include
+      // call text and unrelated avatars (confirmed against the live DOM).
+      var mainContainer = document.querySelector(
+        '[role="log"][aria-label*="Tin nh\u1eafn trong cu\u1ed9c tr\u00f2 chuy\u1ec7n"], ' +
+        '[role="log"][aria-label*="Messages in the conversation"]'
+      ) || document.querySelector('div[role="main"] [role="log"]');
       if (!mainContainer) return;
 
       var spans = mainContainer.querySelectorAll('span[dir="auto"]');
+      var contactHeading = document.querySelector('header h1, header h2, [role="main"] h1, [role="main"] h2, span[aria-level="1"]');
+      var expectedContactName = (contactHeading ? contactHeading.textContent : '').replace(/\s+/g, ' ').trim().toLowerCase();
       var scanCounts = new Map();
       var scanCalls = [];
+      var seenCallRows = new Set();
       for (var i = 0; i < spans.length; i++) {
         var spanEl = spans[i];
         var txt = (spanEl.textContent || '').trim();
@@ -944,9 +987,17 @@
 
         var parentEl = spanEl.closest('[role="button"]') || spanEl.closest('div.x78zum5') || spanEl.parentElement;
         if (!parentEl || !mainContainer.contains(parentEl)) continue;
+        // A real Messenger bubble is an article. Sidebar previews are not.
+        var canonicalCallRow = spanEl.closest('[role="article"]');
+        if (!canonicalCallRow || !mainContainer.contains(canonicalCallRow)) continue;
+        if (seenCallRows.has(canonicalCallRow)) continue;
+        seenCallRows.add(canonicalCallRow);
         var parentText = parentEl ? (parentEl.textContent || '').trim() : '';
         var timeMatch = parentText.match(/(\d{1,2}:\d{2}|\d+\s*(?:giây|phút|giờ|ngày))/i);
         var timeStr = timeMatch ? timeMatch[1].replace(/[:\s]/g, '') : 'notime';
+        // Missed is an outcome, not a sender direction. Avatar/position below
+        // must decide which side owns the call row.
+        lower = lower.replace(/\u0111\u00e3\s+nh\u1ee1|\u0111\u00e3\s+b\u1ecf\s+l\u1ee1|b\u1ecf\s+l\u1ee1/g, '');
         var isOutgoing = false;
         if (lower.includes('của bạn') || lower.includes('bởi bạn') || lower.includes('do bạn')) {
           isOutgoing = true;
@@ -963,6 +1014,12 @@
             var imgs = rowContainer.querySelectorAll('img[alt], img[aria-label]');
             var hasContactAvatar = false;
             for (var ii = 0; ii < imgs.length; ii++) {
+              var candidateAlt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              if (expectedContactName && candidateAlt.includes(expectedContactName)) {
+                hasContactAvatar = true;
+                break;
+              }
+              if (expectedContactName) continue;
               var altTxt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').trim();
               if (altTxt && !/^(bạn|you)$/i.test(altTxt)) {
                 hasContactAvatar = true;
@@ -985,17 +1042,65 @@
         }
 
         var durationMatch = parentText.match(/(\d+\s*(?:giây|phút|giờ))/i);
+        // The owner label can be on the article itself, a deep child, or a
+        // wrapper above it (Facebook changes this during hydration). Inspect
+        // all three instead of querySelector-only, which misses the row itself
+        // and caused an A -> B call to be guessed from geometry on B's side.
+        var ownershipLabels = [];
+        var labelCursor = canonicalCallRow;
+        for (var labelDepth = 0; labelDepth < 4 && labelCursor && mainContainer.contains(labelCursor); labelDepth++) {
+          var cursorLabel = labelCursor.getAttribute?.('aria-label');
+          if (cursorLabel) ownershipLabels.push(cursorLabel);
+          labelCursor = labelCursor.parentElement;
+        }
+        var ownershipNodes = canonicalCallRow.querySelectorAll?.('[aria-label]') || [];
+        for (var labelIndex = 0; labelIndex < ownershipNodes.length; labelIndex++) {
+          ownershipLabels.push(ownershipNodes[labelIndex].getAttribute('aria-label') || '');
+        }
+        for (var ownerIndex = 0; ownerIndex < ownershipLabels.length; ownerIndex++) {
+          var authoritativeDirection = globalThis.FbCrmCallDirection?.directionFromAccessibilityLabel(ownershipLabels[ownerIndex]);
+          if (authoritativeDirection !== null && authoritativeDirection !== undefined) {
+            isOutgoing = authoritativeDirection;
+            break;
+          }
+        }
+
+        // Final authority for call bubbles: Messenger renders the contact's
+        // avatar only on the contact-owned row. "You" rows have no avatar.
+        // Scope this strictly to the canonical call article so header/sidebar
+        // avatars cannot flip the result. Do not let aria labels or geometry
+        // override this rule.
+        var rowAvatarCandidates = canonicalCallRow.querySelectorAll?.('img') || [];
+        var hasVisibleRowAvatar = false;
+        for (var avatarIndex = 0; avatarIndex < rowAvatarCandidates.length; avatarIndex++) {
+          var avatarEl = rowAvatarCandidates[avatarIndex];
+          var avatarSrc = avatarEl.currentSrc || avatarEl.src || '';
+          if (!avatarSrc || /transparent|blank|emoji|staticxx/i.test(avatarSrc)) continue;
+          var avatarRect = avatarEl.getBoundingClientRect?.();
+          if (!avatarRect || avatarRect.width < 16 || avatarRect.height < 16) continue;
+          if (avatarRect.width > 80 || avatarRect.height > 80) continue;
+          var avatarStyle = window.getComputedStyle?.(avatarEl);
+          if (avatarStyle && (avatarStyle.display === 'none' || avatarStyle.visibility === 'hidden' || avatarStyle.opacity === '0')) continue;
+          hasVisibleRowAvatar = true;
+          break;
+        }
+        isOutgoing = !hasVisibleRowAvatar;
+
         var displayContent = txt;
         if (durationMatch && !txt.includes(durationMatch[1])) displayContent = txt + ' • ' + durationMatch[1];
 
-        var signature = threadId + '|' + displayContent.toLowerCase().replace(/\s+/g, ' ').trim() + '|' + timeStr + '|' + (isOutgoing ? 'out' : 'in');
+        // Direction is deliberately NOT part of identity. Facebook hydrates
+        // ownership labels after the call row first appears; including the
+        // temporary side here turned one call into two bubbles (first A, then B).
+        var signature = threadId + '|' + displayContent.toLowerCase().replace(/\s+/g, ' ').trim() + '|' + timeStr;
         var occurrence = (scanCounts.get(signature) || 0) + 1;
         scanCounts.set(signature, occurrence);
-        scanCalls.push({ signature: signature, occurrence: occurrence, displayContent: displayContent, timeStr: timeStr, isOutgoing: isOutgoing });
+        scanCalls.push({ signature: signature, occurrence: occurrence, displayContent: displayContent, timeStr: timeStr, isOutgoing: isOutgoing, hasRowAvatar: hasVisibleRowAvatar });
       }
 
       if (!_callBaselineReady) {
         scanCounts.forEach(function(count, signature) { _callSeenCounts.set(signature, count); });
+        _callPendingDirections.clear();
         _callBaselineReady = true;
         return;
       }
@@ -1004,13 +1109,30 @@
         var call = scanCalls[c];
         var previouslySeen = _callSeenCounts.get(call.signature) || 0;
         if (call.occurrence <= previouslySeen) continue;
+
+        // Require four consecutive scans with the same avatar result. This
+        // gives a lazy-loaded contact avatar time to mount before committing
+        // the row as an avatar-less "You" call.
+        var pendingKey = call.signature + '|occ' + call.occurrence;
+        var pendingDirection = _callPendingDirections.get(pendingKey);
+        if (!pendingDirection || pendingDirection.isOutgoing !== call.isOutgoing) {
+          _callPendingDirections.set(pendingKey, { isOutgoing: call.isOutgoing, confirmations: 1 });
+          continue;
+        }
+        pendingDirection.confirmations += 1;
+        if (pendingDirection.confirmations < 4) continue;
+        _callPendingDirections.delete(pendingKey);
         _callSeenCounts.set(call.signature, call.occurrence);
 
-        var callId = 'call_' + callSignatureHash(call.signature) + '_occ' + call.occurrence;
+        // Duration/text are not unique: two separate calls to the same person
+        // can both be "Voice call - 2 seconds". Baseline/seen-counts already
+        // prevent old DOM rows from being emitted again, so add this detection
+        // instant to distinguish genuinely new calls across the same thread.
+        var callId = 'call_' + callSignatureHash(call.signature + '|' + Date.now()) + '_occ' + call.occurrence;
         if (_callSentIds.has(callId)) continue;
         _callSentIds.add(callId);
 
-        console.log('[CALL_SCANNER] Tim thay cuoc goi MOI: "' + call.displayContent + '" (' + call.timeStr + ') | isOutgoing=' + call.isOutgoing + ' | thread=' + threadId + ' | id=' + callId);
+        console.log('[CALL_SCANNER] Tim thay cuoc goi MOI: "' + call.displayContent + '" (' + call.timeStr + ') | hasRowAvatar=' + call.hasRowAvatar + ' | isOutgoing=' + call.isOutgoing + ' | thread=' + threadId + ' | id=' + callId);
         try {
           if (chrome && chrome.runtime && chrome.runtime.id) {
             chrome.runtime.sendMessage({
@@ -1022,6 +1144,8 @@
                 sender_name: call.isOutgoing ? 'Bạn' : '',
                 content: call.displayContent,
                 is_outgoing: call.isOutgoing,
+                has_row_avatar: call.hasRowAvatar,
+                direction_evidence: 'call_article_avatar',
                 media_type: 'text',
                 source: 'dom_observer',
                 timestamp_ms: Date.now(),

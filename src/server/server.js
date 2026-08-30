@@ -116,7 +116,11 @@ app.get('/api/auth/me', async (req, res) => {
   const user = authService.getRequestUser(req);
   if (!user) return res.status(401).json({ success: false, code: 'AUTH_REQUIRED' });
   try {
-    await centralAuthClient.accountStatus(user.username);
+    const status = await centralAuthClient.accountStatus(user.username);
+    if (status?.data?.company_role && status.data.company_role !== user.company_role) {
+      authService.db.prepare('UPDATE users SET company_role=? WHERE id=?').run(status.data.company_role, user.id);
+      user.company_role = status.data.company_role;
+    }
   } catch (error) {
     if (error instanceof CentralAuthError && ['USER_NOT_FOUND', 'ACCOUNT_BLOCKED'].includes(error.code)) {
       authService.revokeRequestSession(req);
@@ -158,6 +162,11 @@ app.get('/api/license/status', async (req, res) => {
       body: JSON.stringify({ username: user.username, key: licenseChecker.getSavedKey(), machineId: getMachineId() })
     });
     const result = await response.json();
+    if (result.success && result.data?.valid && result.data?.key) {
+      if (licenseChecker.getSavedKey() !== result.data.key) {
+        licenseChecker.saveKey(result.data.key);
+      }
+    }
     res.json({ success: true, data: { isLicensed: Boolean(result.data?.valid), ...result.data } });
   } catch (error) {
     res.json({ success: true, data: { isLicensed: false, reason: 'LICENSE_SERVER_UNAVAILABLE', message: 'Không thể kiểm tra gói tài khoản.' } });
@@ -279,7 +288,7 @@ app.use('/api', licenseChecker.middleware());
 const clientDistPath = path.join(__dirname, '../../dist/client');
 app.use(express.static(clientDistPath, {
   setHeaders: (res, filePath) => {
-    if (filePath.endsWith('index.html')) {
+    if (filePath.endsWith('index.html') || filePath.endsWith('.js') || filePath.endsWith('.css')) {
       res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     } else if (filePath.endsWith('.jpg') || filePath.endsWith('.jpeg') || filePath.endsWith('.png')) {
       res.set('Cache-Control', 'public, max-age=31536000, immutable');
@@ -300,9 +309,15 @@ io.use((socket, next) => {
 const wss = new WebSocket.Server({ noServer: true });
 const extensionConnections = new Map();
 const pendingAccountOwners = new Map();
+// Existing-account "Kết nối Facebook" launches should become background
+// processes only after that account's extension has registered successfully.
+// New-account pending sessions are intentionally excluded so the login window
+// stays visible for the operator.
+const backgroundAfterConnectRequests = new Map();
 const domReplaySuppressUntil = new Map();
 const callEventDeduplicator = new CallEventDeduplicator();
 const historyBackfillJobs = new Map();
+const bulkHistoryJobs = new Map();
 
 const richContentSecret = crypto.randomBytes(32);
 
@@ -405,7 +420,9 @@ server.on('upgrade', (request, socket, head) => {
 // ── Helper: gửi tin nhắn qua Extension WebSocket ──────────────────────────
 async function sendViaExtension(thread_id, text, client_message_id = null) {
   // Tìm account_id của thread
-  const thread = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(thread_id);
+  const thread = db.prepare(
+    'SELECT account_id, contact_name, thread_url FROM threads WHERE id = ?'
+  ).get(thread_id);
   if (!thread) throw new Error(`Thread ${thread_id} không tồn tại`);
 
   const extWs = extensionConnections.get(thread.account_id);
@@ -453,8 +470,41 @@ async function sendViaExtension(thread_id, text, client_message_id = null) {
   } else {
     // Persist trước khi dispatch để DOM/network confirmation không chạy vào race
     // window và luôn tìm thấy bản ghi pending để ghép đúng client_message_id.
-    extWs.send(JSON.stringify({ type: 'SEND_MESSAGE', data: { thread_id, content: text, client_message_id: clientMsgId } }));
+    extWs.send(JSON.stringify({
+      type: 'SEND_MESSAGE',
+      data: {
+        account_id: thread.account_id,
+        thread_id,
+        thread_url: thread.thread_url || null,
+        expected_contact_name: thread.contact_name || null,
+        content: text,
+        client_message_id: clientMsgId
+      }
+    }));
     trace('BACKEND_DISPATCHED_EXTENSION');
+
+    // Never leave the CRM bubble pending forever when an extension handler
+    // stalls before returning SEND_MESSAGE_RESULT.
+    setTimeout(() => {
+      const pending = db.prepare(`
+        SELECT id FROM messages
+        WHERE client_message_id = ? AND delivery_status = 'pending'
+      `).get(clientMsgId);
+      if (!pending) return;
+      const timeoutError = 'Extension không xác nhận kết quả gửi trong 30 giây';
+      db.prepare(`
+        UPDATE messages SET delivery_status = 'failed', delivery_error = ?
+        WHERE id = ?
+      `).run(timeoutError, pending.id);
+      io.emit('MESSAGE_SEND_FAILED', {
+        thread_id,
+        client_message_id: clientMsgId,
+        success: false,
+        status: 'failed',
+        error: timeoutError,
+        error_code: 'EXTENSION_ACK_TIMEOUT'
+      });
+    }, 30000);
   }
 
   io.emit('NEW_MESSAGE', {
@@ -583,7 +633,11 @@ wss.on('connection', (ws, req) => {
             previousExtension.close(1000, 'ACCOUNT_CONNECTION_REPLACED');
           }
           extensionConnections.set(account_id, ws);
-          InboxSyncScheduler.registerAccount(account_id);
+          // A pending account is still inside Facebook's interactive login /
+          // encrypted-history PIN setup. Do not start background sidebar
+          // polling until the operator finishes setup and reconnects it as an
+          // existing account (REGISTER_ACCOUNT without pending_key).
+          if (!pending_key) InboxSyncScheduler.registerAccount(account_id);
           domReplaySuppressUntil.set(account_id, Date.now() + 8000);
           ws.accountId = account_id;
 
@@ -632,6 +686,14 @@ wss.on('connection', (ws, req) => {
           io.emit('INBOX_SOURCE_ADDED', { id: 'src_personal_' + account_id, source_type: 'personal_messenger', display_name: accName });
           io.emit('EXTENSION_CONNECTION_CHANGED', { account_id, is_connected: true });
 
+          const backgroundRequestedAt = backgroundAfterConnectRequests.get(String(account_id));
+          const backgroundRequestIsFresh = Number.isFinite(backgroundRequestedAt)
+            && Date.now() - backgroundRequestedAt < 120000;
+          if (!pending_key && backgroundRequestIsFresh) {
+            backgroundAfterConnectRequests.delete(String(account_id));
+            processManager.hideAccountProcess(account_id);
+          }
+
           // Gửi ACK về Extension xác nhận đăng ký thành công
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
@@ -646,7 +708,9 @@ wss.on('connection', (ws, req) => {
           // Phần rebind extensionConnections/ACK phía trên vẫn luôn chạy bình
           // thường - chỉ việc quét lại sidebar là được cooldown.
           const nowMs = Date.now();
-          if (SidebarSyncCooldown.isInCooldown(account_id, nowMs)) {
+          if (pending_key) {
+            console.log(`[WS] Bỏ qua auto SYNC_THREADS trong phiên thiết lập/PIN: account=${account_id}`);
+          } else if (SidebarSyncCooldown.isInCooldown(account_id, nowMs)) {
             console.log(`[WS] Bỏ qua auto SYNC_THREADS sau REGISTER_ACCOUNT (còn cooldown ${SidebarSyncCooldown.remainingMs(account_id, nowMs)}ms): account=${account_id}`);
           } else {
             SidebarSyncCooldown.markDispatched(account_id, nowMs);
@@ -702,7 +766,14 @@ wss.on('connection', (ws, req) => {
               console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DISPATCHED_ALREADY_FAILED', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
             } else {
               console.log(`[WS] Composer đã dispatch tin; giữ pending chờ DOM/network confirmation: ${client_message_id}`);
-              io.emit('MESSAGE_SEND_PENDING', { thread_id, client_message_id, status: 'pending', error_code });
+              // Composer cleared successfully. Stop the first-message spinner,
+              // but keep SQLite pending for late Facebook DOM correlation.
+              io.emit('MESSAGE_SENT', {
+                thread_id,
+                client_message_id,
+                status: 'sent',
+                provisional: true
+              });
               console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_CONFIRMATION_GRACE', thread_id: String(thread_id), client_message_id, at: new Date().toISOString() }));
             }
           } else {
@@ -897,7 +968,18 @@ wss.on('connection', (ws, req) => {
             });
             const stableCallId = m.fb_message_id;
             const existingCall = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(stableCallId);
-            const callIsOutgoing = (m.is_outgoing === true || m.is_outgoing === 1) ? 1 : 0;
+            const normalizedCallContent = String(m.content || '').toLocaleLowerCase('vi-VN');
+            const isExplicitMissedIncoming = /(?:\u0111\u00e3\s+nh\u1ee1|b\u1ecf\s+l\u1ee1|missed)\s+(?:cu\u1ed9c\s+)?g\u1ecdi/.test(normalizedCallContent);
+            // Use the raw DOM evidence at the persistence boundary. Avatar in
+            // the call article means contact; no avatar means the logged-in
+            // account. A missed-call label is an explicit incoming outcome.
+            const hasRawAvatarEvidence = m.direction_evidence === 'call_article_avatar'
+              && (m.has_row_avatar === true || m.has_row_avatar === false);
+            const callIsOutgoing = isExplicitMissedIncoming
+              ? 0
+              : hasRawAvatarEvidence
+                ? (m.has_row_avatar ? 0 : 1)
+                : ((m.is_outgoing === true || m.is_outgoing === 1) ? 1 : 0);
             const callSenderId = m.sender_id || (callIsOutgoing ? String(targetAccountIdForCall || 'STAFF') : 'CONTACT');
             if (!existingCall) {
               const insertCall = db.prepare(`
@@ -916,8 +998,8 @@ wss.on('connection', (ws, req) => {
                 console.log(`[CALL_DEBUG] ✅ Đã lưu call log vào DB: "${m.content}" (id: ${stableCallId}) | is_outgoing: ${callIsOutgoing}`);
                 const newMsg = db.prepare('SELECT * FROM messages WHERE fb_message_id = ?').get(stableCallId);
                 if (newMsg) {
-                  io.emit('NEW_MESSAGE', newMsg);
-                  io.emit('THREAD_MESSAGES_UPDATED', { thread_id: m.thread_id });
+                  io.emit('NEW_MESSAGE', { ...newMsg, account_id: targetAccountIdForCall });
+                  io.emit('THREAD_MESSAGES_UPDATED', { thread_id: m.thread_id, account_id: targetAccountIdForCall });
                 }
               } else {
                 console.log(`[CALL_DEBUG] ⚠️ Call log đã tồn tại, bỏ qua: ${stableCallId}`);
@@ -1455,11 +1537,6 @@ wss.on('connection', (ws, req) => {
                     : 'Chưa có tin nhắn';
                 }
 
-                const previousThread = db.prepare('SELECT last_message, is_unread FROM threads WHERE id = ?').get(threadId);
-                const sidebarChanged = !previousThread
-                  || cleanMessageText(previousThread.last_message) !== cleanLastMsg
-                  || Boolean(previousThread.is_unread) !== Boolean(t.is_unread);
-
                 ConversationRepository.upsertThread({
                   id: threadId,
                   account_id: account_id,
@@ -1468,15 +1545,6 @@ wss.on('connection', (ws, req) => {
                   last_message: cleanLastMsg,
                   is_unread: t.is_unread
                 });
-
-                if (sidebarChanged) {
-                  InboxSyncScheduler.enqueueThreadSync({
-                    account_id,
-                    thread_id: threadId,
-                    thread_url: t.thread_url || null,
-                    reason: previousThread ? 'sidebar_changed' : 'sidebar_new_thread'
-                  });
-                }
 
                 // Auto-bind Page source nếu thread đến từ Business Suite
                 if (t.page_id || t.source_type === 'page_messenger') {
@@ -1549,6 +1617,8 @@ wss.on('connection', (ws, req) => {
           if (reason) {
             const HistorySyncManager = require('./services/HistorySyncManager');
             HistorySyncManager.updateSyncStatus(thread_id, 'FAILED', null, reason);
+            console.log(`[WS] History sync failed for thread=${thread_id}; automatic retry is disabled.`);
+            return;
 
             // marker_mismatch/sidebar_mismatch/no_rows/no_main_container are DOM-timing
             // flukes that usually clear up on their own; error_screen means Facebook
@@ -1637,7 +1707,8 @@ wss.on('connection', (ws, req) => {
             if (deltaIds.length === 0) break;
             const placeholders = deltaIds.map(() => '?').join(',');
             const deltaMsgsRows = db.prepare(`
-              SELECT * FROM messages WHERE fb_message_id IN (${placeholders}) ORDER BY timestamp_ms ASC, created_at ASC, id ASC
+              SELECT * FROM messages WHERE fb_message_id IN (${placeholders})
+              ORDER BY COALESCE(sequence_order, id) ASC, id ASC
             `).all(...deltaIds);
             const cleanMsgs = deltaMsgsRows.map(m => {
               const cleaned = cleanMessageText(m.content);
@@ -1693,6 +1764,36 @@ wss.on('connection', (ws, req) => {
           } else if (resolvedSyncStatus === 'SYNCED' && activeJob && String(activeJob.threadId) === String(thread_id)) {
             historyBackfillJobs.delete(historyJobKey);
           }
+          break;
+        }
+
+        case 'BULK_HISTORY_SYNC_PROGRESS': {
+          const progress = msg.data || {};
+          const job = bulkHistoryJobs.get(String(progress.job_id || ''));
+          if (!job) break;
+          const accountKey = String(progress.account_id || ws.accountId || '');
+          job.accounts.set(accountKey, {
+            total: Number(progress.total || 0),
+            completed: Number(progress.completed || 0),
+            failed: Number(progress.failed || 0),
+            status: progress.status || 'running',
+            error: progress.error || null
+          });
+          const states = [...job.accounts.values()];
+          const aggregate = states.reduce((sum, state) => ({
+            total: sum.total + state.total,
+            completed: sum.completed + state.completed,
+            failed: sum.failed + state.failed
+          }), { total: 0, completed: 0, failed: 0 });
+          const allTerminal = states.length === job.expectedAccounts
+            && states.every((state) => state.status === 'completed' || state.status === 'failed');
+          io.emit('BULK_HISTORY_SYNC_PROGRESS', {
+            job_id: job.id,
+            status: allTerminal ? 'completed' : 'running',
+            ...aggregate,
+            error: progress.error || null
+          });
+          if (allTerminal) bulkHistoryJobs.delete(job.id);
           break;
         }
 
@@ -1858,9 +1959,12 @@ wss.on('connection', (ws, req) => {
 
           console.log(`[WS] 📞 CALL_ENDED: ${callContent} (${duration_text || '?'}) thread=${callThreadId}`);
 
+          const storedCallMessage = db.prepare('SELECT * FROM messages WHERE fb_message_id = ?').get(callFbId);
           // Emit to CRM immediately
           io.emit('NEW_MESSAGE', {
+            ...(storedCallMessage || {}),
             thread_id: internalThreadId,
+            account_id: String(callAccountId || ws.accountId || ''),
             fb_message_id: callFbId,
             content: callContent,
             is_outgoing: true,
@@ -1895,6 +1999,46 @@ wss.on('connection', (ws, req) => {
 // Socket.io: Nhân viên gửi tin nhắn → AI auto-pause 30 phút
 // ────────────────────────────────────────────────
 io.on('connection', (socket) => {
+  socket.on('REQUEST_BULK_HISTORY_SYNC', ({ job_id, threads = [] } = {}) => {
+    const requested = Array.isArray(threads) ? threads : [];
+    const allowed = requested.filter((thread) =>
+      thread?.thread_id && enterpriseAccess.canAccessThread(socket.user, thread.thread_id)
+    );
+    const groups = new Map();
+    for (const thread of allowed) {
+      const row = db.prepare('SELECT id, account_id, thread_url, contact_name, source_id FROM threads WHERE id = ?').get(thread.thread_id);
+      if (!row?.account_id) continue;
+      const source = ConversationRepository.getThreadSource(row.id);
+      if (source?.sourceType === 'page_messenger') continue;
+      const key = String(row.account_id);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push({
+        thread_id: String(row.id),
+        thread_url: row.thread_url || thread.thread_url || null,
+        contact_name: row.contact_name || thread.contact_name || null
+      });
+    }
+
+    const id = String(job_id || require('crypto').randomUUID());
+    const connectedGroups = [...groups.entries()].filter(([accountId]) => {
+      const extWs = extensionConnections.get(accountId);
+      return extWs && extWs.readyState === WebSocket.OPEN;
+    });
+    if (connectedGroups.length === 0) {
+      socket.emit('BULK_HISTORY_SYNC_PROGRESS', { job_id: id, status: 'completed', total: 0, completed: 0, failed: allowed.length, error: 'EXTENSION_NOT_CONNECTED' });
+      return;
+    }
+
+    bulkHistoryJobs.set(id, { id, expectedAccounts: connectedGroups.length, accounts: new Map() });
+    socket.emit('BULK_HISTORY_SYNC_PROGRESS', { job_id: id, status: 'running', total: allowed.length, completed: 0, failed: 0 });
+    for (const [accountId, accountThreads] of connectedGroups) {
+      extensionConnections.get(accountId).send(JSON.stringify({
+        type: 'BULK_HISTORY_SYNC',
+        data: { job_id: id, account_id: accountId, threads: accountThreads }
+      }));
+    }
+  });
+
   socket.on('REQUEST_SYNC_THREADS', ({ account_id }) => {
     if (!account_id) return;
     if (!InboxSyncScheduler.requestSidebarSync(account_id, 'crm_manual', { force: true })) {
@@ -1902,7 +2046,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('REQUEST_SYNC_THREAD_MESSAGES', ({ account_id, thread_id, thread_url, page_id, contact_name }) => {
+  socket.on('REQUEST_SYNC_THREAD_MESSAGES', ({ thread_id }) => {
+    console.log(`[Socket.io] Ignored legacy per-thread history sync request for thread=${thread_id || 'unknown'}; use bulk sync button.`);
+    return;
+    /* Automatic/per-thread history sync is intentionally disabled.
     if (!enterpriseAccess.canAccessAccount(socket.user, account_id) && !enterpriseAccess.canAccessThread(socket.user, thread_id)) return;
     let targetAccId = account_id;
     if (!targetAccId && extensionConnections.size > 0) {
@@ -1938,6 +2085,7 @@ io.on('connection', (socket) => {
       reason: 'crm_navigation',
       allow_navigation: true
     });
+    */
   });
 
   socket.on('TRIGGER_CALL', ({ thread_id, call_type = 'audio', account_id, call_request_id }) => {
@@ -2185,16 +2333,32 @@ app.get('/api/accounts', (req, res) => {
   }));
   res.json(result);
 });
-app.post('/api/accounts/:id/start', (req, res) => {
+app.post('/api/accounts/:id/start', async (req, res) => {
   if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
     return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
   }
-  res.json({ success: processManager.startAccountProcess(req.params.id) });
+  const accountId = String(req.params.id);
+  backgroundAfterConnectRequests.set(accountId, Date.now());
+  const success = await processManager.startAccountProcess(accountId);
+  if (!success) {
+    backgroundAfterConnectRequests.delete(accountId);
+    return res.json({ success: false });
+  }
+
+  // If the extension is already connected, no new REGISTER_ACCOUNT event may
+  // arrive. Hide immediately; otherwise REGISTER_ACCOUNT above will hide it.
+  const extension = extensionConnections.get(accountId);
+  if (extension?.readyState === WebSocket.OPEN) {
+    backgroundAfterConnectRequests.delete(accountId);
+    processManager.hideAccountProcess(accountId);
+  }
+  res.json({ success: true });
 });
 app.post('/api/accounts/:id/stop', (req, res) => {
   if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
     return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
   }
+  backgroundAfterConnectRequests.delete(String(req.params.id));
   const stopped = processManager.stopAccountProcess(req.params.id);
   res.json({ success: true, stopped });
 });
@@ -2202,19 +2366,23 @@ app.post('/api/accounts/:id/open', (req, res) => {
   if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
     return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
   }
-  const started = processManager.startAccountProcess(req.params.id);
-  if (started) processManager.unhideWindow(req.params.id);
-  res.json({ success: started });
+  if (processManager.getStatus(req.params.id) !== 'RUNNING') {
+    return res.status(409).json({ success: false, error: 'Hãy kết nối tài khoản Facebook trước khi bật hiển thị Chrome.' });
+  }
+  const visible = processManager.unhideWindow(req.params.id);
+  res.json({ success: visible });
 });
 app.post('/api/accounts/:id/background', (req, res) => {
   if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
     return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
   }
-  const started = processManager.startAccountProcess(req.params.id);
-  const hidden = started ? processManager.hideAccountProcess(req.params.id) : false;
-  res.json({ success: started, hidden });
+  if (processManager.getStatus(req.params.id) !== 'RUNNING') {
+    return res.status(409).json({ success: false, error: 'Tài khoản Facebook chưa được kết nối.' });
+  }
+  const hidden = processManager.hideAccountProcess(req.params.id);
+  res.json({ success: hidden });
 });
-app.post('/api/accounts/new-session', (req, res) => {
+app.post('/api/accounts/new-session', async (req, res) => {
   if (!enterpriseAccess.isCompanyAdmin(req.user) && !(req.user.role === 'ADMIN' && req.user.username === 'admin')) {
     return res.status(403).json({ success: false, error: 'Chỉ Admin doanh nghiệp được thêm tài khoản Facebook.' });
   }
@@ -2225,7 +2393,7 @@ app.post('/api/accounts/new-session', (req, res) => {
   pendingAccountOwners.set(pendingKey, req.user.id);
 
   console.log(`[API] Tạo phiên đăng ký tài khoản Facebook mới: ${pendingKey}`);
-  const success = processManager.startNewAccountProcess(pendingKey);
+  const success = await processManager.startNewAccountProcess(pendingKey);
   if (!success) pendingAccountOwners.delete(pendingKey);
   res.json({ success, pending_key: pendingKey });
 });
@@ -2244,6 +2412,7 @@ app.delete('/api/accounts/:id', (req, res) => {
     // Block late REGISTER_ACCOUNT frames before terminating the detached
     // Chrome tree, otherwise the account can be recreated during deletion.
     processManager.stopAccountProcess(accountId);
+    backgroundAfterConnectRequests.delete(accountId);
     const extension = extensionConnections.get(accountId);
     extensionConnections.delete(accountId);
     InboxSyncScheduler.unregisterAccount(accountId);
@@ -2958,7 +3127,10 @@ app.get('/api/threads/:id/messages', (req, res) => {
   if (!enterpriseAccess.canAccessThread(req.user, req.params.id)) return res.status(404).json({ error: 'Không tìm thấy hội thoại' });
   // `id` is the durable per-database receive sequence. is_outgoing identifies
   // the side (0 = customer, 1 = operator); timestamps are display-only.
-  const msgs = db.prepare('SELECT * FROM messages WHERE thread_id=? ORDER BY COALESCE(sequence_order, id) ASC, id ASC').all(req.params.id);
+  const msgs = db.prepare(`
+    SELECT * FROM messages WHERE thread_id=?
+    ORDER BY COALESCE(sequence_order, id) ASC, id ASC
+  `).all(req.params.id);
   const cleanMsgs = msgs.map(m => {
     const cleaned = cleanMessageText(m.content);
     return { ...m, cleaned };
@@ -3083,6 +3255,9 @@ function startServer() {
 InboxSyncScheduler.configure({
   getConnection: (accountId) => extensionConnections.get(String(accountId)),
   dispatchThreadMessagesSync: ({ account_id, thread_id, thread_url, page_id, contact_name, reason, allow_navigation }) => {
+    console.log(`[HISTORY_SYNC_DISABLED] Scheduler request ignored account=${account_id} thread=${thread_id}`);
+    return false;
+    /* Scheduler-based message history synchronization is intentionally disabled.
     const extWs = extensionConnections.get(String(account_id));
     if (!extWs || extWs.readyState !== WebSocket.OPEN) return false;
     const syncState = require('./services/HistorySyncManager').getSyncState(thread_id);
@@ -3106,6 +3281,7 @@ InboxSyncScheduler.configure({
       }
     }));
     return true;
+    */
   }
 });
 

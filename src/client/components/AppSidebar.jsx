@@ -17,6 +17,8 @@ export default function AppSidebar({ activeView, onSelectView, onOpenModal, them
   const pointerInsideRef = useRef(false);
   const focusInsideRef = useRef(false);
 
+  const isCompanyAdmin = sessionUser?.company_role !== 'EMPLOYEE';
+
   const navItems = [
     { id: 'chat', label: 'Hội thoại', icon: MessageSquare },
     { id: 'search', label: 'Tìm kiếm', icon: Search, isModal: true },
@@ -24,11 +26,20 @@ export default function AppSidebar({ activeView, onSelectView, onOpenModal, them
     { id: 'campaigns', label: 'Chiến dịch', icon: Megaphone, isModal: true },
     { id: 'aiConfig', label: 'Cài đặt AI', icon: Cpu, isModal: true },
     { id: 'phoneAutomation', label: 'Tự động số điện thoại', icon: Phone, isModal: true },
-    { id: 'license', label: 'Bản quyền Key', icon: Key, isModal: true },
-    { id: 'payment', label: 'Mua License', icon: CreditCard, isModal: true },
-    { id: 'accounts', label: 'Quản lý', icon: UserCheck, isModal: true }
   ];
-  if (sessionUser?.company_role === 'ADMIN') navItems.push({ id: 'employees', label: 'Nhân viên', icon: Users });
+
+  if (isCompanyAdmin) {
+    navItems.push(
+      { id: 'license', label: 'Bản quyền Key', icon: Key, isModal: true },
+      { id: 'payment', label: 'Mua License', icon: CreditCard, isModal: true }
+    );
+  }
+
+  navItems.push({ id: 'accounts', label: 'Quản lý', icon: UserCheck, isModal: true });
+
+  if (isCompanyAdmin) {
+    navItems.push({ id: 'employees', label: 'Nhân viên', icon: Users });
+  }
 
   const cancelScheduledCollapse = () => {
     if (closeTimerRef.current) {

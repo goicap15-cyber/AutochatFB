@@ -1,8 +1,8 @@
 class InboxSyncScheduler {
   constructor({
-    sidebarIntervalMs = 3000,
+    sidebarIntervalMs = 60000,
     sidebarCooldownMs = 2500,
-    sidebarTimeoutMs = 12000,
+    sidebarTimeoutMs = 70000,
     threadCooldownMs = 2000,
     threadTimeoutMs = 20000
   } = {}) {

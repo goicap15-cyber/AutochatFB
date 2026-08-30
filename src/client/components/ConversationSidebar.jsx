@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, Edit, Filter, Megaphone, X }  from 'lucide-react';
+import { Search, Edit, Filter, Megaphone, RefreshCw, X }  from 'lucide-react';
 import ConversationFilters from './ConversationFilters.jsx';
 import ConversationItem from './ConversationItem.jsx';
 import ConversationFilterPopover from './ConversationFilterPopover.jsx';
@@ -22,7 +22,8 @@ export default function ConversationSidebar({
   campaignSelectionMode = false,
   selectedCampaignThreadIds = [],
   onToggleCampaignThread,
-  onStartCampaignSelection, onCancelCampaignSelection, onCreateCampaign
+  onStartCampaignSelection, onCancelCampaignSelection, onCreateCampaign,
+  onBulkHistorySync, bulkHistoryProgress
 }) {
   const [appliedFilters, setAppliedFilters] = useState(() => normalizeFilters(createDefaultFilters()));
   const [isFilterPopoverOpen, setIsFilterPopoverOpen] = useState(false);
@@ -83,6 +84,16 @@ export default function ConversationSidebar({
           </div>
 
           <div className="flex gap-1.5 shrink-0 items-center">
+            <button
+              type="button"
+              onClick={onBulkHistorySync}
+              disabled={!isConnected || bulkHistoryProgress?.status === 'running' || threads.length === 0}
+              className="p-1.5 hover:bg-[var(--color-bg-hover)] rounded-full transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
+              title="Đồng bộ tin nhắn tất cả"
+              aria-label="Đồng bộ tin nhắn tất cả"
+            >
+              <RefreshCw size={17} className={`text-[var(--color-text-muted)] ${bulkHistoryProgress?.status === 'running' ? 'animate-spin' : ''}`} strokeWidth={1.75} />
+            </button>
             <button onClick={onOpenSearch} className="p-1.5 hover:bg-[var(--color-bg-hover)] rounded-full transition-colors cursor-pointer" title="Tìm kiếm nhanh" aria-label="Tìm kiếm nhanh">
               <Edit size={17} className="text-[var(--color-text-muted)]" strokeWidth={1.75} />
             </button>
@@ -142,6 +153,18 @@ export default function ConversationSidebar({
         </div>
 
         <ConversationFilters activeTab={activeTab} onTabChange={onTabChange} />
+        {bulkHistoryProgress && (
+          <div className="flex items-center justify-between rounded-lg bg-[var(--color-bg-surface)] px-2.5 py-1.5 text-[11px] text-[var(--color-text-muted)]">
+            <span>
+              {bulkHistoryProgress.status === 'running'
+                ? 'Đang đồng bộ tất cả tin nhắn'
+                : `Đồng bộ xong${bulkHistoryProgress.failed ? `, lỗi ${bulkHistoryProgress.failed}` : ''}`}
+            </span>
+            <span className="font-semibold tabular-nums text-[var(--color-text-primary)]">
+              {Number(bulkHistoryProgress.completed || 0) + Number(bulkHistoryProgress.failed || 0)}/{Number(bulkHistoryProgress.total || 0)}
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto overscroll-y-contain touch-pan-y bg-[var(--color-bg-panel)]">

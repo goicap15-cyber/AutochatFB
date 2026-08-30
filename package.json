@@ -33,6 +33,7 @@
     "express": "^4.21.2",
     "jszip": "^3.10.1",
     "lucide-react": "^0.475.0",
+    "puppeteer-core": "^25.9.0",
     "react": "^19.0.0",
     "react-colorful": "^5.8.0",
     "react-dom": "^19.0.0",

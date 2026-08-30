@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AutoChatbot FB Engine",
-  "version": "1.0.2",
+  "version": "1.0.5",
   "description": "Facebook Messenger GraphQL Engine for AutoChatbot CRM",
   "icons": {
     "16": "icons/icon16.png",
@@ -61,7 +61,7 @@
         "https://*.facebook.com/*",
         "https://*.messenger.com/*"
       ],
-      "js": ["textFilter.js", "content.js"],
+      "js": ["textFilter.js", "callDirection.js", "content.js"],
       "run_at": "document_idle"
     },
     {
