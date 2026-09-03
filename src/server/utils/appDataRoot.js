@@ -22,7 +22,9 @@ function computeAppDataRoot() {
     // from plain `node` (dev/test) it returns the executable path string
     // instead, so `.app` is undefined there and this falls through to dev.
     const electron = require('electron');
-    if (electron && electron.app && typeof electron.app.getPath === 'function') {
+    // Development Electron must share the repository's data/ directory with
+    // `npm start`; only packaged Electron gets its isolated userData store.
+    if (electron && electron.app && electron.app.isPackaged && typeof electron.app.getPath === 'function') {
       return path.join(electron.app.getPath('userData'), 'data');
     }
   } catch (_) { /* electron not resolvable from this context - dev/test via plain node */ }

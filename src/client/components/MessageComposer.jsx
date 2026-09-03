@@ -68,7 +68,7 @@ export default function MessageComposer({
     setError(null);
     try {
       await onSendMessage({
-        contract_version: 2,
+        contract_version: submittedAttachment ? 2 : 1,
         content,
         client_message_id: clientMessageId,
         attachment_id: submittedAttachment?.id || null,

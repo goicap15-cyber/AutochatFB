@@ -262,6 +262,7 @@ class ProcessManager {
       const browser = await puppeteer.launch({
         executablePath: chromeExecutable,
         headless: false,
+        ignoreDefaultArgs: ['--enable-automation'],
         userDataDir: absProfileDir,
         defaultViewport: null,
         enableExtensions: true,
@@ -269,6 +270,9 @@ class ProcessManager {
           '--no-first-run',
           '--no-default-browser-check',
           '--disable-background-mode',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
           '--disable-popup-blocking',
           '--disable-notifications',
           '--autoplay-policy=no-user-gesture-required'
@@ -297,7 +301,7 @@ class ProcessManager {
 
       const pages = await browser.pages();
       const page = pages[0] || await browser.newPage();
-      await page.goto('https://www.facebook.com/messages', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto('https://www.facebook.com/messages/', { waitUntil: 'domcontentloaded', timeout: 30000 });
 
       console.log(`[ProcessManager] Chrome Stable [PID ${child.pid}] đã tự cài extension cho account ${accountId}.`);
       return true;
@@ -324,12 +328,31 @@ class ProcessManager {
     const absExtPath = path.resolve(this.extensionPath).replace(/\\/g, '/');
     const absProfileDir = path.resolve(profileDir).replace(/\\/g, '/');
 
+    // The backend can restart while the operator is still completing login.
+    // Re-attach the in-memory registry to that exact Chrome/profile instead
+    // of launching another browser against the same user-data directory.
+    const runningProfilePid = findBundledChromePidByProfile(absProfileDir, chromeExecutable);
+    if (runningProfilePid) {
+      this.processes.set(pendingKey, {
+        process: null,
+        browser: null,
+        profileDir: absProfileDir,
+        pid: runningProfilePid,
+        status: 'RUNNING',
+        displayMode: 'VISIBLE'
+      });
+      this.unhideWindow(pendingKey);
+      console.log(`[ProcessManager] Reused pending Chrome ${pendingKey} (PID ${runningProfilePid}).`);
+      return true;
+    }
+
     const setupUrl = `https://www.facebook.com/messages/?crm_pending_key=${encodeURIComponent(pendingKey)}`;
     console.log(`[ProcessManager] Khởi chạy Chrome Stable + tự cài extension cho phiên [${pendingKey}]: ${chromeExecutable}`);
     try {
       const browser = await puppeteer.launch({
         executablePath: chromeExecutable,
         headless: false,
+        ignoreDefaultArgs: ['--enable-automation'],
         userDataDir: absProfileDir,
         defaultViewport: null,
         enableExtensions: true,
@@ -337,6 +360,9 @@ class ProcessManager {
           '--no-first-run',
           '--no-default-browser-check',
           '--disable-background-mode',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding',
           '--disable-popup-blocking',
           '--disable-notifications',
           '--autoplay-policy=no-user-gesture-required'

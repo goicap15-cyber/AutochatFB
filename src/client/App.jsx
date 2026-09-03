@@ -4,6 +4,7 @@ import ConversationSidebar from './components/ConversationSidebar.jsx';
 import ChatHeader from './components/ChatHeader.jsx';
 import MessageList from './components/MessageList.jsx';
 import MessageComposer from './components/MessageComposer.jsx';
+import MessageRequestActions from './components/MessageRequestActions.jsx';
 import LeadDetailsPanel from './components/LeadDetailsPanel.jsx';
 import EmptyState from './components/EmptyState.jsx';
 import SearchOverlay from './components/SearchOverlay.jsx';
@@ -23,6 +24,19 @@ import { useSocket } from './hooks/useSocket.js';
 import { MessageSquare } from 'lucide-react';
 
 const THEME_VERSION = 'chat-redesign-v1';
+
+// Older/background sync payloads can create a thread before Messenger returns
+// the actual display name.  Do not keep showing that placeholder once the
+// contact record has a verified name.
+function isPlaceholderContactName(value) {
+  const normalized = String(value || '').trim().toLocaleLowerCase('vi-VN');
+  return !normalized || normalized === 'khách hàng' || normalized === 'customer';
+}
+
+function getVerifiedContactName(contact) {
+  const name = String(contact?.name || contact?.contact_name || '').trim();
+  return isPlaceholderContactName(name) ? '' : name;
+}
 
 export default function App() {
   const [theme, setTheme] = useState(() => {
@@ -72,6 +86,7 @@ export default function App() {
   const [leadStatuses, setLeadStatuses] = useState([]);
   const [activeThreadId, setActiveThreadId] = useState(null);
   const [activeTab, setActiveTab] = useState('ALL');
+  const [waitingCount, setWaitingCount] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
   const [messages, setMessages] = useState({});
   const [contacts, setContacts] = useState({});
@@ -80,6 +95,8 @@ export default function App() {
   const [activeModal, setActiveModal] = useState(null);
   const [richCapabilities, setRichCapabilities] = useState(null);
   const [bulkHistoryProgress, setBulkHistoryProgress] = useState(null);
+  const [accountSyncing, setAccountSyncing] = useState(null);
+  const requestedFacebookSyncRef = useRef(null);
 
   const [campaignSelectionMode, setCampaignSelectionMode] = useState(false);
   const [selectedCampaignThreadIds, setSelectedCampaignThreadIds] = useState([]);
@@ -117,6 +134,7 @@ export default function App() {
       setMessages({});
       setContacts({});
       setActiveThreadId(null);
+      setWaitingCount(0);
       setSelectedCampaignThreadIds([]);
       setCampaignSelectionMode(false);
       setActiveCampaignId(null);
@@ -231,13 +249,26 @@ export default function App() {
     }
   }, [activeTab, sessionUser]);
 
+  const loadWaitingCount = useCallback(async () => {
+    if (!sessionUser) return;
+    const requestedUserId = sessionUser.id;
+    try {
+      const response = await fetch('/api/threads/waiting-count');
+      const data = await response.json();
+      if (sessionUserIdRef.current !== requestedUserId) return;
+      setWaitingCount(Math.max(0, Number(data?.count) || 0));
+    } catch {
+      if (sessionUserIdRef.current === requestedUserId) setWaitingCount(0);
+    }
+  }, [sessionUser]);
+
   const loadThreadsRef = useRef(loadThreads);
   useEffect(() => { loadThreadsRef.current = loadThreads; }, [loadThreads]);
   useEffect(() => {
     if (sessionUser && licenseStatus?.isLicensed) {
-      loadThreads(); loadAccounts(); loadInboxSources(); loadLeadStatuses();
+      loadThreads(); loadWaitingCount(); loadAccounts(); loadInboxSources(); loadLeadStatuses();
     }
-  }, [sessionUser, licenseStatus?.isLicensed, loadThreads, loadAccounts, loadInboxSources, loadLeadStatuses]);
+  }, [sessionUser, licenseStatus?.isLicensed, loadThreads, loadWaitingCount, loadAccounts, loadInboxSources, loadLeadStatuses]);
 
   useEffect(() => {
     if (!isMobile && !activeThreadId && threads.length > 0) {
@@ -277,6 +308,16 @@ export default function App() {
       .then(data => {
         if (contactRequestVersionRef.current.get(threadIdStr) !== requestVersion) return;
         setContacts(prev => ({ ...prev, [threadIdStr]: { thread_id: threadIdStr, ...data } }));
+        const verifiedName = getVerifiedContactName(data);
+        if (verifiedName) {
+          setThreads(prev => prev.map((thread) => {
+            if (String(thread.id) !== threadIdStr) return thread;
+            const currentName = thread.contact_name || thread.name;
+            return isPlaceholderContactName(currentName)
+              ? { ...thread, contact_name: verifiedName }
+              : thread;
+          }));
+        }
       })
       .catch(() => {});
   }, [activeThreadId]);
@@ -315,6 +356,7 @@ export default function App() {
     if (!socket) return;
     socket.on('NEW_MESSAGE', (newMsg) => {
       if (!accountsRef.current.some((account) => String(account.id) === String(newMsg.account_id))) return;
+      loadWaitingCount();
       const tidStr = String(newMsg.thread_id);
       setMessages(prev => {
         const currentMsgs = prev[tidStr] || [];
@@ -346,7 +388,20 @@ export default function App() {
             updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
           }
         } else {
-          updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
+          const existsIdx = currentMsgs.findIndex((message) => (
+            (newMsg.fb_message_id && message.fb_message_id === newMsg.fb_message_id) ||
+            (newMsg.id != null && message.id === newMsg.id)
+          ));
+          if (existsIdx >= 0) {
+            updated = [...currentMsgs];
+            updated[existsIdx] = {
+              ...currentMsgs[existsIdx],
+              ...newMsg,
+              status: newMsg.status || newMsg.delivery_status || 'sent'
+            };
+          } else {
+            updated = [...currentMsgs, { ...newMsg, status: newMsg.status || newMsg.delivery_status || 'sent' }];
+          }
         }
         
         // Database insertion order is the canonical chat sequence. Direction
@@ -410,6 +465,23 @@ export default function App() {
           })
           .catch(() => {});
       }, 300);
+    });
+
+    socket.on('THREAD_INBOX_FOLDER_CHANGED', ({ thread_id, inbox_folder }) => {
+      const tidStr = String(thread_id);
+      setThreads((previous) => previous.map((thread) => (
+        String(thread.id) === tidStr ? { ...thread, inbox_folder } : thread
+      )));
+      loadThreadsRef.current();
+      loadWaitingCount();
+    });
+
+    socket.on('MESSAGE_REQUEST_REMOVED', ({ thread_id }) => {
+      const tidStr = String(thread_id);
+      setThreads((previous) => previous.filter((thread) => String(thread.id) !== tidStr));
+      setActiveThreadId((previous) => String(previous || '') === tidStr ? null : previous);
+      loadThreadsRef.current();
+      loadWaitingCount();
     });
 
     socket.on('MESSAGE_SEND_FAILED', ({ thread_id, client_message_id, error }) => {
@@ -560,12 +632,13 @@ export default function App() {
     });
 
     socket.on('CONTACT_UPDATED', (contactUpdate = {}) => {
-      const { thread_id, avatar_url, name, phone, email, status_id, status_name, status_color, phone_source, phone_captured_at } = contactUpdate;
+      const { thread_id, avatar_url, name, nickname, phone, email, status_id, status_name, status_color, phone_source, phone_captured_at } = contactUpdate;
       if (thread_id == null) return;
       const tidStr = String(thread_id);
       const contactPatch = {
         ...(avatar_url ? { avatar_url } : {}),
         ...(name ? { name } : {}),
+        ...(nickname !== undefined ? { nickname } : {}),
         ...(phone ? { phone } : {}),
         ...(email ? { email } : {}),
         ...(status_id !== undefined ? { status_id, status_name: status_name || null, status_color: status_color || null } : {}),
@@ -576,6 +649,7 @@ export default function App() {
         ...t,
         ...(avatar_url ? { avatar_url } : {}),
         ...(name ? { contact_name: name } : {}),
+        ...(nickname !== undefined ? { nickname } : {}),
         ...(status_id !== undefined ? { status_id, status_name: status_name || null, status_color: status_color || null } : {})
       } : t));
       setContacts(prev => ({
@@ -620,6 +694,11 @@ export default function App() {
       loadAccounts();
     });
 
+    socket.on('FACEBOOK_SYNC_STARTED', ({ account_id, tab_count }) => {
+      if (String(requestedFacebookSyncRef.current || '') !== String(account_id || '')) return;
+      setAccountSyncing({ accountId: String(account_id), tabCount: Math.max(0, Number(tab_count) || 0) });
+    });
+
     socket.on('AI_PAUSED', ({ thread_id, until }) => {
       const tidStr = String(thread_id);
       setThreads(prev => prev.map(t => String(t.id) === tidStr ? { ...t, ai_paused_until: until } : t));
@@ -638,17 +717,22 @@ export default function App() {
     socket.on('CAMPAIGN_AUDIT_EVENT', handleCampaignEvent);
     socket.on('THREADS_SYNCED', ({ account_id, threads: syncedThreads }) => {
       if (!syncedThreads || !Array.isArray(syncedThreads)) return;
+      if (String(requestedFacebookSyncRef.current || '') === String(account_id || '')) {
+        requestedFacebookSyncRef.current = null;
+        setAccountSyncing(null);
+      }
       if (!accountsRef.current.some((account) => String(account.id) === String(account_id))) return;
+      loadWaitingCount();
       setThreads(prev => {
         const accIdStr = String(account_id || '');
         const updatedThreads = [...prev];
 
         for (const synced of syncedThreads) {
-          const syncedIdStr = String(synced.id);
+          const syncedIdStr = String(synced.id || synced.thread_id || '');
           const syncedAccStr = String(synced.account_id || account_id || '');
 
           const idx = updatedThreads.findIndex(t => 
-            String(t.id) === syncedIdStr && String(t.account_id || accIdStr) === syncedAccStr
+            String(t.id || t.thread_id || '') === syncedIdStr && String(t.account_id || accIdStr) === syncedAccStr
           );
 
           if (idx >= 0) {
@@ -681,6 +765,8 @@ export default function App() {
     return () => {
       socket.off('NEW_MESSAGE');
       socket.off('MESSAGE_SENT');
+      socket.off('THREAD_INBOX_FOLDER_CHANGED');
+      socket.off('MESSAGE_REQUEST_REMOVED');
       socket.off('MESSAGE_SEND_FAILED');
       socket.off('MESSAGE_SEND_ACCEPTED');
       socket.off('MESSAGE_SEND_STATUS');
@@ -690,6 +776,7 @@ export default function App() {
       socket.off('EXTENSION_CONNECTION_CHANGED');
       socket.off('MESSAGE_UNSENT');
       socket.off('ACCOUNT_STATUS_CHANGED');
+      socket.off('FACEBOOK_SYNC_STARTED');
       socket.off('AI_PAUSED');
       socket.off('THREAD_ASSIGNED');
       socket.off('THREAD_COMPLETED');
@@ -701,7 +788,7 @@ export default function App() {
       socket.off('CAMPAIGN_RECIPIENT_UPDATED', handleCampaignEvent);
       socket.off('CAMPAIGN_AUDIT_EVENT', handleCampaignEvent);
     };
-  }, [socket, loadAccounts, loadInboxSources, activeCampaignId]);
+  }, [socket, loadAccounts, loadInboxSources, loadWaitingCount, activeCampaignId]);
 
   useEffect(() => {
     const handler = (e) => {
@@ -790,7 +877,9 @@ export default function App() {
 
     if (socket && isConnected) {
       socket.emit('SEND_MESSAGE', {
-        contract_version: 2,
+        // Plain text uses the low-latency direct Messenger path. Rich-message
+        // queueing is reserved for attachments, which need integrity tracking.
+        contract_version: payload.attachment_id || payload.attachment ? 2 : 1,
         thread_id: threadIdStr,
         client_message_id: payload.client_message_id,
         content: payload.content,
@@ -876,6 +965,17 @@ export default function App() {
       (contactRequestVersionRef.current.get(contactThreadId) || 0) + 1
     );
     setContacts(prev => ({ ...prev, [contactThreadId]: persistedContact }));
+    setThreads(prev => prev.map((thread) => String(thread.id) === contactThreadId
+      ? { ...thread, nickname: persistedContact.nickname || null }
+      : thread));
+    const verifiedName = getVerifiedContactName(persistedContact);
+    if (verifiedName) {
+      setThreads(prev => prev.map((thread) => (
+        String(thread.id) === contactThreadId && isPlaceholderContactName(thread.contact_name || thread.name)
+          ? { ...thread, contact_name: verifiedName }
+          : thread
+      )));
+    }
     if ('status_id' in persistedContact) {
       const matchedStatus = leadStatuses.find((s) => s.id === persistedContact.status_id) || null;
       setThreads(prev => prev.map(t => String(t.id) === contactThreadId
@@ -931,6 +1031,7 @@ export default function App() {
     setLicenseStatus(null);
     setThreads([]);
     setAccounts([]);
+    setWaitingCount(0);
     setActiveThreadId(null);
   };
 
@@ -946,6 +1047,7 @@ export default function App() {
   const activeContact = activeThreadId && selectedThread ? {
     thread_id: String(activeThreadId),
     name: selectedThread.contact_name || selectedThread.name || 'Khách hàng',
+    nickname: selectedThread.nickname || null,
     avatar_url: selectedThread.avatar_url,
     status: selectedThread.status,
     account_id: selectedThread.account_id,
@@ -1009,6 +1111,27 @@ export default function App() {
 
   return (
     <div className={gridClass}>
+      {accountSyncing && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="rounded-xl bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-lg"
+          style={{
+            position: 'fixed',
+            top: '12px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 10000,
+            width: 'max-content',
+            height: 'auto',
+            maxWidth: 'calc(100vw - 32px)',
+          }}
+        >
+          {accountSyncing.tabCount == null
+            ? 'Đang khởi động đồng bộ Facebook, vui lòng chờ...'
+            : `Đang đồng bộ Facebook trên ${accountSyncing.tabCount} tab, vui lòng chờ...`}
+        </div>
+      )}
       {/* Column 1: Sidebar Navigation - 48px */}
       <AppSidebar
         activeView={activeView} onSelectView={setActiveView}
@@ -1029,6 +1152,7 @@ export default function App() {
           requestThreadNavigation(clickedThread);
         }}
         activeTab={activeTab} onTabChange={setActiveTab}
+        waitingCount={waitingCount}
         searchQuery={searchQuery} onSearchChange={setSearchQuery}
         isConnected={isConnected} onOpenSearch={() => setActiveModal('search')}
         accounts={accounts}
@@ -1066,15 +1190,24 @@ export default function App() {
               onSyncThread={undefined}
               onRetryMessage={handleRetryMessage}
             />
-            <MessageComposer
-              key={String(activeThreadId)}
-              onSendMessage={handleSendMessage}
-              onStageAttachment={handleStageAttachment}
-              onDiscardAttachment={handleDiscardAttachment}
-              capabilities={richCapabilities}
-              disabled={!!isCurrentSendDisabled || richCapabilities?.text?.enabled === false}
-              disabledReason={currentSendDisabledReason}
-            />
+            {['MESSAGE_REQUEST_SPAM', 'MESSAGE_REQUEST_POSSIBLE'].includes(selectedThread.inbox_folder) ? (
+              <MessageRequestActions
+                key={String(activeThreadId)}
+                thread={selectedThread}
+                socket={socket}
+                isConnected={isConnected}
+              />
+            ) : (
+              <MessageComposer
+                key={String(activeThreadId)}
+                onSendMessage={handleSendMessage}
+                onStageAttachment={handleStageAttachment}
+                onDiscardAttachment={handleDiscardAttachment}
+                capabilities={richCapabilities}
+                disabled={!!isCurrentSendDisabled || richCapabilities?.text?.enabled === false}
+                disabledReason={currentSendDisabledReason}
+              />
+            )}
           </div>
         ) : (
           <EmptyState icon={MessageSquare} title="Chọn một hội thoại để bắt đầu nhắn tin" description="Tin nhắn và thông tin khách hàng sẽ xuất hiện tại đây." />
@@ -1098,7 +1231,15 @@ export default function App() {
 
       {/* Modals */}
       {activeModal === 'search' && <SearchOverlay onClose={() => setActiveModal(null)} onSelectThread={(tid) => { setActiveThreadId(tid); setActiveModal(null); }} />}
-      {activeModal === 'accounts' && <AccountManagerModal sessionUser={sessionUser} socket={socket} onClose={() => { setActiveModal(null); loadAccounts(); loadInboxSources(); }} onSourcesChanged={() => { loadInboxSources(); loadThreads(); }} />}
+      {activeModal === 'accounts' && <AccountManagerModal sessionUser={sessionUser} socket={socket} onClose={() => { setActiveModal(null); loadAccounts(); loadInboxSources(); }} onSourcesChanged={() => { loadInboxSources(); loadThreads(); }} onFacebookSyncStart={(accountId, started) => {
+        if (!started) {
+          if (String(requestedFacebookSyncRef.current || '') === String(accountId)) requestedFacebookSyncRef.current = null;
+          setAccountSyncing(null);
+          return;
+        }
+        requestedFacebookSyncRef.current = String(accountId);
+        setAccountSyncing({ accountId: String(accountId), tabCount: null });
+      }} />}
       {activeModal === 'autoReply' && <AutoReplyModal onClose={() => setActiveModal(null)} />}
       {activeModal === 'campaigns' && (
         <CampaignCreateModal
@@ -1142,11 +1283,62 @@ export default function App() {
         callInfo={incomingCallInfo}
         onClose={() => setIncomingCallInfo(null)}
         onSelectThread={(tid) => setActiveThreadId(tid)}
-        onAnswerCall={(action, thread_id) => {
-          if (socket) {
-            console.log(`[App] 🎯 Emitting ANSWER_INCOMING_CALL (${action}) for thread ${thread_id}`);
-            socket.emit('ANSWER_INCOMING_CALL', { action, thread_id });
+        onAnswerCall={(action, thread_id, callback, source_tab_id = null) => {
+          if (!socket) {
+            callback?.(false, 'Extension Facebook chưa kết nối');
+            return;
           }
+
+          console.log(`[App] 🎯 Emitting ANSWER_INCOMING_CALL (${action}) for thread ${thread_id}`);
+
+          let settled = false;
+          let timeoutId = null;
+
+          const cleanup = () => {
+            if (timeoutId) {
+              clearTimeout(timeoutId);
+              timeoutId = null;
+            }
+            socket.off?.('ANSWER_INCOMING_CALL_RESULT', resultHandler);
+            socket.off?.('ANSWER_INCOMING_CALL_RESPONSE', ackHandler);
+          };
+
+          const finish = (ok, msg) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            callback?.(!!ok, msg);
+          };
+
+          const matchesThread = (payloadThreadId, payloadExternalThreadId) => {
+            if (!thread_id) return true;
+            const expected = String(thread_id);
+            return String(payloadThreadId || '') === expected || String(payloadExternalThreadId || '') === expected;
+          };
+
+          const resultHandler = (payload = {}) => {
+            if (payload.action !== action) return;
+            if (!matchesThread(payload.thread_id, payload.external_thread_id)) return;
+            finish(
+              !!payload.success,
+              payload.success
+                ? (action === 'accept' ? 'Đã chấp nhận cuộc gọi' : 'Đã từ chối cuộc gọi')
+                : (payload.error || 'Extension không bấm được nút cuộc gọi')
+            );
+          };
+
+          const ackHandler = (payload = {}) => {
+            if (payload?.success) return;
+            finish(false, payload?.error || 'Không gửi được lệnh tới extension');
+          };
+
+          socket.on?.('ANSWER_INCOMING_CALL_RESULT', resultHandler);
+          socket.on?.('ANSWER_INCOMING_CALL_RESPONSE', ackHandler);
+          timeoutId = setTimeout(() => {
+            finish(false, 'Hết thời gian chờ extension phản hồi');
+          }, 10000);
+
+          socket.emit('ANSWER_INCOMING_CALL', { action, thread_id, source_tab_id });
         }}
       />
 

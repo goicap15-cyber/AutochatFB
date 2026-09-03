@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, ExternalLink, ShieldAlert, RefreshCw, PlusCircle, Trash2 } from 'lucide-react';
 
-export default function AccountManagerModal({ onClose, onSourcesChanged, socket, sessionUser }) {
+export default function AccountManagerModal({ onClose, onSourcesChanged, onFacebookSyncStart, socket, sessionUser }) {
   const isCompanyAdmin = sessionUser?.company_role === 'ADMIN';
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -113,12 +113,14 @@ export default function AccountManagerModal({ onClose, onSourcesChanged, socket,
 
   const handleStartChrome = async (accountId) => {
     setStartingId(accountId);
+    onFacebookSyncStart?.(accountId, true);
     try {
       const res = await fetch(`/api/accounts/${accountId}/start`, { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.success) throw new Error(data.error || 'Không thể mở Chrome');
       await loadAccounts();
     } catch (error) {
+      onFacebookSyncStart?.(accountId, false);
       setAccountActionError(error.message || 'Không thể mở Chrome');
     } finally {
       setStartingId(null);

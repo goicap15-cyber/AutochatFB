@@ -16,6 +16,7 @@ import { sortDueReminders } from '../utils/reminderPresentation.js';
 export default function ConversationSidebar({
   threads = [], activeThreadId, onSelectThread,
   activeTab, onTabChange, searchQuery, onSearchChange, isConnected, onOpenSearch,
+  waitingCount = 0,
   accounts = [],
   inboxSources = [],
   leadStatuses = [],
@@ -37,6 +38,9 @@ export default function ConversationSidebar({
 
   const visibleThreads = threads.filter((thread) => {
     if (!matchesConversationFilters(thread, appliedFilters)) return false;
+    const isMessageRequest = ['MESSAGE_REQUEST_SPAM', 'MESSAGE_REQUEST_POSSIBLE'].includes(String(thread.inbox_folder || 'INBOX'));
+    if (activeTab === 'WAITING' && !isMessageRequest) return false;
+    if (activeTab !== 'WAITING' && isMessageRequest) return false;
     if (activeTab === 'ASSIGNED' && thread.status !== 'ASSIGNED') return false;
     if (activeTab === 'UNPROCESSED' && thread.status !== 'UNPROCESSED') return false;
     if (activeTab === 'COMPLETED' && thread.status !== 'COMPLETED') return false;
@@ -87,7 +91,7 @@ export default function ConversationSidebar({
             <button
               type="button"
               onClick={onBulkHistorySync}
-              disabled={!isConnected || bulkHistoryProgress?.status === 'running' || threads.length === 0}
+              disabled={!isConnected || bulkHistoryProgress?.status === 'running'}
               className="p-1.5 hover:bg-[var(--color-bg-hover)] rounded-full transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40"
               title="Đồng bộ tin nhắn tất cả"
               aria-label="Đồng bộ tin nhắn tất cả"
@@ -152,7 +156,7 @@ export default function ConversationSidebar({
           <Search size={16} className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--color-text-muted)] pointer-events-none" strokeWidth={1.75} />
         </div>
 
-        <ConversationFilters activeTab={activeTab} onTabChange={onTabChange} />
+        <ConversationFilters activeTab={activeTab} onTabChange={onTabChange} waitingCount={waitingCount} />
         {bulkHistoryProgress && (
           <div className="flex items-center justify-between rounded-lg bg-[var(--color-bg-surface)] px-2.5 py-1.5 text-[11px] text-[var(--color-text-muted)]">
             <span>

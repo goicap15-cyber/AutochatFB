@@ -72,6 +72,16 @@ if (existingAttachmentColumns.length > 0 && !existingAttachmentColumns.includes(
 }
 db.exec(initializationSql);
 
+// CREATE TABLE IF NOT EXISTS does not evolve an existing SQLite table. Keep
+// this additive compatibility guard independent from migration version state:
+// some long-lived databases can already contain higher/custom migration rows,
+// which would otherwise make MAX(version) skip the nickname migration.
+const contactColumns = db.prepare('PRAGMA table_info(contacts)').all().map((column) => column.name);
+if (!contactColumns.includes('nickname')) {
+  db.exec('ALTER TABLE contacts ADD COLUMN nickname TEXT;');
+  console.log('[DB] Added missing contacts.nickname column.');
+}
+
 // Initialize migrations table
 db.exec(`
   CREATE TABLE IF NOT EXISTS migrations (
@@ -706,6 +716,14 @@ const migrations = [
         CREATE INDEX IF NOT EXISTS idx_account_assignments_user ON account_user_assignments(user_id,account_id);
       `);
       console.log('[DB] Migration v30: Added enterprise membership and Facebook assignments.');
+    }
+  },
+  {
+    version: 53,
+    name: 'add_local_contact_nickname',
+    up: (db) => {
+      try { db.exec('ALTER TABLE contacts ADD COLUMN nickname TEXT;'); } catch (error) { }
+      console.log('[DB] Migration v53: Verified CRM-only contact nicknames.');
     }
   }
 ];

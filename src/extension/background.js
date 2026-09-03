@@ -21,6 +21,43 @@ async function blockFacebookNativeNotifications() {
 
 blockFacebookNativeNotifications();
 let ws = null;
+const pendingSetupRegistrationAccounts = new Set();
+
+function waitForPendingSetupCompletion(accountId, attempt = 0) {
+  const accountKey = String(accountId || '');
+  if (!accountKey || pendingSetupRegistrationAccounts.has(accountKey)) return;
+  pendingSetupRegistrationAccounts.add(accountKey);
+
+  const check = async () => {
+    try {
+      const tab = await getFacebookTab(accountKey);
+      if (!tab?.id) throw new Error('MESSENGER_TAB_NOT_READY');
+      await assertMessengerRecoveryDialogResolved(tab.id);
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => sessionStorage.removeItem('crm_pending_account_setup')
+      }).catch(() => {});
+      const reloadComplete = waitForTabComplete(tab.id, 15000);
+      await chrome.tabs.reload(tab.id);
+      await Promise.race([reloadComplete, delay(5000)]);
+      await delay(1000);
+      pendingSetupRegistrationAccounts.delete(accountKey);
+      sendToBackend('REGISTER_ACCOUNT', {
+        account_id: accountKey,
+        fb_dtsg: fb_dtsg || '',
+        pending_key: null
+      });
+      console.log(`[FB Engine] Setup/PIN completed; normal sync enabled for account=${accountKey}`);
+    } catch (_) {
+      pendingSetupRegistrationAccounts.delete(accountKey);
+      if (attempt < 120) {
+        setTimeout(() => waitForPendingSetupCompletion(accountKey, attempt + 1), 5000);
+      }
+    }
+  };
+
+  setTimeout(check, attempt === 0 ? 8000 : 0);
+}
 let fb_dtsg = null;
 const TRUSTED_SEND_ADAPTER_VERSION = "trusted-send-v1";
 let user_id = null;
@@ -89,6 +126,9 @@ async function checkFacebookCookiesAndRegister() {
     if (!chrome?.cookies) return;
     const cookie = await chrome.cookies.get({ url: 'https://www.facebook.com', name: 'c_user' });
     if (cookie && cookie.value) {
+      // Persist immediately: waiting for content.js lets Facebook redirects or
+      // a browser close leave the next launch at the one-tap Continue screen.
+      await persistFacebookSessionCookies();
       const newUserId = String(cookie.value).trim();
       if (newUserId && newUserId !== '0' && /^\d+$/.test(newUserId)) {
         const hadUser = Boolean(user_id);
@@ -123,6 +163,16 @@ if (chrome?.cookies?.onChanged) {
     if (changeInfo?.cookie?.name === 'c_user' && !changeInfo.removed && changeInfo.cookie.value) {
       console.log('[FB Engine] 🍪 c_user cookie changed/set:', changeInfo.cookie.value);
       checkFacebookCookiesAndRegister();
+    }
+  });
+}
+
+// xs may be written after c_user. Catch that second write too so both login
+// cookies are durable even when the setup page redirects immediately.
+if (chrome?.cookies?.onChanged) {
+  chrome.cookies.onChanged.addListener((changeInfo) => {
+    if (changeInfo?.cookie?.name === 'xs' && !changeInfo.removed && changeInfo.cookie.value) {
+      persistFacebookSessionCookies().catch(() => {});
     }
   });
 }
@@ -167,6 +217,7 @@ function connectWebSocket() {
       switch (message.type) {
         case 'REGISTER_ACCOUNT_ACK': {
           console.log('[FB Engine] ✅ Backend ACK đăng ký tài khoản thành công:', message.data);
+          const setupPendingKey = message.data?.pending_key || pending_key;
           pending_key = null;
           try {
             if (chrome?.storage?.local) {
@@ -178,6 +229,7 @@ function connectWebSocket() {
               });
             });
           } catch (e) {}
+          if (setupPendingKey && user_id) waitForPendingSetupCompletion(user_id);
           break;
         }
         case 'SEND_MESSAGE':
@@ -1975,18 +2027,43 @@ async function getBusinessSuiteTab(pageId) {
 // ── Đồng bộ danh sách threads từ sidebar Facebook ──────────────────────────
 // Yêu cầu content.js scrape DOM sidebar của facebook.com/messages
 let discoverySyncInFlight = false;
+let recoverySyncRetryTimer = null;
 
 function moveMessengerDiscoverySidebar(action = 'step') {
-  const links = [...document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"]')];
-  const candidates = new Map();
-  for (const link of links) {
-    let node = link.parentElement;
-    while (node && node !== document.body) {
-      if (node.scrollHeight > node.clientHeight + 40 && node.clientHeight > 180) candidates.set(node, (candidates.get(node) || 0) + 1);
-      node = node.parentElement;
+  // Strategy 1: Find container by navigation grid/gridcell/role or sidebar aria labels
+  let scroller = null;
+  const navContainer = null;
+  if (navContainer) {
+    const scrollables = [...navContainer.querySelectorAll('div')].filter(d => {
+      const style = window.getComputedStyle(d);
+      return (style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay' || d.scrollHeight > d.clientHeight + 10) && d.clientHeight > 150;
+    });
+    // Pick the one with largest scrollHeight or most children
+    if (scrollables.length > 0) {
+      scrollables.sort((a, b) => b.scrollHeight - a.scrollHeight);
+      scroller = scrollables[0];
     }
   }
-  const scroller = [...candidates.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+
+  // Strategy 2: Ancestors of conversation link anchors
+  if (!scroller) {
+    const links = [...document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"], a[href*="/messages/requests/t/"], a[href*="/messages/requests/spam/t/"], a[href*="/messages/spam/t/"]')];
+    const candidates = new Map();
+    for (const link of links) {
+      let node = link.parentElement;
+      while (node && node !== document.body) {
+        if (node.clientHeight > 150 && node.scrollHeight > node.clientHeight) {
+          candidates.set(node, (candidates.get(node) || 0) + 1);
+        }
+        node = node.parentElement;
+      }
+    }
+    scroller = [...candidates.entries()].sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].clientWidth - b[0].clientWidth;
+    })[0]?.[0] || null;
+  }
+
   if (!scroller) return { found: false, atEnd: true };
   if (!scroller.dataset.crmDiscoveryOriginalTop) scroller.dataset.crmDiscoveryOriginalTop = String(scroller.scrollTop || 0);
   if (action === 'restore') {
@@ -1995,15 +2072,19 @@ function moveMessengerDiscoverySidebar(action = 'step') {
     return { found: true, restored: true };
   }
   const before = scroller.scrollTop;
-  scroller.scrollTop = Math.min(scroller.scrollHeight, before + Math.max(240, scroller.clientHeight * 0.75));
+  const stepAmount = Math.max(300, Math.floor(scroller.clientHeight * 0.75));
+  scroller.scrollTo({ top: before + stepAmount, behavior: 'instant' });
   scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-  return { found: true, before, after: scroller.scrollTop, atEnd: scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 8 };
+  const after = scroller.scrollTop;
+  const atEnd = (after + scroller.clientHeight >= scroller.scrollHeight - 20) || (after === before && before > 0);
+  return { found: true, before, after, atEnd };
 }
 
 async function handleSync100Threads({ account_id }) {
   if (discoverySyncInFlight) {
     console.log(`[FB Engine] [DISCOVERY] Skip overlapping scan for account=${account_id}`);
-    sendToBackend('SYNC_THREADS_RESULT', { account_id, threads: [], reason: 'discovery_in_flight' });
+    // The original scan still owns the result. Sending an empty result here
+    // makes the backend mark the job complete while Requests is still running.
     return;
   }
   discoverySyncInFlight = true;
@@ -2012,12 +2093,66 @@ async function handleSync100Threads({ account_id }) {
   // Keep the existing Personal Messenger flow, but scrape open Business Suite
   // tabs independently as well. A Page thread must carry the asset_id of the
   // exact tab it came from even when a Personal Messenger tab is also open.
+  // Discovery must never scroll the operator's interaction/chat tab.
   const personalTab = await ensureRoleMessengerTab(account_id, 'discovery');
+  const recoveryDialogOpen = personalTab?.id ? await chrome.scripting.executeScript({
+    target: { tabId: personalTab.id },
+    func: () => {
+      const pattern = /kh\u00f4i ph\u1ee5c|restore (?:chat|message)|m\u00e3 pin|\bpin\b|secure storage/i;
+      return [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].some((dialog) => {
+        const rect = dialog.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const text = `${dialog.innerText || ''} ${dialog.getAttribute('aria-label') || ''}`;
+        return pattern.test(text) || Boolean(dialog.querySelector('input[type="password"], input[inputmode="numeric"], input[autocomplete="one-time-code"]'));
+      });
+    }
+  }).then((rows) => rows?.[0]?.result === true).catch(() => false) : false;
+
+  if (recoveryDialogOpen) {
+    console.log(`[FB Engine] [DISCOVERY] Pause account=${account_id}: Messenger PIN recovery is open`);
+    discoverySyncInFlight = false;
+    if (!recoverySyncRetryTimer) {
+      recoverySyncRetryTimer = setTimeout(() => {
+        recoverySyncRetryTimer = null;
+        handleSync100Threads({ account_id }).catch(() => {});
+      }, 5000);
+    }
+    return;
+  }
   const bizTabs = await new Promise((resolve) => {
     chrome.tabs.query({ url: ['*://business.facebook.com/*'] }, (tabs) => resolve(tabs || []));
   });
   const scrapeTargets = [];
-  if (personalTab?.id) scrapeTargets.push({ tab: personalTab, isBizTab: false, pageId: null });
+  let inboxTarget = null;
+  if (personalTab?.id) {
+    const inboxUrl = 'https://www.facebook.com/messages?crm_tab_role=discovery';
+    if (/\/messages\/(?:requests|spam)/i.test(String(personalTab.url || ''))) {
+      const load = waitForTabComplete(personalTab.id, 12000);
+      await chrome.tabs.update(personalTab.id, { url: inboxUrl });
+      await Promise.race([load, delay(4500)]);
+      await delay(1000);
+    }
+    inboxTarget = { tab: await chrome.tabs.get(personalTab.id).catch(() => personalTab), isBizTab: false, pageId: null, inboxFolder: 'INBOX' };
+  }
+
+  // Message requests use their own background tab, so scanning them cannot
+  // navigate or scroll the tab used for normal CRM chat/send/call actions.
+  const requestsTab = await ensureRoleMessengerTab(account_id, 'requests');
+  if (requestsTab?.id) {
+    const requestsUrl = 'https://www.facebook.com/messages/requests?crm_tab_role=requests';
+    if (!/\/messages\/requests(?:\/|$|\?)/i.test(String(requestsTab.url || ''))) {
+      const load = waitForTabComplete(requestsTab.id, 15000);
+      await chrome.tabs.update(requestsTab.id, { url: requestsUrl });
+      await Promise.race([load, delay(6000)]);
+      await delay(1400);
+    }
+    const settledRequestsTab = await chrome.tabs.get(requestsTab.id).catch(() => requestsTab);
+    scrapeTargets.push({ tab: settledRequestsTab, isBizTab: false, pageId: null, inboxFolder: 'MESSAGE_REQUEST_POSSIBLE', desiredUrl: requestsUrl, requestSection: 'possible' });
+    scrapeTargets.push({ tab: settledRequestsTab, isBizTab: false, pageId: null, inboxFolder: 'MESSAGE_REQUEST_SPAM', desiredUrl: requestsUrl, requestSection: 'spam' });
+  }
+  // Requests are independent and run first. Inbox discovery must not delay
+  // switching from an empty "You may know" section to Spam.
+  if (inboxTarget) scrapeTargets.push(inboxTarget);
   for (const bizTab of bizTabs) {
     if (!bizTab?.id) continue;
     const pageId = bizTab.url?.match(/[?&]asset_id=(\d+)/)?.[1] || null;
@@ -2039,21 +2174,126 @@ async function handleSync100Threads({ account_id }) {
         let scraped = [];
         if (target.isBizTab) {
           const results = await chrome.scripting.executeScript({ target: { tabId: target.tab.id }, func: scrapeBusinessSuiteSidebar });
-          scraped = results?.[0]?.result || [];
+          scraped = (results?.[0]?.result || []).map((t) => ({ ...t, inbox_folder: 'INBOX' }));
         } else {
+          if (target.desiredUrl) {
+            const current = await chrome.tabs.get(target.tab.id).catch(() => target.tab);
+            const desiredPath = new URL(target.desiredUrl).pathname;
+            let currentPath = '';
+            try { currentPath = new URL(String(current?.url || '')).pathname.replace(/\/$/, ''); } catch (_) {}
+            if (currentPath !== desiredPath.replace(/\/$/, '')) {
+              const load = waitForTabComplete(target.tab.id, 15000);
+              await chrome.tabs.update(target.tab.id, { url: target.desiredUrl });
+              await Promise.race([load, delay(6000)]);
+            }
+            const sectionSelected = await chrome.scripting.executeScript({
+              target: { tabId: target.tab.id },
+              func: (section) => {
+                const labels = section === 'spam'
+                  ? /^(?:Spam|Thư rác)$/i
+                  : /^(?:Có thể bạn biết|You may know)$/i;
+                const candidates = [...document.querySelectorAll('[role="tab"], [role="button"], button, [tabindex], span, div')]
+                  .filter((el) => labels.test(String(el.textContent || '').trim()))
+                  .filter((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0 && rect.left < 460 && rect.top < 420;
+                  })
+                  .sort((a, b) => {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    return (ar.width * ar.height) - (br.width * br.height);
+                  });
+                const label = candidates[0];
+                if (!label) return false;
+                const control = label.closest('[role="tab"], [role="button"], button, [tabindex]') || label;
+                control.click();
+                return true;
+              },
+              args: [target.requestSection]
+            }).then((rows) => rows?.[0]?.result === true).catch(() => false);
+            if (!sectionSelected) {
+              console.warn(`[FB Engine] [REQUESTS] Cannot select section=${target.requestSection}`);
+              continue;
+            }
+            await delay(1200);
+            // Wait for both the request URL and its React surface. Merely
+            // waiting for navigation lets the previous Inbox DOM be scraped
+            // during the transition and labels normal chats as requests.
+            let requestSurfaceReady = false;
+            for (let readinessAttempt = 0; readinessAttempt < 60; readinessAttempt += 1) {
+              requestSurfaceReady = await chrome.scripting.executeScript({
+                target: { tabId: target.tab.id },
+                func: () => {
+                  const path = location.pathname.replace(/\/$/, '');
+                  const heading = String(document.body?.innerText || '').slice(0, 4000);
+                  const hasRequestHeading = /Tin nh.n (?:.ang )?ch.|Message requests/i.test(heading);
+                  return path === '/messages/requests' && hasRequestHeading;
+                }
+              }).then((rows) => rows?.[0]?.result === true).catch(() => false);
+              if (requestSurfaceReady) break;
+              await delay(750);
+            }
+            if (!requestSurfaceReady) {
+              console.warn(`[FB Engine] [REQUESTS] Skip tab=${target.tab.id}: request surface not ready`);
+              continue;
+            }
+          }
           const discovered = new Map();
           let roundsWithoutNew = 0;
           for (let round = 0; round < 60 && discovered.size < 500; round += 1) {
             const results = await chrome.scripting.executeScript({ target: { tabId: target.tab.id }, func: scrapeFacebookSidebar });
             const visible = results?.[0]?.result || [];
+            if (round === 0 && target.requestSection && visible.length === 0) {
+              console.log(`[FB Engine] [REQUESTS] section=${target.requestSection} empty; continue immediately`);
+              break;
+            }
             const beforeCount = discovered.size;
-            for (const thread of visible) discovered.set(String(thread.thread_id), thread);
+            const newBatch = [];
+            for (const thread of visible) {
+              const key = String(thread.thread_id);
+              if (!discovered.has(key)) {
+                const item = { ...thread, inbox_folder: target.inboxFolder || 'INBOX' };
+                discovered.set(key, item);
+                newBatch.push(item);
+              }
+            }
+            // Send new threads immediately to backend so CRM UI updates live
+            // Stream Inbox for fast UI feedback. Requests are held until the
+            // final cross-folder dedupe so a stale request surface can never
+            // temporarily move normal conversations into the waiting tab.
+            if (newBatch.length > 0 && (target.inboxFolder || 'INBOX') === 'INBOX') {
+              sendToBackend('SYNC_THREADS_RESULT', {
+                account_id,
+                partial: true,
+                threads: newBatch.map((t) => ({
+                  id: t.thread_id,
+                  thread_id: t.thread_id,
+                  contact_name: t.name || t.contact_name,
+                  last_message: t.last_message,
+                  is_unread: t.is_unread,
+                  avatar_url: t.avatar_url || null,
+                  avatar_base64: t.avatar_base64 || null,
+                  thread_url: t.thread_url || null,
+                  is_e2ee: !!t.is_e2ee,
+                  page_id: null,
+                  source_type: 'personal_messenger',
+                  inbox_folder: target.inboxFolder || 'INBOX'
+                }))
+              });
+            }
             roundsWithoutNew = discovered.size === beforeCount ? roundsWithoutNew + 1 : 0;
-            console.log(`[FB Engine] [DISCOVERY] account=${account_id} round=${round + 1} total=${discovered.size} visible=${visible.length}`);
-            if (roundsWithoutNew >= 5) break;
+            console.log('[FB Engine] [DISCOVERY] account=' + account_id + ' round=' + (round + 1) + ' total=' + discovered.size + ' visible=' + visible.length);
+            // Messenger virtualizes the list and often pauses at the bottom of
+            // the currently loaded chunk. Give it several load windows before
+            // deciding that the real end has been reached.
+            if (roundsWithoutNew >= 8) break;
             const move = await chrome.scripting.executeScript({ target: { tabId: target.tab.id }, func: moveMessengerDiscoverySidebar, args: ['step'] });
-            if (move?.[0]?.result?.atEnd && roundsWithoutNew >= 2) break;
-            await delay(850);
+            const moveState = move?.[0]?.result || {};
+            // At the real bottom, allow three lazy-load windows and then move
+            // to the requests phase. Previously it waited eight identical
+            // bottom rounds, which looked like an endless re-scroll.
+            if (moveState.atEnd && roundsWithoutNew >= 3) break;
+            await delay(moveState.atEnd ? 1800 : 850);
           }
           scraped = [...discovered.values()];
           await chrome.scripting.executeScript({ target: { tabId: target.tab.id }, func: moveMessengerDiscoverySidebar, args: ['restore'] }).catch(() => {});
@@ -2071,28 +2311,47 @@ async function handleSync100Threads({ account_id }) {
       }
     }
 
-    const processedThreads = await Promise.all(collectedThreads.map(async (t) => {
-      let avatarBase64 = t.avatar_base64 || null;
-      if (!avatarBase64 && t.avatar_url && t.avatar_url.startsWith('http')) {
-        try {
-          const res = await fetch(t.avatar_url, { credentials: 'include' });
-          if (res.ok) {
-            const buffer = await res.arrayBuffer();
-            const bytes = new Uint8Array(buffer);
-            let binary = '';
-            const chunkSize = 8192;
-            for (let i = 0; i < bytes.length; i += chunkSize) {
-              binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-            }
-            const base64 = btoa(binary);
-            const contentType = res.headers.get('content-type') || 'image/jpeg';
-            avatarBase64 = `data:${contentType};base64,${base64}`;
-          }
-        } catch (e) {}
+    // Process avatar downloads in fast parallel batches with timeout
+    const fetchAvatarBase64 = async (url) => {
+      if (!url || !url.startsWith('http')) return null;
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch(url, { credentials: 'include', signal: controller.signal });
+        clearTimeout(timer);
+        if (!res.ok) return null;
+        const buffer = await res.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        const contentType = res.headers.get('content-type') || 'image/jpeg';
+        return `data:${contentType};base64,${btoa(binary)}`;
+      } catch (e) {
+        return null;
       }
+    };
+
+    // A transient/stale Requests DOM can expose rows from the previous Inbox
+    // surface. If the same thread was positively observed in Inbox during this
+    // job, Inbox is authoritative and must never be overwritten by Requests.
+    const threadsByIdentity = new Map();
+    for (const thread of collectedThreads) {
+      const identity = `${thread.source_type || 'personal_messenger'}:${thread.page_id || ''}:${String(thread.thread_id)}`;
+      const existing = threadsByIdentity.get(identity);
+      if (!existing || (existing.inbox_folder !== 'INBOX' && thread.inbox_folder === 'INBOX')) {
+        threadsByIdentity.set(identity, thread);
+      }
+    }
+
+    const processedThreads = await Promise.all([...threadsByIdentity.values()].map(async (t) => {
+      const avatarBase64 = t.avatar_base64 || (await fetchAvatarBase64(t.avatar_url));
       return {
+        id: t.thread_id,
         thread_id: t.thread_id,
-        contact_name: t.name,
+        contact_name: t.name || t.contact_name,
         last_message: t.last_message,
         is_unread: t.is_unread,
         avatar_url: t.avatar_url,
@@ -2100,7 +2359,8 @@ async function handleSync100Threads({ account_id }) {
         thread_url: t.thread_url || null,
         is_e2ee: !!t.is_e2ee,
         page_id: t.page_id || null,
-        source_type: t.source_type
+        source_type: t.source_type,
+        inbox_folder: t.inbox_folder || 'INBOX'
       };
     }));
 
@@ -2258,12 +2518,12 @@ function scrapeFacebookSidebar() {
   };
 
   // Tìm các thread item trong sidebar Messenger (bao gồm cả E2EE /messages/e2ee/t/ và chuẩn /messages/t/)
-  const links = document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"], a[href*="/messages/"], div[role="row"] a, div[role="listitem"] a');
+  const links = document.querySelectorAll('a[href*="/messages/t/"], a[href*="/messages/e2ee/t/"], a[href*="/messages/requests/t/"], a[href*="/messages/requests/spam/t/"], a[href*="/messages/spam/t/"], a[href*="/messages/"], div[role="row"] a, div[role="listitem"] a');
 
   for (const link of links) {
     try {
       const href = link.getAttribute('href') || '';
-      const threadIdMatch = href.match(/\/messages\/(?:e2ee\/)?t\/([^\/?#]+)/) || href.match(/\/messages\/t\/([^\/?#]+)/);
+      const threadIdMatch = href.match(/\/messages\/(?:(?:requests(?:\/spam)?|spam)\/)?(?:e2ee\/)?t\/([^\/?#]+)/);
       if (!threadIdMatch) continue;
 
       const thread_id = decodeURIComponent(threadIdMatch[1]);
@@ -2346,7 +2606,7 @@ function scrapeFacebookSidebar() {
         avatar_url,
         avatar_base64,
         thread_url,
-        is_e2ee: /\/messages\/e2ee\/t\//.test(thread_url)
+        is_e2ee: /\/messages\/(?:(?:requests(?:\/spam)?|spam)\/)?e2ee\/t\//.test(thread_url)
       });
 
       if (threads.length >= 100) break;

@@ -44,22 +44,21 @@ export default function IncomingCallModal({ callInfo, onClose, onSelectThread, o
     setResultMsg('');
     setResultOk(null);
 
-    if (callInfo.thread_id) {
-      onSelectThread?.(callInfo.thread_id);
+    if (onAnswerCall) {
+      onAnswerCall('accept', callInfo.thread_id || callInfo.external_thread_id, (ok, msg) => {
+        setPendingAction(null);
+        setResultOk(ok);
+        setResultMsg(msg || (ok ? 'Đã chấp nhận cuộc gọi' : 'Không thể chấp nhận, hãy bấm trực tiếp trên Messenger'));
+        if (ok && callInfo.thread_id) onSelectThread?.(callInfo.thread_id);
+        setTimeout(() => onClose?.(), ok ? 800 : 2500);
+      }, callInfo.source_tab_id);
+    } else {
+      if (callInfo.thread_id) onSelectThread?.(callInfo.thread_id);
+      setTimeout(() => {
+        setPendingAction(null);
+        onClose?.();
+      }, 1000);
     }
-
-    onAnswerCall?.('accept', callInfo.thread_id || callInfo.external_thread_id, (ok, msg) => {
-      setPendingAction(null);
-      setResultOk(ok);
-      setResultMsg(msg || (ok ? 'Đã chấp nhận cuộc gọi' : 'Không thể chấp nhận, hãy bấm trực tiếp trên Messenger'));
-      if (ok) setTimeout(() => onClose?.(), 1200);
-    });
-
-    // If no callback — just close after a moment
-    setTimeout(() => {
-      setPendingAction(null);
-      onClose?.();
-    }, 1500);
   };
 
   const handleDecline = (e) => {
@@ -69,21 +68,19 @@ export default function IncomingCallModal({ callInfo, onClose, onSelectThread, o
     setResultMsg('');
     setResultOk(null);
 
-    onAnswerCall?.('decline', callInfo.thread_id || callInfo.external_thread_id, (ok, msg) => {
-      setPendingAction(null);
-      setResultOk(ok);
-      setResultMsg(msg || (ok ? 'Đã từ chối cuộc gọi' : 'Không thể từ chối tự động — hãy bấm trực tiếp trên Messenger'));
-      // Close after showing result
-      setTimeout(() => onClose?.(), ok ? 1000 : 3000);
-    });
-
-    // If no callback — show feedback and close
-    setTimeout(() => {
-      setPendingAction(null);
-      setResultOk(false);
-      setResultMsg('Đã gửi lệnh từ chối đến Extension. Nếu cuộc gọi vẫn reo, hãy bấm từ chối trực tiếp trên tab Messenger.');
-      setTimeout(() => onClose?.(), 3000);
-    }, 1500);
+    if (onAnswerCall) {
+      onAnswerCall('decline', callInfo.thread_id || callInfo.external_thread_id, (ok, msg) => {
+        setPendingAction(null);
+        setResultOk(ok);
+        setResultMsg(msg || (ok ? 'Đã từ chối cuộc gọi' : 'Không thể từ chối tự động — hãy bấm trực tiếp trên Messenger'));
+        setTimeout(() => onClose?.(), ok ? 800 : 2500);
+      }, callInfo.source_tab_id);
+    } else {
+      setTimeout(() => {
+        setPendingAction(null);
+        onClose?.();
+      }, 1000);
+    }
   };
 
   const handleClose = (e) => {

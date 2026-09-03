@@ -146,7 +146,8 @@ app.use('/api', (req, res, next) => {
   const unauthenticatedPaymentPaths = [
     '/payment/sepay-webhook',
     '/orders/create',
-    '/orders/status'
+    '/orders/status',
+    '/extension/reload'
   ];
   if (unauthenticatedPaymentPaths.some((pathPrefix) => req.path.startsWith(pathPrefix))) return next();
   return requireAuthenticatedApi(req, res, next);
@@ -676,7 +677,12 @@ wss.on('connection', (ws, req) => {
               last_broadcast_date = DATE('now')
           `).run(account_id, accName, profileDir, ownerUserId || null,
             ownerUserId ? db.prepare('SELECT company_id FROM users WHERE id=?').get(ownerUserId)?.company_id || ownerUserId : null);
-          if (pending_key) pendingAccountOwners.delete(String(pending_key));
+          if (pending_key) {
+            pendingAccountOwners.delete(String(pending_key));
+            try {
+              fs.unlinkSync(path.join(APP_DATA_ROOT, 'profiles', String(pending_key), '.crm-pending-owner.json'));
+            } catch (_) {}
+          }
 
           console.log(`[WS] REGISTER_ACCOUNT thành công: account_id=${account_id}, profile_dir=${profileDir}`);
           try {
@@ -1499,14 +1505,17 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'SYNC_THREADS_RESULT': {
-          const { account_id, threads } = msg.data;
+          const { account_id, threads, partial } = msg.data;
           console.log(`[WS] Nhận ${threads?.length || 0} threads từ extension tài khoản: ${account_id}`);
-          InboxSyncScheduler.markSidebarResult(account_id, threads?.length || 0);
+          // Progressive UI batches are not the end of the combined Inbox +
+          // Requests scan. Only its final aggregate frame releases inFlight.
+          if (partial !== true) InboxSyncScheduler.markSidebarResult(account_id, threads?.length || 0);
           domReplaySuppressUntil.set(account_id, Date.now() + 5000);
           if (threads?.length) {
             const txn = db.transaction((account_id, threads) => {
               for (const t of threads) {
-                const threadId = String(t.thread_id);
+                const threadId = String(t.id || t.thread_id || '');
+                if (!threadId) continue;
                 let name = cleanContactName(t.name || t.contact_name, null);
                 if (!name || isInvalidContactName(name)) {
                   const existing = db.prepare('SELECT contact_name FROM threads WHERE id = ?').get(threadId);
@@ -1543,7 +1552,8 @@ wss.on('connection', (ws, req) => {
                   thread_url: t.thread_url || null,
                   contact_name: name,
                   last_message: cleanLastMsg,
-                  is_unread: t.is_unread
+                  is_unread: t.is_unread,
+                  inbox_folder: t.inbox_folder || null
                 });
 
                 // Auto-bind Page source nếu thread đến từ Business Suite
@@ -2362,6 +2372,19 @@ app.post('/api/accounts/:id/stop', (req, res) => {
   const stopped = processManager.stopAccountProcess(req.params.id);
   res.json({ success: true, stopped });
 });
+app.post('/api/extension/reload', (req, res) => {
+  let count = 0;
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) {
+      try {
+        client.send(JSON.stringify({ type: 'RELOAD_EXTENSION' }));
+        count++;
+      } catch (_) {}
+    }
+  });
+  console.log(`[WS] 🔄 Đã gửi tín hiệu RELOAD_EXTENSION tới ${count} kết nối Extension WebSocket.`);
+  res.json({ success: true, reloaded: count });
+});
 app.post('/api/accounts/:id/open', (req, res) => {
   if (!enterpriseAccess.canAccessAccount(req.user, req.params.id)) {
     return res.status(404).json({ success: false, error: 'Không tìm thấy tài khoản Facebook' });
@@ -2386,11 +2409,61 @@ app.post('/api/accounts/new-session', async (req, res) => {
   if (!enterpriseAccess.isCompanyAdmin(req.user) && !(req.user.role === 'ADMIN' && req.user.username === 'admin')) {
     return res.status(403).json({ success: false, error: 'Chỉ Admin doanh nghiệp được thêm tài khoản Facebook.' });
   }
+  // Reuse this operator's unfinished login window. A new pending profile on
+  // every click loses Facebook's device cookies, makes each retry look like a
+  // new browser, and leaves several heavy Chrome processes alive.
+  for (const [existingPendingKey, ownerUserId] of pendingAccountOwners.entries()) {
+    if (String(ownerUserId) !== String(req.user.id)) continue;
+    if (processManager.getStatus(existingPendingKey) !== 'RUNNING') {
+      pendingAccountOwners.delete(existingPendingKey);
+      continue;
+    }
+    processManager.unhideWindow(existingPendingKey);
+    console.log(`[API] Reuse unfinished Facebook login session: ${existingPendingKey}`);
+    return res.json({ success: true, pending_key: existingPendingKey, reused: true });
+  }
+  // Recover an unfinished login owned by this operator after a backend
+  // restart. Without this durable marker every click created another cold
+  // Chrome profile, losing Facebook device trust/cache and making login slow.
+  const profilesRoot = path.join(APP_DATA_ROOT, 'profiles');
+  try {
+    const reusable = fs.readdirSync(profilesRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith('pending_'))
+      .map((entry) => {
+        const markerPath = path.join(profilesRoot, entry.name, '.crm-pending-owner.json');
+        try {
+          const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+          const stat = fs.statSync(markerPath);
+          return String(marker.owner_user_id) === String(req.user.id)
+            ? { pendingKey: entry.name, modifiedMs: stat.mtimeMs }
+            : null;
+        } catch (_) { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.modifiedMs - a.modifiedMs)[0];
+    if (reusable) {
+      pendingAccountOwners.set(reusable.pendingKey, req.user.id);
+      const success = await processManager.startNewAccountProcess(reusable.pendingKey);
+      if (success) {
+        console.log(`[API] Recovered unfinished Facebook login profile: ${reusable.pendingKey}`);
+        return res.json({ success: true, pending_key: reusable.pendingKey, reused: true });
+      }
+      pendingAccountOwners.delete(reusable.pendingKey);
+    }
+  } catch (_) {}
+
   const now = new Date();
   const dateStr = now.toISOString().replace(/[-T:.Z]/g, '').substring(0, 14);
   const randomStr = Math.random().toString(36).substring(2, 7);
   const pendingKey = `pending_${dateStr}_${randomStr}`;
   pendingAccountOwners.set(pendingKey, req.user.id);
+
+  const pendingProfileDir = path.join(APP_DATA_ROOT, 'profiles', pendingKey);
+  fs.mkdirSync(pendingProfileDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(pendingProfileDir, '.crm-pending-owner.json'),
+    JSON.stringify({ owner_user_id: req.user.id, created_at: new Date().toISOString() })
+  );
 
   console.log(`[API] Tạo phiên đăng ký tài khoản Facebook mới: ${pendingKey}`);
   const success = await processManager.startNewAccountProcess(pendingKey);
@@ -2432,6 +2505,20 @@ app.delete('/api/accounts/:id', (req, res) => {
 });
 
 // Threads
+app.get('/api/threads/waiting-count', (req, res) => {
+  try {
+    const row = db.prepare(`
+      SELECT COUNT(*) as count FROM threads t
+      JOIN accounts a ON a.id = t.account_id
+      WHERE COALESCE(t.inbox_folder, 'INBOX') IN ('MESSAGE_REQUEST_SPAM', 'MESSAGE_REQUEST_POSSIBLE')
+      AND t.archived_at IS NULL
+    `).get();
+    res.json({ count: row?.count || 0 });
+  } catch (error) {
+    res.json({ count: 0 });
+  }
+});
+
 app.get('/api/threads', (req, res) => {
   const { tab = 'ALL' } = req.query;
   const threads = assignmentManager.getThreadsByFilter(req.user.id, req.user.role, tab, 'all', req.user.company_id, req.user.company_role, req.user.username);

@@ -2,7 +2,9 @@ class InboxSyncScheduler {
   constructor({
     sidebarIntervalMs = 60000,
     sidebarCooldownMs = 2500,
-    sidebarTimeoutMs = 70000,
+    // One sidebar job now scans Inbox and Message Requests sequentially in
+    // separate tabs. Facebook lazy loading can legitimately exceed 70s.
+    sidebarTimeoutMs = 180000,
     threadCooldownMs = 2000,
     threadTimeoutMs = 20000
   } = {}) {

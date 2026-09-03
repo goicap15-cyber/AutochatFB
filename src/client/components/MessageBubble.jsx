@@ -32,6 +32,7 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
   const lowerContent = content.toLowerCase();
   const isCallMessage = Boolean(
     msg.media_type === 'call' ||
+    (msg.fb_message_id && String(msg.fb_message_id).startsWith('call_')) ||
     lowerContent.includes('cuộc gọi') ||
     lowerContent.includes('gọi thoại') ||
     lowerContent.includes('bỏ lỡ cuộc gọi')

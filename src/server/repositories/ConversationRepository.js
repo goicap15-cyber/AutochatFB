@@ -36,10 +36,13 @@ function shouldCommitDirectionFlip(stableMessageId, existingIsOutgoing, proposed
 
 class ConversationRepository {
   static upsertThread(threadData, database = getDefaultDb()) {
-    const { id, account_id, thread_url, contact_name, last_message, is_unread, source_id } = threadData;
+    const { id, account_id, thread_url, contact_name, last_message, is_unread, source_id, inbox_folder } = threadData;
     const external_thread_id = String(threadData.external_thread_id || threadData.thread_id || id);
     const preferredId = String(id || external_thread_id);
     const cleanIncomingName = isInvalidContactName(contact_name) ? null : contact_name.trim();
+    const normalizedInboxFolder = ['INBOX', 'MESSAGE_REQUEST_SPAM', 'MESSAGE_REQUEST_POSSIBLE'].includes(String(inbox_folder || '').trim())
+      ? String(inbox_folder).trim()
+      : null;
 
     let existing = null;
     if (source_id && external_thread_id) {
@@ -74,7 +77,8 @@ class ConversationRepository {
             contact_name = ?,
             thread_url = COALESCE(?, thread_url),
             last_message = COALESCE(?, last_message),
-            is_unread = COALESCE(?, is_unread)
+            is_unread = COALESCE(?, is_unread),
+            inbox_folder = COALESCE(?, inbox_folder)
         WHERE id = ?
       `).run(
           external_thread_id, 
@@ -83,15 +87,16 @@ class ConversationRepository {
           thread_url, 
           last_message, 
           is_unread === undefined ? null : (is_unread ? 1 : 0), 
+          normalizedInboxFolder,
           existing.id
       );
       return this.getThread(existing.id, database);
     }
 
     database.prepare(`
-      INSERT INTO threads (id, external_thread_id, account_id, source_id, thread_url, contact_name, last_message, is_unread)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(preferredId, external_thread_id, account_id, source_id || null, thread_url, cleanIncomingName || 'Khách hàng', last_message, is_unread === undefined ? 1 : (is_unread ? 1 : 0));
+      INSERT INTO threads (id, external_thread_id, account_id, source_id, thread_url, contact_name, last_message, is_unread, inbox_folder)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(preferredId, external_thread_id, account_id, source_id || null, thread_url, cleanIncomingName || 'Khách hàng', last_message, is_unread === undefined ? 1 : (is_unread ? 1 : 0), normalizedInboxFolder || 'INBOX');
     return this.getThread(preferredId, database);
   }
 

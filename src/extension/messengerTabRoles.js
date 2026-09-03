@@ -1,5 +1,5 @@
 (function initMessengerTabRoles(root) {
-  const PERSONAL_ROLES = ['interaction', 'discovery', 'history'];
+  const PERSONAL_ROLES = ['interaction', 'discovery', 'history', 'requests'];
 
   function roleKey(accountId, role) {
     if (!PERSONAL_ROLES.includes(role)) throw new Error(`Unknown Messenger tab role: ${role}`);
@@ -18,6 +18,7 @@
       if (key === legacyInteractionKey(accountId) || key === roleKey(accountId, 'interaction')) return 'interaction';
       if (key === roleKey(accountId, 'discovery')) return 'discovery';
       if (key === roleKey(accountId, 'history')) return 'history';
+      if (key === roleKey(accountId, 'requests')) return 'requests';
     }
     return null;
   }

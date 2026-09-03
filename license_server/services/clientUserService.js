@@ -66,10 +66,22 @@ function login(input) {
 function list() {
   return db.prepare(`
     SELECT u.id,u.username,u.status,u.created_at,u.last_login_at,u.last_machine_id,u.updated_at,
+      COALESCE(u.company_role, 'ADMIN') AS company_role,
+      u.company_admin_id,
       l.key_value AS license_key,l.company_name,l.months AS package_months,l.expires_at AS package_expires_at,
-      CASE WHEN l.id IS NOT NULL AND l.is_active=1 AND datetime(l.expires_at)>datetime('now') THEN 'ACTIVE' ELSE 'NONE' END AS package_status
+      CASE WHEN l.id IS NOT NULL AND l.is_active=1 AND datetime(l.expires_at)>datetime('now') THEN 'ACTIVE' ELSE 'NONE' END AS package_status,
+      COUNT(e.id) AS member_count,
+      GROUP_CONCAT(e.username, ', ') AS member_usernames
     FROM client_users u
     LEFT JOIN licenses l ON l.id=u.license_id
+    LEFT JOIN client_users e
+      ON e.company_admin_id = u.id
+     AND COALESCE(e.company_role, 'ADMIN') = 'EMPLOYEE'
+    WHERE COALESCE(u.company_role, 'ADMIN') = 'ADMIN'
+    GROUP BY
+      u.id,u.username,u.status,u.created_at,u.last_login_at,u.last_machine_id,u.updated_at,
+      u.company_role,u.company_admin_id,
+      l.key_value,l.company_name,l.months,l.expires_at,l.id,l.is_active
     ORDER BY u.id DESC
   `).all();
 }

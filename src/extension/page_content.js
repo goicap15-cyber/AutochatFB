@@ -6,7 +6,9 @@
 const isBusiness = window.location.hostname.includes('business.facebook.com')
     || window.location.href.includes('asset_id=')
     || window.location.href.includes('/biz/')
-    || (window.top !== window.self && window.location.hostname.includes('facebook.com'));
+    || (window.top !== window.self
+        && window.location.hostname.includes('facebook.com')
+        && document.referrer.includes('business.facebook.com'));
 
 if (isBusiness) {
     console.log(`[PageContent] Business Suite Inbox DOM observer started in ${window.top === window.self ? 'TOP FRAME' : 'IFRAME'}: ${window.location.href}`);
