@@ -742,7 +742,6 @@ const migrations = [
     version: 55,
     name: 'allow_call_media_type_in_messages',
     up: (db) => {
-      db.pragma('foreign_keys = OFF');
       db.exec(`
         CREATE TABLE messages_v55 (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -825,7 +824,6 @@ const migrations = [
           WHERE id = new.id;
         END;
       `);
-      db.pragma('foreign_keys = ON');
       console.log('[DB] Migration v55: Rebuilt messages table to allow media_type="call".');
     }
   }
@@ -853,7 +851,12 @@ function runMigrations() {
     });
 
     try {
+      db.pragma('foreign_keys = OFF');
       migrate(pending);
+    } finally {
+      db.pragma('foreign_keys = ON');
+    }
+    try {
       console.log('[DB] Migrations applied successfully.');
 
       // Integrity check
