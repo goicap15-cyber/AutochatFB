@@ -6,6 +6,9 @@ CREATE TABLE IF NOT EXISTS users (
     role TEXT CHECK(role IN ('ADMIN', 'STAFF')) NOT NULL DEFAULT 'STAFF',
     company_id INTEGER,
     company_role TEXT NOT NULL DEFAULT 'ADMIN' CHECK(company_role IN ('ADMIN', 'EMPLOYEE')),
+    google_id TEXT,
+    email TEXT,
+    avatar_url TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -1,10 +1,11 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const crypto = require('crypto');
 const licenseService = require('./services/licenseService');
 const clientUserService = require('./services/clientUserService');
+const registrationOtpService = require('./services/registrationOtpService');
 
 const app = express();
 const PORT = process.env.PORT || 5055;
@@ -35,9 +36,52 @@ app.post('/api/admin/login', (req, res) => {
   res.json({ success: true, token });
 });
 
+app.post('/api/client-auth/register-otp', async (req, res) => {
+  try {
+    const result = await registrationOtpService.send(req.body?.email);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) {
+    console.error('[Registration OTP]', error);
+    res.status(error.code === 'OTP_MAIL_NOT_CONFIGURED' ? 503 : 500).json({ success: false, code: error.code || 'OTP_SEND_FAILED', message: error.message || 'Không thể gửi mã OTP.' });
+  }
+});
+
+app.post('/api/client-auth/reset-password-otp', async (req, res) => {
+  try {
+    const email = registrationOtpService.normalizeGmail(req.body?.email);
+    if (!email) return res.status(400).json({ success: false, code: 'INVALID_GMAIL', message: 'Vui lòng nhập địa chỉ @gmail.com hợp lệ.' });
+    const userCheck = clientUserService.accountStatus({ username: email });
+    if (!userCheck.success) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'Email này chưa được đăng ký trong hệ thống.' });
+    }
+    const result = await registrationOtpService.send(email);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) {
+    console.error('[Reset Password OTP]', error);
+    res.status(error.code === 'OTP_MAIL_NOT_CONFIGURED' ? 503 : 500).json({ success: false, code: error.code || 'OTP_SEND_FAILED', message: error.message || 'Không thể gửi mã OTP.' });
+  }
+});
+
+app.post('/api/client-auth/reset-password', (req, res) => {
+  try {
+    const email = registrationOtpService.normalizeGmail(req.body?.email || req.body?.username);
+    const verified = registrationOtpService.verify(email, req.body?.otp);
+    if (!verified.success) return res.status(verified.status || 400).json(verified);
+    const result = clientUserService.resetPasswordByOtp({ ...req.body, email });
+    if (result.success) registrationOtpService.verify(email, req.body?.otp, true);
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, code: 'AUTH_SERVER_ERROR', message: 'Không thể đặt lại mật khẩu.' });
+  }
+});
+
 app.post('/api/client-auth/register', (req, res) => {
   try {
-    const result = clientUserService.register(req.body);
+    const email = registrationOtpService.normalizeGmail(req.body?.email || req.body?.username);
+    const verified = registrationOtpService.verify(email, req.body?.otp);
+    if (!verified.success) return res.status(verified.status || 400).json(verified);
+    const result = clientUserService.register({ ...req.body, username: email, email });
+    if (result.success) registrationOtpService.verify(email, req.body?.otp, true);
     res.status(result.success ? 201 : result.status || 400).json(result);
   } catch (error) { res.status(500).json({ success: false, code: 'AUTH_SERVER_ERROR', message: 'Không thể đăng ký tài khoản.' }); }
 });
@@ -47,6 +91,16 @@ app.post('/api/client-auth/login', (req, res) => {
     const result = clientUserService.login(req.body);
     res.status(result.success ? 200 : result.status || 400).json(result);
   } catch (error) { res.status(500).json({ success: false, code: 'AUTH_SERVER_ERROR', message: 'Không thể đăng nhập tài khoản.' }); }
+});
+
+app.post('/api/client-auth/google', async (req, res) => {
+  try {
+    const result = await clientUserService.loginGoogle(req.body || {});
+    res.status(result.success ? 200 : result.status || 400).json(result);
+  } catch (error) {
+    console.error('[Google Auth]', error);
+    res.status(500).json({ success: false, code: 'GOOGLE_AUTH_SERVER_ERROR', message: 'Không thể đăng nhập bằng Google.' });
+  }
 });
 
 app.post('/api/client-auth/license-status', (req, res) => {

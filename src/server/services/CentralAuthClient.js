@@ -30,7 +30,11 @@ class CentralAuthClient {
   }
 
   register(credentials) { return this.request('/api/client-auth/register', credentials); }
+  requestRegistrationOtp(email) { return this.request('/api/client-auth/register-otp', { email }); }
+  requestResetPasswordOtp(email) { return this.request('/api/client-auth/reset-password-otp', { email }); }
+  resetPassword(data) { return this.request('/api/client-auth/reset-password', data); }
   login(credentials) { return this.request('/api/client-auth/login', credentials); }
+  google(credential) { return this.request('/api/client-auth/google', { credential }); }
   accountStatus(username) { return this.request('/api/client-auth/account-status', { username }); }
 }
 

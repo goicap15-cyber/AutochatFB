@@ -35,7 +35,15 @@ export default function MessageBubble({ msg, activeThread, onRetry }) {
     (msg.fb_message_id && String(msg.fb_message_id).startsWith('call_')) ||
     lowerContent.includes('cuộc gọi') ||
     lowerContent.includes('gọi thoại') ||
-    lowerContent.includes('bỏ lỡ cuộc gọi')
+    lowerContent.includes('bỏ lỡ cuộc gọi') ||
+    lowerContent.includes('nhỡ cuộc') ||
+    lowerContent.includes('audio call') ||
+    lowerContent.includes('video call') ||
+    lowerContent.includes('missed call') ||
+    lowerContent.includes('missed audio') ||
+    lowerContent.includes('missed video') ||
+    lowerContent.includes('call ended') ||
+    /\bcall\b/.test(lowerContent)
   );
   const isMissedCall = lowerContent.includes('bỏ lỡ') || lowerContent.includes('nhỡ') || lowerContent.includes('missed');
   const isVideoCall = lowerContent.includes('video');

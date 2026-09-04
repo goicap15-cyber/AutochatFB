@@ -17,9 +17,14 @@ test('legacy personal key remains the interaction role', () => {
   assert.equal(Roles.roleForTab([['personal:a1', 7]], 'a1', 7), 'interaction');
 });
 
-test('only interaction can forward realtime and call events', () => {
+test('only interaction forwards messages; discovery may forward mirrored calls', () => {
   assert.equal(Roles.canForwardRealtime('interaction'), true);
   assert.equal(Roles.canForwardRealtime('discovery'), false);
   assert.equal(Roles.canForwardRealtime('history'), false);
   assert.equal(Roles.canForwardRealtime(null), false);
+  assert.equal(Roles.canForwardCallRealtime('interaction'), true);
+  assert.equal(Roles.canForwardCallRealtime('discovery'), true);
+  assert.equal(Roles.canForwardCallRealtime('history'), false);
+  assert.equal(Roles.canForwardCallRealtime('requests'), false);
+  assert.equal(Roles.canForwardCallRealtime(null), false);
 });

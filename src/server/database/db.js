@@ -725,6 +725,109 @@ const migrations = [
       try { db.exec('ALTER TABLE contacts ADD COLUMN nickname TEXT;'); } catch (error) { }
       console.log('[DB] Migration v53: Verified CRM-only contact nicknames.');
     }
+  },
+  {
+    version: 54,
+    name: 'add_google_identity_to_users',
+    up: (db) => {
+      try { db.exec('ALTER TABLE users ADD COLUMN google_id TEXT;'); } catch (error) { }
+      try { db.exec('ALTER TABLE users ADD COLUMN email TEXT;'); } catch (error) { }
+      try { db.exec('ALTER TABLE users ADD COLUMN avatar_url TEXT;'); } catch (error) { }
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id) WHERE google_id IS NOT NULL;');
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE) WHERE email IS NOT NULL;');
+      console.log('[DB] Migration v54: Added Google identity fields.');
+    }
+  },
+  {
+    version: 55,
+    name: 'allow_call_media_type_in_messages',
+    up: (db) => {
+      db.pragma('foreign_keys = OFF');
+      db.exec(`
+        CREATE TABLE messages_v55 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            fb_message_id TEXT UNIQUE,
+            client_message_id TEXT,
+            sender_id TEXT NOT NULL,
+            content TEXT,
+            media_type TEXT CHECK(media_type IN ('text', 'image', 'video', 'voice', 'file', 'call')) DEFAULT 'text',
+            media_url TEXT,
+            local_media_path TEXT,
+            attachment_id TEXT REFERENCES outbound_attachments(id),
+            latest_attempt_id TEXT REFERENCES outbound_attempts(id),
+            media_name TEXT,
+            media_mime_type TEXT,
+            media_size INTEGER CHECK(media_size IS NULL OR media_size >= 0),
+            is_outgoing BOOLEAN NOT NULL DEFAULT 0,
+            sender_role TEXT NOT NULL DEFAULT 'customer' CHECK(sender_role IN ('customer', 'operator')),
+            sequence_order INTEGER,
+            direction_status TEXT NOT NULL DEFAULT 'confirmed' CHECK(direction_status IN ('confirmed', 'pending')),
+            is_unsent BOOLEAN NOT NULL DEFAULT 0,
+            delivery_status TEXT CHECK(delivery_status IN ('pending', 'sent', 'failed')) DEFAULT 'sent',
+            delivery_error TEXT,
+            timestamp_ms INTEGER DEFAULT 0,
+            timestamp_source TEXT DEFAULT 'unknown',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+        );
+
+        INSERT INTO messages_v55 (
+            id, thread_id, fb_message_id, client_message_id, sender_id, content, media_type, media_url,
+            local_media_path, attachment_id, latest_attempt_id, media_name, media_mime_type, media_size,
+            is_outgoing, sender_role, sequence_order, direction_status, is_unsent, delivery_status,
+            delivery_error, timestamp_ms, timestamp_source, created_at
+        )
+        SELECT
+            id, thread_id, fb_message_id, client_message_id, sender_id, content, media_type, media_url,
+            local_media_path, attachment_id, latest_attempt_id, media_name, media_mime_type, media_size,
+            is_outgoing, COALESCE(NULLIF(sender_role, ''), CASE WHEN is_outgoing = 1 THEN 'operator' ELSE 'customer' END),
+            sequence_order, direction_status, is_unsent, delivery_status,
+            delivery_error, timestamp_ms, timestamp_source, created_at
+        FROM messages;
+
+        DROP TABLE messages;
+        ALTER TABLE messages_v55 RENAME TO messages;
+
+        CREATE INDEX IF NOT EXISTS idx_messages_thread_sequence ON messages(thread_id, sequence_order, id);
+        CREATE INDEX IF NOT EXISTS idx_messages_latest_attempt ON messages(latest_attempt_id) WHERE latest_attempt_id IS NOT NULL;
+
+        DROP TRIGGER IF EXISTS messages_ai_insert;
+        DROP TRIGGER IF EXISTS messages_ai_update;
+        DROP TRIGGER IF EXISTS messages_ai_delete;
+        DROP TRIGGER IF EXISTS messages_sequence_after_insert;
+        DROP TRIGGER IF EXISTS messages_role_after_direction_update;
+
+        CREATE TRIGGER IF NOT EXISTS messages_ai_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, content, thread_id, sender_id)
+            VALUES (new.id, new.content, new.thread_id, new.sender_id);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_ai_update AFTER UPDATE ON messages BEGIN
+            UPDATE messages_fts SET content = new.content, thread_id = new.thread_id, sender_id = new.sender_id
+            WHERE rowid = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_ai_delete AFTER DELETE ON messages BEGIN
+            DELETE FROM messages_fts WHERE rowid = old.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_sequence_after_insert AFTER INSERT ON messages BEGIN
+          UPDATE messages
+          SET sequence_order = COALESCE(new.sequence_order, new.id),
+              sender_role = CASE WHEN new.is_outgoing = 1 THEN 'operator' ELSE 'customer' END
+          WHERE id = new.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_role_after_direction_update AFTER UPDATE OF is_outgoing ON messages BEGIN
+          UPDATE messages
+          SET sender_role = CASE WHEN new.is_outgoing = 1 THEN 'operator' ELSE 'customer' END
+          WHERE id = new.id;
+        END;
+      `);
+      db.pragma('foreign_keys = ON');
+      console.log('[DB] Migration v55: Rebuilt messages table to allow media_type="call".');
+    }
   }
 ];
 

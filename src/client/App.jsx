@@ -355,9 +355,24 @@ export default function App() {
   useEffect(() => {
     if (!socket) return;
     socket.on('NEW_MESSAGE', (newMsg) => {
-      if (!accountsRef.current.some((account) => String(account.id) === String(newMsg.account_id))) return;
+      if (newMsg.account_id && accountsRef.current.length > 0) {
+        const matchesAccount = accountsRef.current.some((account) =>
+          String(account.id) === String(newMsg.account_id) ||
+          String(account.account_id || '') === String(newMsg.account_id)
+        );
+        if (!matchesAccount) return;
+      }
       loadWaitingCount();
-      const tidStr = String(newMsg.thread_id);
+      // Map thread_id to canonical thread id if available in threadsRef
+      let tidStr = String(newMsg.thread_id);
+      const matchedThread = threadsRef.current.find(t =>
+        String(t.id) === tidStr ||
+        String(t.external_thread_id || '') === tidStr ||
+        String(t.id).endsWith(':' + tidStr)
+      );
+      if (matchedThread) {
+        tidStr = String(matchedThread.id);
+      }
       setMessages(prev => {
         const currentMsgs = prev[tidStr] || [];
         let updated;
@@ -1134,8 +1149,12 @@ export default function App() {
       )}
       {/* Column 1: Sidebar Navigation - 48px */}
       <AppSidebar
-        activeView={activeView} onSelectView={setActiveView}
-        onOpenModal={handleOpenModal}
+        activeView={activeView}
+        onSelectView={(viewId) => {
+          setActiveModal(null);
+          setActiveView(viewId);
+        }}
+        onOpenModal={setActiveModal}
         theme={theme} onToggleTheme={toggleTheme}
         hasCheckpoint={hasCheckpoint} collapsed={leadPanelCollapsed}
         onToggleCollapse={() => setLeadPanelCollapsed(!leadPanelCollapsed)}

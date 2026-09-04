@@ -32,7 +32,7 @@ class EnterpriseAccessService {
 
   listEmployees(admin) {
     return this.db.prepare(`SELECT id,username,company_role,created_at FROM users
-      WHERE company_id=? AND id<>? ORDER BY created_at DESC`).all(admin.company_id, admin.id);
+      WHERE company_id=? AND id<>? AND company_role='EMPLOYEE' ORDER BY created_at DESC`).all(admin.company_id, admin.id);
   }
 
   createEmployee(admin, { username, password }) {

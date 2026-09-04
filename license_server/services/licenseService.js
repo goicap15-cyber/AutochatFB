@@ -16,7 +16,7 @@ class LicenseService {
     const unitPrice = Number(input.unitPrice);
     const extraSlotPrice = Number(input.extraSlotPrice);
     const discounts = input.discounts || {};
-    if (!Number.isInteger(unitPrice) || unitPrice <= 0 || unitPrice > 100000000) {
+    if (!Number.isInteger(unitPrice) || unitPrice < 0 || unitPrice > 100000000) {
       return { success: false, status: 400, message: 'Đơn giá phải là số nguyên từ 1 đến 100.000.000đ' };
     }
     if (!Number.isInteger(extraSlotPrice) || extraSlotPrice < 0 || extraSlotPrice > 100000000) {

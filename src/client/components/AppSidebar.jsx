@@ -123,11 +123,19 @@ export default function AppSidebar({ activeView, onSelectView, onOpenModal, them
               <button
                 key={item.id}
                 type="button"
-                onClick={() => item.isModal ? onOpenModal(item.id) : onSelectView(item.id)}
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  if (item.isModal) {
+                    onOpenModal?.(item.id);
+                  } else {
+                    onSelectView?.(item.id);
+                  }
+                }}
                 title={isExpanded ? undefined : item.label}
                 aria-label={item.label}
                 style={{ minWidth: BTN_SIZE, minHeight: BTN_SIZE }}
-                className={'app-sidebar-nav-item group relative flex items-center rounded-lg linear-transition ' + (isActive ? activeClass : idleClass)}
+                className={'app-sidebar-nav-item group relative flex items-center rounded-lg linear-transition cursor-pointer select-none ' + (isActive ? activeClass : idleClass)}
               >
                 {isCheckpointBtn
                   ? <ShieldAlert size={ICON_SIZE} strokeWidth={ICON_STROKE} className="shrink-0 text-[var(--color-danger)]" />

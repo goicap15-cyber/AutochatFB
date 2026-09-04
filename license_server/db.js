@@ -40,6 +40,17 @@ if (!clientUserColumns.some((column) => column.name === 'company_admin_id')) {
 if (!clientUserColumns.some((column) => column.name === 'company_role')) {
   db.exec("ALTER TABLE client_users ADD COLUMN company_role TEXT NOT NULL DEFAULT 'ADMIN' CHECK(company_role IN ('ADMIN','EMPLOYEE'))");
 }
+if (!clientUserColumns.some((column) => column.name === 'google_id')) {
+  db.exec('ALTER TABLE client_users ADD COLUMN google_id TEXT');
+}
+if (!clientUserColumns.some((column) => column.name === 'email')) {
+  db.exec('ALTER TABLE client_users ADD COLUMN email TEXT');
+}
+if (!clientUserColumns.some((column) => column.name === 'avatar_url')) {
+  db.exec('ALTER TABLE client_users ADD COLUMN avatar_url TEXT');
+}
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_client_users_google_id ON client_users(google_id) WHERE google_id IS NOT NULL');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_client_users_email ON client_users(email COLLATE NOCASE) WHERE email IS NOT NULL');
 
 const orderColumns = db.prepare('PRAGMA table_info(orders)').all();
 if (!orderColumns.some((column) => column.name === 'order_type')) {

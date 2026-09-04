@@ -195,8 +195,8 @@ html, body, #root {
   max-height: 100dvh;
 }
 
-/* Dedicated application page: keep the navigation column and remove chat columns. */
-.employee-view > :not(.app-sidebar-shell):not(.employee-management-page) {
+/* Dedicated application page: keep navigation & modals, hide background chat columns. */
+.employee-view > :not(.app-sidebar-shell):not(.employee-management-page):not(.fixed):not([role="dialog"]) {
   display: none;
 }
 

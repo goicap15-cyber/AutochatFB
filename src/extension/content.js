@@ -337,7 +337,7 @@
   function getExactCallControlLabels(action) {
     return action === 'accept'
       ? ['Chấp nhận', 'Accept', 'Trả lời', 'Answer', 'Chấp nhận cuộc gọi', 'Accept call']
-      : ['Từ chối', 'Decline', 'Bỏ qua', 'Dismiss', 'Tắt', 'Kết thúc', 'Reject', 'Từ chối cuộc gọi', 'Decline call', 'Bỏ qua cuộc gọi'];
+      : ['Từ chối', 'Decline', 'Bỏ qua', 'Dismiss', 'Tắt', 'Kết thúc', 'Reject', 'Từ chối cuộc gọi', 'Decline call', 'Bỏ qua cuộc gọi', 'Từ chối cuộc gọi thoại', 'Từ chối cuộc gọi video', 'Decline audio call', 'Decline video call'];
   }
 
   function getCallActionTokens(action) {
@@ -352,15 +352,27 @@
 
   function findExactCallButtonByLabel(root, action) {
     var labels = getExactCallControlLabels(action);
+    var scope = root || document;
     for (var i = 0; i < labels.length; i++) {
-      var selector = '[role="button"][aria-label="' + labels[i] + '"], button[aria-label="' + labels[i] + '"], [tabindex][aria-label="' + labels[i] + '"]';
-      var btn = null;
-      if (root && root.matches && root.matches(selector)) {
-        btn = root;
-      } else if (root && root.querySelector) {
-        btn = root.querySelector(selector);
+      var l = labels[i];
+      var selectors = [
+        '[role="button"][aria-label="' + l + '"]',
+        'button[aria-label="' + l + '"]',
+        '[tabindex][aria-label="' + l + '"]',
+        '[role="button"][aria-label*="' + l + '"]',
+        'button[aria-label*="' + l + '"]',
+        '[tabindex][aria-label*="' + l + '"]'
+      ];
+      for (var s = 0; s < selectors.length; s++) {
+        var selector = selectors[s];
+        var btn = null;
+        if (scope && scope.matches && scope.matches(selector)) {
+          btn = scope;
+        } else if (scope && scope.querySelector) {
+          btn = scope.querySelector(selector);
+        }
+        if (btn && isVisibleCallElement(btn) && !isDisabledCallButton(btn)) return btn;
       }
-      if (btn && isVisibleCallElement(btn) && !isDisabledCallButton(btn)) return btn;
     }
     return null;
   }
@@ -1065,8 +1077,15 @@
     let sender_name = '';
     let is_outgoing = false;
 
-    // Phân tích sender từ accessibility label
-    if (/do Bạn gửi|Tin nhắn do Bạn gửi lúc|Bạn đã gửi|sent by you|You sent|Message sent by you/i.test(effectiveLabel)) {
+    const contactNameEl = document.querySelector('header h1, header h2, [role="main"] h1, [role="main"] h2, span[aria-level="1"]');
+    const contactNameStr = contactNameEl ? contactNameEl.textContent.trim() : '';
+
+    const isMissedCallContent = /nhỡ|bỏ lỡ|missed/i.test(effectiveLabel || (node && node.textContent) || '');
+
+    if (isMissedCallContent) {
+      is_outgoing = false;
+      sender_name = contactNameStr || 'Khách hàng';
+    } else if (/do Bạn gửi|Tin nhắn do Bạn gửi lúc|Bạn đã gửi|sent by you|You sent|Message sent by you/i.test(effectiveLabel)) {
       is_outgoing = true;
       sender_name = 'Bạn';
     } else {
@@ -1081,17 +1100,34 @@
           sender_name = rawSender;
         }
       } else {
-        const urlMatch = location.href.match(/\/messages\/(?:e2ee\/)?t\/([^\/?#]+)/);
-        const contactNameEl = document.querySelector('header h1, header h2, [role="main"] h1, [role="main"] h2, span[aria-level="1"]');
-        const contactNameStr = contactNameEl ? contactNameEl.textContent.trim() : '';
         const hasContactAvatar = contactNameStr ? !!(
           Array.from(messageRow.querySelectorAll('img[alt], div[role="img"][aria-label], img[aria-label]')).some(el => {
             const alt = el.getAttribute('alt') || el.getAttribute('aria-label') || '';
             return alt.toLowerCase().includes(contactNameStr.toLowerCase());
           })
         ) : false;
-        is_outgoing = !hasContactAvatar;
-        sender_name = is_outgoing ? 'Bạn' : contactNameStr;
+
+        if (hasContactAvatar) {
+          is_outgoing = false;
+          sender_name = contactNameStr;
+        } else {
+          const mainEl = document.querySelector('div[role="main"]');
+          const targetNode = messageRow || node;
+          if (mainEl && targetNode && typeof targetNode.getBoundingClientRect === 'function') {
+            const mainRect = mainEl.getBoundingClientRect();
+            const nodeRect = targetNode.getBoundingClientRect();
+            if (mainRect.width > 0 && nodeRect.width > 0) {
+              const nodeCenter = nodeRect.left + nodeRect.width / 2;
+              const mainCenter = mainRect.left + mainRect.width * 0.55;
+              is_outgoing = nodeCenter > mainCenter;
+            } else {
+              is_outgoing = false;
+            }
+          } else {
+            is_outgoing = false;
+          }
+          sender_name = is_outgoing ? 'Bạn' : contactNameStr;
+        }
       }
     }
 
@@ -1129,7 +1165,7 @@
 
     const results = [];
     let bubble_idx = 0;
-    for (const bubble of leafBubbles) {
+    for (const bubble of finalBubbles) {
       const cleanText = cleanBubbleText(bubble.textContent);
 
       if (!cleanText || cleanText.length < 1 || cleanText.length > 1000) {
@@ -1242,6 +1278,8 @@
         observerPaused = false;
       }, 1500);
     }
+
+    if (observerPaused) return;
 
     mutations.forEach(mutation => mutation.addedNodes.forEach(node => {
       if (node.nodeType !== 1) return;
@@ -1421,7 +1459,9 @@
 
       var spans = mainContainer.querySelectorAll('span[dir="auto"]');
       var contactHeading = document.querySelector('header h1, header h2, [role="main"] h1, [role="main"] h2, span[aria-level="1"]');
-      var expectedContactName = (contactHeading ? contactHeading.textContent : '').replace(/\s+/g, ' ').trim().toLowerCase();
+      var rawHeadingText = (contactHeading ? contactHeading.textContent : '').replace(/\s+/g, ' ').trim();
+      rawHeadingText = rawHeadingText.replace(/(?:Hoạt động|Active|Đang hoạt động).*$/i, '').trim();
+      var expectedContactName = rawHeadingText.toLowerCase();
       var scanCounts = new Map();
       var scanCalls = [];
       var seenCallRows = new Set();
@@ -1462,15 +1502,16 @@
             var hasContactAvatar = false;
             for (var ii = 0; ii < imgs.length; ii++) {
               var candidateAlt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
-              if (expectedContactName && candidateAlt.includes(expectedContactName)) {
+              if (expectedContactName && candidateAlt && (expectedContactName.includes(candidateAlt) || candidateAlt.includes(expectedContactName))) {
                 hasContactAvatar = true;
                 break;
               }
-              if (expectedContactName) continue;
-              var altTxt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').trim();
-              if (altTxt && !/^(bạn|you)$/i.test(altTxt)) {
-                hasContactAvatar = true;
-                break;
+              if (!expectedContactName) {
+                var altTxt = (imgs[ii].getAttribute('alt') || imgs[ii].getAttribute('aria-label') || '').trim();
+                if (altTxt && !/^(bạn|you)$/i.test(altTxt)) {
+                  hasContactAvatar = true;
+                  break;
+                }
               }
             }
             if (hasContactAvatar) {
@@ -1546,8 +1587,14 @@
       }
 
       if (!_callBaselineReady) {
+        // First scan establishes baseline: seed all existing calls as "already seen"
+        // so only genuinely NEW calls after this point will trigger emission.
+        scanCounts.forEach(function(count, signature) {
+          _callSeenCounts.set(signature, count);
+        });
         _callPendingDirections.clear();
         _callBaselineReady = true;
+        return; // Don't emit anything on the very first scan - it's all history
       }
 
       for (var c = 0; c < scanCalls.length; c++) {
@@ -1555,9 +1602,8 @@
         var previouslySeen = _callSeenCounts.get(call.signature) || 0;
         if (call.occurrence <= previouslySeen) continue;
 
-        // Require four consecutive scans with the same avatar result. This
-        // gives a lazy-loaded contact avatar time to mount before committing
-        // the row as an avatar-less "You" call.
+        // Require 2 consecutive scans with the same avatar result (was 4)
+        // to give lazy-loaded avatars time to mount before committing direction.
         var pendingKey = call.signature + '|occ' + call.occurrence;
         var pendingDirection = _callPendingDirections.get(pendingKey);
         if (!pendingDirection || pendingDirection.isOutgoing !== call.isOutgoing) {
@@ -1565,7 +1611,7 @@
           continue;
         }
         pendingDirection.confirmations += 1;
-        if (pendingDirection.confirmations < 4) continue;
+        if (pendingDirection.confirmations < 2) continue;
         _callPendingDirections.delete(pendingKey);
         _callSeenCounts.set(call.signature, call.occurrence);
 
@@ -1604,7 +1650,7 @@
     } catch(e) {}
   }
 
-  setInterval(scanCallLogsNow, 1200);
+  setInterval(scanCallLogsNow, 500);
 
   // ── Incoming Call Ringing Scanner ───────────────────────────────────────────
   // Detect the real Facebook controls; incoming-call overlays do not always keep

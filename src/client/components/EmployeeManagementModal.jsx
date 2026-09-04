@@ -1,11 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { Check, CheckSquare, ChevronRight, Eye, Plus, RefreshCw, Square, Trash2, UserPlus, Users, X } from 'lucide-react';
 
+// Module-level cache: giữ data giữa các lần mount/unmount
+let _cachedData = null;
+let _cacheLoaded = false;
+
 export default function EmployeeManagementModal() {
-  const [data, setData] = useState({ employees: [], accounts: [], assignments: {} });
+  const [data, setData] = useState(_cachedData || { employees: [], accounts: [], assignments: {} });
   const [form, setForm] = useState({ username: '', password: '' });
   const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!_cacheLoaded); // nếu đã có cache thì không cần loading
   const [error, setError] = useState('');
   const [showCreate, setShowCreate] = useState(false);
   const [assigningEmployee, setAssigningEmployee] = useState(null);
@@ -21,11 +25,15 @@ export default function EmployeeManagementModal() {
     if (!response.ok || !payload.success) {
       throw new Error(payload.error || 'Không tải được danh sách nhân viên.');
     }
+    // Cập nhật cache module-level
+    _cachedData = payload;
+    _cacheLoaded = true;
     setData(payload);
     setSelected(new Set()); // clear selection on reload
   };
 
   useEffect(() => {
+    if (_cacheLoaded) return; // đã có cache, không gọi lại API
     setLoading(true);
     load()
       .catch((loadError) => setError(loadError.message))

@@ -27,7 +27,14 @@
     return role === 'interaction';
   }
 
-  const api = { PERSONAL_ROLES, roleKey, legacyInteractionKey, roleForTab, canForwardRealtime };
+  function canForwardCallRealtime(role) {
+    // Incoming-call UI is mirrored by Facebook to the background discovery
+    // tab as well. Allow that tab to report calls; the backend deduplicates
+    // simultaneous reports from interaction and discovery by caller/thread.
+    return role === 'interaction' || role === 'discovery';
+  }
+
+  const api = { PERSONAL_ROLES, roleKey, legacyInteractionKey, roleForTab, canForwardRealtime, canForwardCallRealtime };
   root.FbCrmMessengerTabRoles = api;
   if (typeof module === 'object' && module.exports) module.exports = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);

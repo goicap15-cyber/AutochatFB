@@ -39,7 +39,8 @@ class AuthService {
 
   validateCredentials(username, password) {
     const normalizedUsername = this.normalizeUsername(username);
-    if (!USERNAME_PATTERN.test(normalizedUsername)) {
+    const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedUsername) && normalizedUsername.length <= 254;
+    if (!USERNAME_PATTERN.test(normalizedUsername) && !isEmail) {
       throw new AuthError('INVALID_USERNAME', 'Tên đăng nhập phải có 3-32 ký tự: chữ, số, dấu chấm, gạch ngang hoặc gạch dưới.');
     }
     const passwordText = String(password || '');
@@ -113,6 +114,29 @@ class AuthService {
     }
     const user = this.ensureLocalUser(input, centralIdentity);
     return { user, ...this.createSession(user.id) };
+  }
+
+  async loginGoogleManaged(input, centralClient) {
+    const centralIdentity = await centralClient.google(input.credential);
+    const username = this.normalizeUsername(centralIdentity.email || centralIdentity.username);
+    if (!username) throw new AuthError('INVALID_GOOGLE_ACCOUNT', 'Tài khoản Google không có email hợp lệ.', 401);
+    let user = this.db.prepare('SELECT id,username,role,company_id,company_role FROM users WHERE google_id=? OR email=? COLLATE NOCASE OR lower(username)=? LIMIT 1')
+      .get(String(centralIdentity.google_id || ''), username, username);
+    if (!user) {
+      const passwordHash = bcrypt.hashSync(crypto.randomBytes(32).toString('base64url'), 12);
+      const result = this.db.prepare("INSERT INTO users(username,password_hash,role,google_id,email,avatar_url) VALUES (?,?,'STAFF',?,?,?)")
+        .run(username, passwordHash, centralIdentity.google_id || null, username, centralIdentity.avatar_url || null);
+      this.db.prepare("UPDATE users SET company_id=id,company_role='ADMIN' WHERE id=?").run(result.lastInsertRowid);
+      user = this.db.prepare('SELECT id,username,role,company_id,company_role FROM users WHERE id=?').get(result.lastInsertRowid);
+    } else {
+      this.db.prepare('UPDATE users SET google_id=COALESCE(google_id,?),email=COALESCE(email,?),avatar_url=COALESCE(?,avatar_url) WHERE id=?')
+        .run(centralIdentity.google_id || null, username, centralIdentity.avatar_url || null, user.id);
+    }
+    const companyId = Number(centralIdentity.company_admin_id || centralIdentity.id || user.id);
+    const companyRole = centralIdentity.company_role === 'EMPLOYEE' ? 'EMPLOYEE' : 'ADMIN';
+    this.db.prepare('UPDATE users SET company_id=?,company_role=? WHERE id=?').run(companyId, companyRole, user.id);
+    user = this.db.prepare('SELECT id,username,role,company_id,company_role FROM users WHERE id=?').get(user.id);
+    return { user: this.publicUser(user), ...this.createSession(user.id) };
   }
 
   login({ username, password }) {

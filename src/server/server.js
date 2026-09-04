@@ -91,6 +91,33 @@ function sendAuthError(res, error) {
 
 // Authentication comes before license activation: users sign in first, then
 // the authenticated application checks or activates this machine's key.
+app.post('/api/auth/register-otp', async (req, res) => {
+  try {
+    const data = await centralAuthClient.requestRegistrationOtp(req.body?.email);
+    res.json({ success: true, data });
+  } catch (error) {
+    sendAuthError(res, error);
+  }
+});
+
+app.post('/api/auth/reset-password-otp', async (req, res) => {
+  try {
+    const data = await centralAuthClient.requestResetPasswordOtp(req.body?.email);
+    res.json({ success: true, data });
+  } catch (error) {
+    sendAuthError(res, error);
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const data = await centralAuthClient.resetPassword(req.body || {});
+    res.json({ success: true, message: data?.message || 'Đặt lại mật khẩu thành công!' });
+  } catch (error) {
+    sendAuthError(res, error);
+  }
+});
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const user = await authService.registerManaged(req.body || {}, centralAuthClient);
@@ -105,6 +132,16 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const session = await authService.loginManaged(req.body || {}, centralAuthClient);
+    res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
+    res.json({ success: true, user: session.user });
+  } catch (error) {
+    sendAuthError(res, error);
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const session = await authService.loginGoogleManaged(req.body || {}, centralAuthClient);
     res.setHeader('Set-Cookie', authService.sessionCookie(session.token));
     res.json({ success: true, user: session.user });
   } catch (error) {
@@ -319,6 +356,12 @@ const domReplaySuppressUntil = new Map();
 const callEventDeduplicator = new CallEventDeduplicator();
 const historyBackfillJobs = new Map();
 const bulkHistoryJobs = new Map();
+
+function sanitizeLog(str, maxLen = 120) {
+  if (!str) return '';
+  const cleaned = String(str).replace(/[\r\n]+/g, ' ').trim();
+  return cleaned.length > maxLen ? cleaned.substring(0, maxLen) + '...' : cleaned;
+}
 
 const richContentSecret = crypto.randomBytes(32);
 
@@ -892,6 +935,18 @@ wss.on('connection', (ws, req) => {
           break;
         }
 
+        case 'ANSWER_INCOMING_CALL_RESULT': {
+          const m = msg.data || {};
+          console.log(`[CALL_DEBUG] 🎯 Extension phản hồi ANSWER_INCOMING_CALL_RESULT: action=${m.action}, success=${m.success}, thread=${m.thread_id}, error=${m.error}`);
+          io.emit('ANSWER_INCOMING_CALL_RESULT', {
+            action: m.action,
+            thread_id: m.thread_id,
+            success: !!m.success,
+            error: m.error || null
+          });
+          break;
+        }
+
         case 'THREAD_METADATA_UPDATED': {
           const { account_id, thread_id, contact_name, avatar_url, page_id } = msg.data || {};
           const tidStr = String(thread_id || '');
@@ -938,11 +993,14 @@ wss.on('connection', (ws, req) => {
         case 'NEW_MESSAGE_RECEIVED': {
           const m = msg.data;
           const threadId = String(m.thread_id || '');
-          console.log(`[WS] 📩 Nhận NEW_MESSAGE_RECEIVED | Source: ${m.source || 'unknown'} | Thread: ${threadId} | FB Message ID: ${m.fb_message_id} | Content: "${(m.content || '').substring(0, 80)}"`);
+          console.log(`[WS] 📩 Nhận NEW_MESSAGE_RECEIVED | Source: ${m.source || 'unknown'} | Thread: ${threadId} | FB Message ID: ${m.fb_message_id} | Content: "${sanitizeLog(m.content, 80)}"`);
           const _rawContentLower = (m.content || '').toLowerCase();
-          const isCallLog = _rawContentLower.includes('cuộc gọi') || _rawContentLower.includes('bỏ lỡ') || _rawContentLower.includes('đã nhỡ') || _rawContentLower.includes('nhỡ cuộc') || _rawContentLower.includes('video') || _rawContentLower.includes('chat video');
+          const isCallLog = _rawContentLower.includes('cuộc gọi') || _rawContentLower.includes('bỏ lỡ') || _rawContentLower.includes('đã nhỡ') || _rawContentLower.includes('nhỡ cuộc') || _rawContentLower.includes('chat video')
+            || _rawContentLower.includes('audio call') || _rawContentLower.includes('video call') || _rawContentLower.includes('missed call')
+            || _rawContentLower.includes('missed audio') || _rawContentLower.includes('missed video') || _rawContentLower.includes('call ended')
+            || (m.media_type === 'call');
           if (isCallLog) {
-            console.log(`[CALL_DEBUG] 📞 Backend nhận CALL LOG từ Extension: content="${m.content}", thread=${threadId}, fb_id=${m.fb_message_id}`);
+            console.log(`[CALL_DEBUG] 📞 Backend nhận CALL LOG từ Extension: content="${sanitizeLog(m.content)}", thread=${threadId}, fb_id=${m.fb_message_id}, isCallLog=true`);
           }
           if (!threadId || threadId === 'unknown_dom' || !/^\d+$/.test(threadId)) {
             console.warn(`[WS] ⚠️ Bỏ qua tin nhắn từ Thread ID không hợp lệ: "${threadId}"`);
@@ -952,21 +1010,14 @@ wss.on('connection', (ws, req) => {
           const canonicalThreadId = resolveInternalThreadId(db, targetAccountId, threadId);
           if (!canonicalThreadId) {
             console.warn(`[WS] Bỏ qua tin nhắn chưa ánh xạ được thread: raw=${threadId} account=${targetAccountId || 'unknown'}`);
-            break;
           }
 
-          // Lọc tin nhắn hệ thống, accessibility text & timestamps bằng textFilter.
-          // Một tin nhắn media (ảnh/sticker) hợp lệ có thể không có caption nào cả -
-          // content rỗng không có nghĩa là rác nếu đã có media_url HOẶC media_type
-          // khác 'text' kèm theo (media_url có thể là null khi DOM chỉ thấy được
-          // data: URI cục bộ, không có CDN URL thật - nhưng media_type vẫn đủ để
-          // biết đây là ảnh thật, không phải rác).
-          // CALL LOG BYPASS: cuộc gọi không được qua cleanMessageText / system-text guard
-          // vì các từ như "Đã nhỡ cuộc gọi thoại" có thể bị xóa bởi bộ lọc.
-          if (isCallLog && m.content && m.fb_message_id && m.fb_message_id.startsWith('call_')) {
-            const targetAccountIdForCall = m.account_id || ws.accountId || null;
+          if (isCallLog && m.content && m.fb_message_id) {
+            const callThreadId = canonicalThreadId || m.thread_id;
+            const threadAccRow = db.prepare('SELECT account_id FROM threads WHERE id = ?').get(callThreadId);
+            const targetAccountIdForCall = m.account_id || ws.accountId || threadAccRow?.account_id || null;
             ConversationRepository.upsertThread({
-              id: m.thread_id,
+              id: callThreadId,
               account_id: targetAccountIdForCall,
               contact_name: m.contact_name || 'Khách hàng',
               last_message: m.content,
@@ -975,10 +1026,7 @@ wss.on('connection', (ws, req) => {
             const stableCallId = m.fb_message_id;
             const existingCall = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(stableCallId);
             const normalizedCallContent = String(m.content || '').toLocaleLowerCase('vi-VN');
-            const isExplicitMissedIncoming = /(?:\u0111\u00e3\s+nh\u1ee1|b\u1ecf\s+l\u1ee1|missed)\s+(?:cu\u1ed9c\s+)?g\u1ecdi/.test(normalizedCallContent);
-            // Use the raw DOM evidence at the persistence boundary. Avatar in
-            // the call article means contact; no avatar means the logged-in
-            // account. A missed-call label is an explicit incoming outcome.
+            const isExplicitMissedIncoming = /(?:nhỡ|bỏ lỡ|missed)/i.test(normalizedCallContent);
             const hasRawAvatarEvidence = m.direction_evidence === 'call_article_avatar'
               && (m.has_row_avatar === true || m.has_row_avatar === false);
             const callIsOutgoing = isExplicitMissedIncoming
@@ -987,34 +1035,50 @@ wss.on('connection', (ws, req) => {
                 ? (m.has_row_avatar ? 0 : 1)
                 : ((m.is_outgoing === true || m.is_outgoing === 1) ? 1 : 0);
             const callSenderId = m.sender_id || (callIsOutgoing ? String(targetAccountIdForCall || 'STAFF') : 'CONTACT');
+            console.log(`[CALL_DEBUG] 🧵 callThreadId=${callThreadId} | m.thread_id=${m.thread_id} | canonicalThreadId=${canonicalThreadId} | callIsOutgoing=${callIsOutgoing}`);
             if (!existingCall) {
               const insertCall = db.prepare(`
                 INSERT OR IGNORE INTO messages
                   (thread_id, fb_message_id, sender_id, content, media_type, is_outgoing, direction_status, timestamp_ms, timestamp_source, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               `).run(
-                m.thread_id, stableCallId,
+                callThreadId, stableCallId,
                 callSenderId,
-                m.content, 'text', callIsOutgoing, 'confirmed',
+                m.content, 'call', callIsOutgoing, 'confirmed',
                 m.timestamp_ms || Date.now(),
                 m.timestamp_source || 'realtime_fallback',
                 m.created_at || new Date().toISOString()
               );
               if (insertCall.changes > 0) {
-                console.log(`[CALL_DEBUG] ✅ Đã lưu call log vào DB: "${m.content}" (id: ${stableCallId}) | is_outgoing: ${callIsOutgoing}`);
+                console.log(`[CALL_DEBUG] ✅ Đã lưu call log vào DB: "${sanitizeLog(m.content)}" (id: ${stableCallId}) | thread: ${callThreadId} | is_outgoing: ${callIsOutgoing}`);
                 const newMsg = db.prepare('SELECT * FROM messages WHERE fb_message_id = ?').get(stableCallId);
                 if (newMsg) {
-                  io.emit('NEW_MESSAGE', { ...newMsg, account_id: targetAccountIdForCall });
-                  io.emit('THREAD_MESSAGES_UPDATED', { thread_id: m.thread_id, account_id: targetAccountIdForCall });
+                  io.emit('NEW_MESSAGE', { ...newMsg, thread_id: callThreadId, account_id: targetAccountIdForCall });
+                  io.emit('THREAD_MESSAGES_UPDATED', { thread_id: callThreadId, account_id: targetAccountIdForCall });
                 }
               } else {
-                console.log(`[CALL_DEBUG] ⚠️ Call log đã tồn tại, bỏ qua: ${stableCallId}`);
+                // INSERT OR IGNORE bị ignore (trùng fb_message_id): patch media_type và is_outgoing nếu cần
+                db.prepare(`UPDATE messages SET media_type = 'call', is_outgoing = ? WHERE fb_message_id = ?`).run(callIsOutgoing, stableCallId);
+                const existingMsg = db.prepare('SELECT * FROM messages WHERE fb_message_id = ?').get(stableCallId);
+                if (existingMsg) {
+                  console.log(`[CALL_DEBUG] 🔄 Patch media_type='call' cho tin đã tồn tại: ${stableCallId}`);
+                  io.emit('NEW_MESSAGE', { ...existingMsg, thread_id: callThreadId, account_id: targetAccountIdForCall });
+                  io.emit('THREAD_MESSAGES_UPDATED', { thread_id: callThreadId, account_id: targetAccountIdForCall });
+                }
               }
             } else {
-              console.log(`[CALL_DEBUG] ⚠️ Call log đã tồn tại trong DB: ${stableCallId}`);
+              // existingCall tồn tại: patch media_type & is_outgoing rồi re-emit
+              db.prepare(`UPDATE messages SET media_type = 'call', is_outgoing = ? WHERE id = ?`).run(callIsOutgoing, existingCall.id);
+              const existingMsg = db.prepare('SELECT * FROM messages WHERE id = ?').get(existingCall.id);
+              if (existingMsg) {
+                console.log(`[CALL_DEBUG] 🔄 existingCall: patch + re-emit thread=${callThreadId}: ${stableCallId}`);
+                io.emit('NEW_MESSAGE', { ...existingMsg, thread_id: callThreadId, account_id: targetAccountIdForCall });
+                io.emit('THREAD_MESSAGES_UPDATED', { thread_id: callThreadId, account_id: targetAccountIdForCall });
+              }
             }
             break;
           }
+
 
           const cleanedContent = cleanMessageText(m.content);
           const hasMediaPayload = !!(m.media_url || (m.media_type && m.media_type !== 'text'));
@@ -1058,7 +1122,7 @@ wss.on('connection', (ws, req) => {
             break;
           }
           if (!hasMediaPayload && (!cleanedContent || isSystemOrMetadataText(cleanedContent))) {
-            console.log(`[WS] ℹ️ Backend Guard: Bỏ qua tin nhắn rác/hệ thống: "${(m.content || '').substring(0, 40)}" từ thread ${threadId}`);
+            console.log(`[WS] ℹ️ Backend Guard: Bỏ qua tin nhắn rác/hệ thống: "${sanitizeLog(m.content, 40)}" từ thread ${threadId}`);
             break;
           }
 
@@ -1121,7 +1185,7 @@ wss.on('connection', (ws, req) => {
             `).get(threadId);
             const suppressUntil = domReplaySuppressUntil.get(targetAccountId) || 0;
             if (!hasRecentPending && Date.now() < suppressUntil) {
-              console.log(`[WS] ℹ️ Suppress outgoing DOM replay during startup/sync window: thread=${threadId} content="${(m.content || '').substring(0, 40)}"`);
+              console.log(`[WS] ℹ️ Suppress outgoing DOM replay during startup/sync window: thread=${threadId} content="${sanitizeLog(m.content, 40)}"`);
               console.log('[OUTBOUND_TRACE]', JSON.stringify({ stage: 'BACKEND_DOM_REPLAY_SUPPRESSED', thread_id: String(threadId), at: new Date().toISOString() }));
               break;
             }
@@ -1168,9 +1232,9 @@ wss.on('connection', (ws, req) => {
             let skipPendingCorrelation = false;
             // Fix: Tránh crash UNIQUE constraint khi DOM observer gửi lại tin nhắn cũ có trùng content
             if (m.fb_message_id) {
-               const existingFbId = db.prepare('SELECT id FROM messages WHERE fb_message_id = ?').get(m.fb_message_id);
-               if (existingFbId) {
-                   console.log(`[WS] DOM observer sent an already known fb_message_id (${m.fb_message_id}). Bỏ qua event để tránh ghi đè pending.`);
+               const existingFbId = db.prepare('SELECT id, is_outgoing, delivery_status FROM messages WHERE fb_message_id = ?').get(m.fb_message_id);
+               if (existingFbId && existingFbId.is_outgoing === 1 && existingFbId.delivery_status === 'sent') {
+                   console.log(`[WS] DOM observer sent an already known confirmed fb_message_id (${m.fb_message_id}). Bỏ qua event để tránh ghi đè pending.`);
                    skipPendingCorrelation = true;
                }
             }
@@ -1214,9 +1278,14 @@ wss.on('connection', (ws, req) => {
                 ? OutboundDomCorrelationService.matchPendingImageOutbound(db, internalThreadId)
                 : db.prepare(`
                     SELECT outbound.id, outbound.client_message_id FROM messages outbound
-                    LEFT JOIN message_queue queued ON outbound.client_message_id = 'queue_' || queued.id
+                    LEFT JOIN outbound_attempts attempt ON outbound.latest_attempt_id = attempt.id
+                    LEFT JOIN message_queue queued ON (
+                      outbound.client_message_id = 'queue_' || queued.id
+                      OR attempt.id = queued.outbound_attempt_id
+                    )
                     WHERE outbound.thread_id = ? AND outbound.content = ? AND outbound.is_outgoing = 1
                       AND outbound.delivery_status = 'pending'
+                      AND outbound.attachment_id IS NULL AND (outbound.media_type IS NULL OR outbound.media_type = 'text')
                       AND (queued.id IS NULL OR (queued.attachment_id IS NULL AND queued.manifest_id IS NULL))
                     ORDER BY outbound.id DESC LIMIT 1
                   `).get(internalThreadId, m.content);
@@ -1263,6 +1332,7 @@ wss.on('connection', (ws, req) => {
                 }
               }
 
+
               // Mismatch guard: exactly 1 pending in same thread within 10s, but content differs
               const recentPendings = db.prepare(`
                 SELECT id, client_message_id, content FROM messages
@@ -1293,6 +1363,46 @@ wss.on('connection', (ws, req) => {
               }
             }
           }
+          // ===== ANTI-GHOST GUARD (chạy cho MỌI DOM observer, không phân biệt direction) =====
+          // DOM observer đôi khi bắt lại tin nhắn do CRM gửi (đã có is_outgoing=1 trong DB).
+          // Nếu để chạy tiếp sẽ tạo bubble ghost bên trái với is_outgoing=0.
+          // Guard này chạy TRƯỚC insert, bất kể finalIsOutgoing = 0 hay 1.
+          if (m.source === 'dom_observer' || m.source === 'page_dom_observer') {
+            const isMedia = !!(m.media_url || (m.media_type && m.media_type !== 'text'));
+            let outgoingMatch = null;
+
+            if (isMedia) {
+              outgoingMatch = db.prepare(`
+                SELECT id, delivery_status, client_message_id, thread_id FROM messages
+                WHERE thread_id = ? AND is_outgoing = 1
+                  AND (attachment_id IS NOT NULL OR (media_type IS NOT NULL AND media_type != 'text'))
+                  AND datetime(created_at) >= datetime('now', '-300 seconds')
+                ORDER BY id DESC LIMIT 1
+              `).get(canonicalThreadId);
+            } else if (m.content) {
+              outgoingMatch = db.prepare(`
+                SELECT id, delivery_status, client_message_id, thread_id FROM messages
+                WHERE thread_id = ? AND content = ? AND is_outgoing = 1
+                  AND datetime(created_at) >= datetime('now', '-300 seconds')
+                ORDER BY id DESC LIMIT 1
+              `).get(canonicalThreadId, m.content);
+            }
+
+            if (outgoingMatch) {
+              console.log(`[WS] 🚫 Anti-ghost FINAL: DOM observer bắt lại tin outgoing (id=${outgoingMatch.id}, status=${outgoingMatch.delivery_status}). Discard hoàn toàn.`);
+              if (outgoingMatch.delivery_status === 'pending') {
+                OutboundDomCorrelationService.confirmPendingOutbound(db, io, outgoingMatch, {
+                  fbMessageId: m.fb_message_id,
+                  tsMs,
+                  tsSource,
+                  rawMessage: { ...m, created_at: createdAt }
+                });
+              }
+              break;
+            }
+          }
+
+
           // Lưu tin nhắn vào bảng messages
           const stableMessageId = m.fb_message_id || m.client_message_id || ConversationRepository.fingerprint(m.thread_id, m);
           const insertMsgResult = db.prepare(`
@@ -1485,6 +1595,7 @@ wss.on('connection', (ws, req) => {
           // Emit payload đầy đủ lên frontend
           const msgPayload = {
             ...m,
+            account_id: targetAccountId || threadAccountId || m.account_id || ws.accountId || null,
             timestamp_ms: tsMs,
             timestamp_source: tsSource,
             created_at: createdAt,

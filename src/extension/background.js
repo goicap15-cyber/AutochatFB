@@ -344,6 +344,24 @@ function sendToBackend(type, data) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log('[FB Engine] 📥 onMessage received from content:', message.type, JSON.stringify(message).substring(0, 300));
 
+  // Helper to ensure tabRegistry is loaded and auto-register active Messenger tabs
+  async function resolveSenderTabRole(senderTab) {
+    await loadTabRegistry();
+    let senderRole = FbCrmMessengerTabRoles.roleForTab([...tabRegistry.entries()], user_id, senderTab?.id);
+    if (!senderRole && senderTab?.id) {
+      const isMessagesUrl = /(^|\.)facebook\.com\/messages|(^|\.)messenger\.com/i.test(senderTab.url || senderTab.pendingUrl || '');
+      if (isMessagesUrl || !user_id) {
+        if (user_id) {
+          const interactionKey = FbCrmMessengerTabRoles.roleKey(user_id, 'interaction');
+          await registerTab(interactionKey, senderTab.id);
+          await registerTab(FbCrmMessengerTabRoles.legacyInteractionKey(user_id), senderTab.id);
+        }
+        senderRole = 'interaction';
+      }
+    }
+    return senderRole;
+  }
+
   if (message.type === 'FB_TOKENS_EXTRACTED') {
     const newUserId = message.data.user_id;
     const newDtsg = message.data.fb_dtsg;
@@ -351,15 +369,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (incomingPendingKey && !pending_key) pending_key = incomingPendingKey;
 
     const hadUser = Boolean(user_id && fb_dtsg);
-    // fb_dtsg is Facebook's own CSRF token - it rotates on its own every few
-    // seconds regardless of the logged-in user, and the server never even
-    // reads fb_dtsg out of REGISTER_ACCOUNT's payload (only account_id/
-    // pending_key). Treating a dtsg rotation as "user changed" re-sent
-    // REGISTER_ACCOUNT (and every broadcast it triggers) roughly once a
-    // second for as long as the tab stayed open - this is what was flooding
-    // the CRM tab with requests and making it unusable. Still store the
-    // fresh fb_dtsg locally below; only user_id identity changes warrant a
-    // re-registration over the network.
     const userChanged = newUserId !== user_id;
     fb_dtsg = newDtsg;
     user_id = newUserId;
@@ -379,30 +388,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // Forward tin nhắn Facebook đến backend CRM
   if (message.type === 'NEW_MESSAGE_FROM_FB') {
-    const senderRole = FbCrmMessengerTabRoles.roleForTab([...tabRegistry.entries()], user_id, sender?.tab?.id);
-    if (!FbCrmMessengerTabRoles.canForwardRealtime(senderRole)) {
-      console.log(`[FB Engine] Skip NEW_MESSAGE_FROM_FB from role=${senderRole || 'unregistered'} tab=${sender?.tab?.id || 'unknown'}`);
-      return false;
-    }
-    let msgData = message.data;
-    const messageThreadKey = String(msgData?.thread_id || '').split(':').pop();
-    const recentOutgoingCallAt = recentOutgoingCallThreads.get(messageThreadKey) || 0;
-    const isCallLog = /cuộc gọi|gọi thoại|gọi video|missed call|voice call|video call/i.test(String(msgData?.content || ''));
-    if (isCallLog && Date.now() - recentOutgoingCallAt < 5 * 60 * 1000 && msgData?.is_outgoing) {
-      console.log(`[FB Engine] Skip duplicate outgoing DOM call log for thread=${messageThreadKey}`);
-      return false;
-    }
-    if (false && isCallLog && Date.now() - recentOutgoingCallAt < 5 * 60 * 1000) {
-      msgData = { ...msgData, is_outgoing: true, sender_id: user_id, sender_name: 'Bạn' };
-    }
-    console.log('[FB Engine] 📨 NEW_MESSAGE_FROM_FB từ content:', JSON.stringify(msgData).substring(0, 300));
-    console.log('[FB Engine] 🔍 user_id hiện tại:', user_id);
-    // Đính kèm account_id cho backend biết tài khoản nào nhận tin
-    sendToBackend('NEW_MESSAGE_RECEIVED', {
-      ...msgData,
-      account_id: user_id
-    });
-    console.log(`[FB Engine] 📤 Forward tin nhắn → Backend: "${(msgData.content || '').substring(0, 50)}"`);
+    (async () => {
+      const senderRole = await resolveSenderTabRole(sender?.tab);
+      if (!FbCrmMessengerTabRoles.canForwardRealtime(senderRole)) {
+        console.log(`[FB Engine] Skip NEW_MESSAGE_FROM_FB from role=${senderRole || 'unregistered'} tab=${sender?.tab?.id || 'unknown'}`);
+        return;
+      }
+      let msgData = message.data;
+      const messageThreadKey = String(msgData?.thread_id || '').split(':').pop();
+      const recentOutgoingCallAt = recentOutgoingCallThreads.get(messageThreadKey) || 0;
+      const isCallLog = /cuộc gọi|gọi thoại|gọi video|missed call|voice call|video call/i.test(String(msgData?.content || ''));
+      if (isCallLog && Date.now() - recentOutgoingCallAt < 5 * 60 * 1000 && msgData?.is_outgoing) {
+        console.log(`[FB Engine] Skip duplicate outgoing DOM call log for thread=${messageThreadKey}`);
+        return;
+      }
+      if (false && isCallLog && Date.now() - recentOutgoingCallAt < 5 * 60 * 1000) {
+        msgData = { ...msgData, is_outgoing: true, sender_id: user_id, sender_name: 'Bạn' };
+      }
+      console.log('[FB Engine] 📨 NEW_MESSAGE_FROM_FB từ content:', JSON.stringify(msgData).substring(0, 300));
+      console.log('[FB Engine] 🔍 user_id hiện tại:', user_id);
+      // Đính kèm account_id cho backend biết tài khoản nào nhận tin
+      sendToBackend('NEW_MESSAGE_RECEIVED', {
+        ...msgData,
+        account_id: user_id
+      });
+      console.log(`[FB Engine] 📤 Forward tin nhắn → Backend: "${(msgData.content || '').substring(0, 50)}"`);
+    })();
+    return true;
   }
 
   // Temporary diagnostic (spec 040 T020) - relays page_content.js's raw
@@ -432,23 +444,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'INCOMING_CALL_RINGING') {
-    const senderRole = FbCrmMessengerTabRoles.roleForTab([...tabRegistry.entries()], user_id, sender?.tab?.id);
-    if (!FbCrmMessengerTabRoles.canForwardRealtime(senderRole)) return false;
-    console.log('[FB Engine] 🔔 INCOMING_CALL_RINGING từ content.js:', message.data);
-    sendToBackend('INCOMING_CALL_RINGING', {
-      ...message.data,
-      account_id: user_id
-    });
+    (async () => {
+      const senderRole = await resolveSenderTabRole(sender?.tab);
+      if (!FbCrmMessengerTabRoles.canForwardCallRealtime(senderRole)) return;
+      console.log('[FB Engine] 🔔 INCOMING_CALL_RINGING từ content.js:', message.data);
+      sendToBackend('INCOMING_CALL_RINGING', {
+        ...message.data,
+        account_id: user_id,
+        source_tab_id: sender?.tab?.id || null
+      });
+    })();
+    return true;
   }
 
   if (message.type === 'INCOMING_CALL_ENDED') {
-    const senderRole = FbCrmMessengerTabRoles.roleForTab([...tabRegistry.entries()], user_id, sender?.tab?.id);
-    if (!FbCrmMessengerTabRoles.canForwardRealtime(senderRole)) return false;
-    console.log('[FB Engine] 📴 INCOMING_CALL_ENDED từ content.js');
-    sendToBackend('INCOMING_CALL_ENDED', {
-      ...message.data,
-      account_id: user_id
-    });
+    (async () => {
+      const senderRole = await resolveSenderTabRole(sender?.tab);
+      if (!FbCrmMessengerTabRoles.canForwardCallRealtime(senderRole)) return;
+      console.log('[FB Engine] 📴 INCOMING_CALL_ENDED từ content.js');
+      sendToBackend('INCOMING_CALL_ENDED', {
+        ...message.data,
+        account_id: user_id
+      });
+    })();
+    return true;
   }
 
   // Lets a content script re-seed its client-side timestamp-anchor map after
@@ -3902,16 +3921,56 @@ async function handleTriggerMessengerCall({ thread_id, account_id = user_id, cal
 
 async function handleAnswerIncomingCall({ action, thread_id, account_id = user_id }) {
   try {
-    const tab = await getRegisteredTab(FbCrmMessengerTabRoles.roleKey(account_id, 'interaction'))
+    let targetTabs = [];
+    const interactionTab = await getRegisteredTab(FbCrmMessengerTabRoles.roleKey(account_id, 'interaction'))
       || await getRegisteredTab(FbCrmMessengerTabRoles.legacyInteractionKey(account_id));
-    if (tab?.id) {
-      chrome.tabs.sendMessage(tab.id, { type: 'ANSWER_INCOMING_CALL', action, thread_id }, () => {
-        if (chrome.runtime.lastError) { /* ignore a stale interaction tab */ }
-      });
-      console.log(`[FB Engine] Đã gửi lệnh ${action} cuộc gọi tới interaction tab ${tab.id}.`);
+    if (interactionTab?.id) {
+      targetTabs.push(interactionTab);
     }
+    const allFbTabs = await chrome.tabs.query({ url: "*://*.facebook.com/*" });
+    if (Array.isArray(allFbTabs)) {
+      for (const t of allFbTabs) {
+        if (!targetTabs.some(existing => existing.id === t.id)) {
+          targetTabs.push(t);
+        }
+      }
+    }
+
+    let success = false;
+    let errorMsg = null;
+
+    for (const tab of targetTabs) {
+      try {
+        const response = await new Promise((resolve) => {
+          chrome.tabs.sendMessage(tab.id, { type: 'ANSWER_INCOMING_CALL', action, thread_id }, (res) => {
+            if (chrome.runtime.lastError) resolve(null);
+            else resolve(res);
+          });
+        });
+        if (response && response.success) {
+          success = true;
+          console.log(`[FB Engine] ✅ Đã điều khiển ${action} cuộc gọi thành công trên tab ${tab.id}.`);
+          break;
+        }
+      } catch (e) {
+        errorMsg = e.message;
+      }
+    }
+
+    sendToBackend('ANSWER_INCOMING_CALL_RESULT', {
+      action,
+      thread_id,
+      success,
+      error: success ? null : (errorMsg || 'Không tìm thấy nút bấm cuộc gọi trên Facebook')
+    });
   } catch (err) {
     console.error('[FB Engine] ❌ Lỗi gửi lệnh điều khiển cuộc gọi:', err);
+    sendToBackend('ANSWER_INCOMING_CALL_RESULT', {
+      action,
+      thread_id,
+      success: false,
+      error: err.message
+    });
   }
 }
 
