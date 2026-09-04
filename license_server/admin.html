@@ -328,20 +328,14 @@ deleteSelectedClientButton.onclick=async()=>{let ids=[...selectedClientUsers];if
   }
 
   // Also hook into pricing nav click to rebuild after load
-  var _origLoadPricing = null;
-  Object.defineProperty(window, 'loadPricing', {
-    get: function() { return _origLoadPricing; },
-    set: function(fn) {
-      _origLoadPricing = function() {
-        var result = fn.apply(this, arguments);
-        if (result && typeof result.then === 'function') {
-          result.then(function() { setTimeout(rebuildPricingUI, 20); });
-        }
-        return result;
-      };
-    },
-    configurable: true
-  });
+  try {
+    var _origLoadPricing = window.loadPricing;
+    window.loadPricing = async function() {
+      var res = _origLoadPricing ? await _origLoadPricing.apply(this, arguments) : null;
+      setTimeout(rebuildPricingUI, 20);
+      return res;
+    };
+  } catch(e) {}
 })();
 </script></body></html>
 
